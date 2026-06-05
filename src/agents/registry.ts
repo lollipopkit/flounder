@@ -44,11 +44,53 @@ export const BUILTIN_AUDITOR_AGENTS: Record<BuiltInFailureMode, AuditorAgentDefi
     displayName: "Integer Safety Auditor",
     guidance: "Find arithmetic that can wrap, overflow, underflow, truncate, or silently change sign or precision.",
   },
+  input_validation: {
+    failureMode: "input_validation",
+    id: "input-validation-auditor",
+    displayName: "Input Validation Auditor",
+    guidance:
+      "Check whether attacker-controlled inputs are parsed, normalized, bounded, and validated before they influence trust decisions, resource use, file paths, commands, or protocol state.",
+  },
+  injection: {
+    failureMode: "injection",
+    id: "injection-auditor",
+    displayName: "Injection Auditor",
+    guidance:
+      "Trace untrusted data into interpreters such as SQL, shell, template engines, LDAP, XPath, GraphQL, eval-like APIs, and command arguments. Confirm parameterization or equivalent separation.",
+  },
+  ssrf: {
+    failureMode: "ssrf",
+    id: "ssrf-auditor",
+    displayName: "SSRF Auditor",
+    guidance:
+      "Check URL, webhook, fetch, proxy, and metadata-client paths for attacker-controlled destinations, redirect handling, protocol allowlists, DNS rebinding, and internal network access.",
+  },
+  path_traversal: {
+    failureMode: "path_traversal",
+    id: "path-traversal-auditor",
+    displayName: "Path Traversal Auditor",
+    guidance:
+      "Trace user-controlled filenames, archive entries, upload names, and route parameters into filesystem reads, writes, extraction, or deletion. Confirm canonicalization and base-directory enforcement.",
+  },
+  deserialization: {
+    failureMode: "deserialization",
+    id: "deserialization-auditor",
+    displayName: "Deserialization Auditor",
+    guidance:
+      "Check whether untrusted serialized data can instantiate dangerous types, trigger gadget chains, bypass validation, or exceed expected object graph and resource bounds.",
+  },
   access_control: {
     failureMode: "access_control",
     id: "access-control-auditor",
     displayName: "Access Control Auditor",
     guidance: "Check who can call or mutate this state and whether every path enforces that boundary.",
+  },
+  privilege_boundary: {
+    failureMode: "privilege_boundary",
+    id: "privilege-boundary-auditor",
+    displayName: "Privilege Boundary Auditor",
+    guidance:
+      "Check cross-user, cross-tenant, admin, service-account, plugin, sandbox, and host/guest boundaries. Verify identity, authorization, and object ownership are enforced together.",
   },
   reentrancy: {
     failureMode: "reentrancy",
@@ -62,6 +104,13 @@ export const BUILTIN_AUDITOR_AGENTS: Record<BuiltInFailureMode, AuditorAgentDefi
     displayName: "Signature Replay Auditor",
     guidance: "Check domain separation, nonces, chain IDs, contexts, and message binding.",
   },
+  cryptographic_misuse: {
+    failureMode: "cryptographic_misuse",
+    id: "cryptographic-misuse-auditor",
+    displayName: "Cryptographic Misuse Auditor",
+    guidance:
+      "Check randomness, nonce reuse, key derivation, hash/domain separation, signature verification, encryption modes, constant-time boundaries, and downgrade or algorithm-confusion paths.",
+  },
   consensus_divergence: {
     failureMode: "consensus_divergence",
     id: "consensus-divergence-auditor",
@@ -74,6 +123,27 @@ export const BUILTIN_AUDITOR_AGENTS: Record<BuiltInFailureMode, AuditorAgentDefi
     id: "resource-exhaustion-auditor",
     displayName: "Resource Exhaustion Auditor",
     guidance: "Find cheap inputs that force expensive work, panic, unbounded allocation, infinite loops, or network amplification.",
+  },
+  race_condition: {
+    failureMode: "race_condition",
+    id: "race-condition-auditor",
+    displayName: "Race Condition Auditor",
+    guidance:
+      "Check time-of-check/time-of-use gaps, concurrent updates, retries, idempotency, locking, distributed coordination, async cancellation, and state transitions that can be interleaved by an attacker.",
+  },
+  secret_exposure: {
+    failureMode: "secret_exposure",
+    id: "secret-exposure-auditor",
+    displayName: "Secret Exposure Auditor",
+    guidance:
+      "Check logs, traces, error messages, client bundles, config loading, debug endpoints, reports, and generated artifacts for credentials, tokens, private keys, or sensitive internal data.",
+  },
+  dependency_supply_chain: {
+    failureMode: "dependency_supply_chain",
+    id: "dependency-supply-chain-auditor",
+    displayName: "Dependency Supply Chain Auditor",
+    guidance:
+      "Check dependency manifests, plugin loading, install scripts, dynamic imports, update channels, generated code, and package boundaries for trust confusion or execution of untrusted code.",
   },
 };
 

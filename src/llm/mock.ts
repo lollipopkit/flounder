@@ -30,6 +30,24 @@ export class MockAuditLlmClient implements LlmClient {
 }
 
 function responseFor(tag: string, user: string): string {
+  if (tag === "discover_lenses") {
+    return JSON.stringify([
+      {
+        id: "mock-project-lens",
+        displayName: "Mock Project Lens",
+        description: "Mock lens pack used to test model-generated project reconnaissance.",
+        projectContext: {
+          criticalAssets: ["circuit witness integrity"],
+          attackerCapabilities: ["choose private witness values"],
+          securityInvariants: ["logical inputs must be constrained to intended source values"],
+        },
+        failureModes: ["missing_constraint"],
+        enumerationGuidance: ["Map witness assignments to the checks that consume them."],
+        auditGuidance: ["Trace equality or copy constraints before claiming a missing constraint."],
+      },
+    ]);
+  }
+
   if (tag === "enumerate") {
     return JSON.stringify([
       {

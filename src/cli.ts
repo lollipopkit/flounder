@@ -2,13 +2,14 @@
 import { readFile } from "node:fs/promises";
 import { defaultConfig, type AuditorConfig } from "./config.js";
 import { runPipeline } from "./pipeline.js";
-import type { AuditItem } from "./types.js";
+import type { AuditItem, AuditorAgentDefinition } from "./types.js";
 import { loadCorpus, loadSource } from "./ingest/source.js";
 import { RunLogger } from "./trace/logger.js";
 import { runAudit } from "./audit/runner.js";
 import { aggregate } from "./audit/aggregate.js";
 import { PiAiClient } from "./llm/pi-ai.js";
 import { MockAuditLlmClient } from "./llm/mock.js";
+import { normalizeLensPacks, normalizeProjectContext } from "./lens/context.js";
 
 async function main(argv: string[]): Promise<void> {
   const [cmd, ...rest] = argv;
@@ -18,14 +19,14 @@ async function main(argv: string[]): Promise<void> {
   }
 
   if (cmd === "run") {
-    const { cfg, verifyTopK } = parseConfig(rest);
+    const { cfg, verifyTopK } = await parseConfig(rest);
     const result = await runPipeline(cfg, { verifyTopK, ...(hasFlag(rest, "--mock-llm") ? { llm: new MockAuditLlmClient() } : {}) });
     printCoverage(result.runDir, result.summary.coverage);
     return;
   }
 
   if (cmd === "audit") {
-    const { cfg } = parseConfig(rest);
+    const { cfg } = await parseConfig(rest);
     const checklistPath = readFlag(rest, "--checklist");
     if (!checklistPath) throw new Error("--checklist is required");
     const checklist = JSON.parse(await readFile(checklistPath, "utf8")) as AuditItem[];
@@ -44,11 +45,17 @@ async function main(argv: string[]): Promise<void> {
   throw new Error(`Unknown command: ${cmd}`);
 }
 
-function parseConfig(args: string[]): { cfg: AuditorConfig; verifyTopK: number } {
+async function parseConfig(args: string[]): Promise<{ cfg: AuditorConfig; verifyTopK: number }> {
   const cfg = defaultConfig();
+  const configPath = readFlag(args, "--config");
+  if (configPath) {
+    applyConfigOverrides(cfg, JSON.parse(await readFile(configPath, "utf8")) as Record<string, unknown>);
+  }
   cfg.targetName = readFlag(args, "--target") ?? cfg.targetName;
-  cfg.sourcePaths = readMultiFlag(args, "--source");
-  cfg.corpusPaths = readMultiFlag(args, "--corpus");
+  const sourcePaths = readMultiFlag(args, "--source");
+  const corpusPaths = readMultiFlag(args, "--corpus");
+  if (sourcePaths.length > 0) cfg.sourcePaths = sourcePaths;
+  if (corpusPaths.length > 0) cfg.corpusPaths = corpusPaths;
   cfg.outputDir = readFlag(args, "--out") ?? cfg.outputDir;
   cfg.provider = readFlag(args, "--provider") ?? cfg.provider;
   cfg.enumModel = readFlag(args, "--enum-model") ?? readFlag(args, "--model") ?? cfg.enumModel;
@@ -58,12 +65,56 @@ function parseConfig(args: string[]): { cfg: AuditorConfig; verifyTopK: number }
   cfg.maxWorkers = readIntFlag(args, "--max-workers") ?? cfg.maxWorkers;
   cfg.maxTokens = readIntFlag(args, "--max-tokens") ?? cfg.maxTokens;
   cfg.contextCharBudget = readIntFlag(args, "--context-chars") ?? cfg.contextCharBudget;
-  cfg.dryRun = args.includes("--dry-run");
+  if (args.includes("--dry-run")) cfg.dryRun = true;
+  if (args.includes("--no-dynamic-lenses")) cfg.dynamicLensDiscovery = false;
   const thinking = readFlag(args, "--thinking");
   if (thinking === "minimal" || thinking === "low" || thinking === "medium" || thinking === "high" || thinking === "xhigh") {
     cfg.thinkingLevel = thinking;
   }
   return { cfg, verifyTopK: readIntFlag(args, "--verify-top") ?? 3 };
+}
+
+function applyConfigOverrides(cfg: AuditorConfig, raw: Record<string, unknown>): void {
+  if (!raw || typeof raw !== "object") return;
+  if (typeof raw.targetName === "string") cfg.targetName = raw.targetName;
+  if (Array.isArray(raw.sourcePaths) && raw.sourcePaths.every((value) => typeof value === "string")) cfg.sourcePaths = raw.sourcePaths;
+  if (Array.isArray(raw.corpusPaths) && raw.corpusPaths.every((value) => typeof value === "string")) cfg.corpusPaths = raw.corpusPaths;
+  if (typeof raw.outputDir === "string") cfg.outputDir = raw.outputDir;
+  if (typeof raw.provider === "string") cfg.provider = raw.provider;
+  if (typeof raw.enumModel === "string") cfg.enumModel = raw.enumModel;
+  if (typeof raw.auditModel === "string") cfg.auditModel = raw.auditModel;
+  if (typeof raw.verifyModel === "string") cfg.verifyModel = raw.verifyModel;
+  if (typeof raw.model === "string") {
+    cfg.enumModel = raw.model;
+    cfg.auditModel = raw.model;
+    cfg.verifyModel = raw.model;
+  }
+  if (typeof raw.trials === "number" && Number.isFinite(raw.trials)) cfg.trials = Math.max(1, Math.floor(raw.trials));
+  if (typeof raw.maxWorkers === "number" && Number.isFinite(raw.maxWorkers)) cfg.maxWorkers = Math.max(1, Math.floor(raw.maxWorkers));
+  if (typeof raw.maxTokens === "number" && Number.isFinite(raw.maxTokens)) cfg.maxTokens = Math.max(1000, Math.floor(raw.maxTokens));
+  if (typeof raw.contextCharBudget === "number" && Number.isFinite(raw.contextCharBudget)) {
+    cfg.contextCharBudget = Math.max(4000, Math.floor(raw.contextCharBudget));
+  }
+  if (raw.thinkingLevel === "minimal" || raw.thinkingLevel === "low" || raw.thinkingLevel === "medium" || raw.thinkingLevel === "high" || raw.thinkingLevel === "xhigh") {
+    cfg.thinkingLevel = raw.thinkingLevel;
+  }
+  if (Array.isArray(raw.failureModes) && raw.failureModes.every((value) => typeof value === "string")) {
+    cfg.failureModes = raw.failureModes as AuditorConfig["failureModes"];
+  }
+  if (Array.isArray(raw.auditorAgents)) {
+    cfg.auditorAgents = cleanAuditorAgents(raw.auditorAgents);
+  }
+  if ("lensPacks" in raw || "lens_packs" in raw) cfg.lensPacks = normalizeLensPacks(raw.lensPacks ?? raw.lens_packs);
+  if ("projectContext" in raw || "project_context" in raw) {
+    cfg.projectContext = normalizeProjectContext(raw.projectContext ?? raw.project_context) ?? cfg.projectContext;
+  }
+  if (typeof raw.dynamicLensDiscovery === "boolean") cfg.dynamicLensDiscovery = raw.dynamicLensDiscovery;
+  if (typeof raw.dryRun === "boolean") cfg.dryRun = raw.dryRun;
+}
+
+function cleanAuditorAgents(value: unknown[]): AuditorAgentDefinition[] {
+  const packs = normalizeLensPacks([{ id: "config-agents", auditorAgents: value }]);
+  return packs[0]?.auditorAgents ?? [];
 }
 
 function hasFlag(args: string[], name: string): boolean {
@@ -108,14 +159,16 @@ Usage:
   fsa audit --checklist <file> --source <paths...>
 
 Options:
-  --provider <name>       pi-ai provider, default anthropic
+  --config <file>         JSON config with projectContext, lensPacks, agents, models, paths
+  --provider <name>       pi-ai provider, default openai
   --model <name>          set enum/audit/verify model
   --enum-model <name>     model for checklist enumeration
   --audit-model <name>    model for audit trials
   --verify-model <name>   model for verification planning
   --trials <n>            independent trials per item, default 4
   --thinking <level>      minimal|low|medium|high|xhigh
-  --dry-run               no model calls; static seeders only
+  --dry-run               no model calls; local checklist seeders only
+  --no-dynamic-lenses     disable model-generated project lens packs
   --mock-llm              run full pipeline with deterministic mock model
 `);
 }

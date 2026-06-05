@@ -1,4 +1,5 @@
-import type { AuditorAgentDefinition, FailureMode } from "./types.js";
+import type { AuditLensPackDefinition, AuditorAgentDefinition, FailureMode, ProjectContext } from "./types.js";
+import { auditorAgentsFromLensPacks } from "./lens/context.js";
 
 export const DEFAULT_FAILURE_MODES: FailureMode[] = [
   "missing_constraint",
@@ -7,11 +8,21 @@ export const DEFAULT_FAILURE_MODES: FailureMode[] = [
   "soundness_gap",
   "spec_impl_mismatch",
   "integer_overflow",
+  "input_validation",
+  "injection",
+  "ssrf",
+  "path_traversal",
+  "deserialization",
   "access_control",
+  "privilege_boundary",
   "reentrancy",
   "signature_replay",
+  "cryptographic_misuse",
   "consensus_divergence",
   "dos_resource",
+  "race_condition",
+  "secret_exposure",
+  "dependency_supply_chain",
 ];
 
 export interface AuditorConfig {
@@ -30,6 +41,9 @@ export interface AuditorConfig {
   contextCharBudget: number;
   failureModes: FailureMode[];
   auditorAgents: AuditorAgentDefinition[];
+  projectContext: ProjectContext;
+  lensPacks: AuditLensPackDefinition[];
+  dynamicLensDiscovery: boolean;
   dryRun: boolean;
 }
 
@@ -39,10 +53,10 @@ export function defaultConfig(): AuditorConfig {
     sourcePaths: [],
     corpusPaths: [],
     outputDir: "runs",
-    provider: "anthropic",
-    enumModel: "claude-opus-4-8",
-    auditModel: "claude-opus-4-8",
-    verifyModel: "claude-opus-4-8",
+    provider: "openai",
+    enumModel: "gpt-5.5",
+    auditModel: "gpt-5.5",
+    verifyModel: "gpt-5.5",
     trials: 4,
     maxWorkers: 4,
     maxTokens: 8000,
@@ -50,10 +64,24 @@ export function defaultConfig(): AuditorConfig {
     contextCharBudget: 120_000,
     failureModes: DEFAULT_FAILURE_MODES,
     auditorAgents: [],
+    projectContext: {},
+    lensPacks: [],
+    dynamicLensDiscovery: true,
     dryRun: false,
   };
 }
 
-export function effectiveFailureModes(cfg: Pick<AuditorConfig, "failureModes" | "auditorAgents">): FailureMode[] {
-  return [...new Set([...cfg.failureModes, ...cfg.auditorAgents.map((agent) => agent.failureMode)])];
+export function effectiveAuditorAgents(cfg: Pick<AuditorConfig, "auditorAgents" | "lensPacks">): AuditorAgentDefinition[] {
+  return [...cfg.auditorAgents, ...auditorAgentsFromLensPacks(cfg.lensPacks)];
+}
+
+export function effectiveFailureModes(cfg: Pick<AuditorConfig, "failureModes" | "auditorAgents" | "lensPacks">): FailureMode[] {
+  return [
+    ...new Set([
+      ...cfg.failureModes,
+      ...cfg.auditorAgents.map((agent) => agent.failureMode),
+      ...cfg.lensPacks.flatMap((pack) => pack.failureModes ?? []),
+      ...auditorAgentsFromLensPacks(cfg.lensPacks).map((agent) => agent.failureMode),
+    ]),
+  ];
 }

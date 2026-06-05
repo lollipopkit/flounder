@@ -4,7 +4,7 @@
 
 `full-stack-auditor` has two layers:
 
-- Audit engine: deterministic TypeScript modules under `src/ingest`, `src/index`, `src/seeders`, `src/audit`, `src/verify`, and `src/reports`.
+- Audit engine: deterministic TypeScript modules under `src/ingest`, `src/index`, `src/profile`, `src/lens`, `src/seeders`, `src/audit`, `src/verify`, and `src/reports`.
 - Pi integration: thin adapters under `src/llm/pi-ai.ts` and `src/pi/extension.ts`.
 
 The audit engine should not depend on pi-coding-agent. This keeps batch runs, CI, web UI, RPC mode, and future coding-agent flows on the same underlying artifacts.
@@ -15,18 +15,22 @@ The audit engine should not depend on pi-coding-agent. This keeps batch runs, CI
 source + corpus
   -> ingest
   -> source index / retrieval
-  -> static seeders
+  -> deterministic project profile
+  -> model project reconnaissance / dynamic lens packs
+  -> local checklist seeders
   -> LLM enumeration
   -> checklist
-  -> deterministic static audit passes
   -> specialized audit trials
   -> aggregation
   -> independent verification plan
   -> disclosure draft
 ```
 
+Project profile, source index, dynamic lens packs, and local checklist seeders are planning and context mechanisms. They may propose audit questions and routing guidance, but they must not produce bug findings. Findings come only from model-backed audit trials.
+
 ## Agent Roles
 
+- LensDiscoveryAgent: reads the loaded project context and proposes dynamic lens packs for the target's assets, trust boundaries, invariants, attacker capabilities, and domain-specific failure modes.
 - Enumerator: maps code locations, spec statements, security properties, and failure modes.
 - MissingConstraintAuditor: traces witness values to equality/copy/range constraints.
 - BalanceIntegrityAuditor: checks conservation and turnstile boundaries.
@@ -35,15 +39,22 @@ source + corpus
 - ConsensusAuditor: checks ambiguity that could split implementations.
 - VerificationAgent: refutes or confirms findings and writes local-only test scaffolds.
 
-Audit roles are declared in `src/agents/registry.ts`. Adding a new role should be a registry change plus tests and, when useful, a static seeder.
+Audit roles are declared in `src/agents/registry.ts`. Adding a new role should be a registry change plus tests and, when useful, a local checklist seeder.
 
 The registry is extensible at runtime. `AuditorConfig.auditorAgents` accepts additional agent definitions, and their failure modes are merged into the enumeration prompt through `effectiveFailureModes`. The audit runner builds an agent registry for each run, so custom checklist items can route to custom guidance without changing built-in agents.
 
+Project-specific customization has two layers:
+
+- `projectContext`: human- or config-provided assets, attacker capabilities, trust boundaries, invariants, focus areas, and out-of-scope notes.
+- `lensPacks`: scenario-specific failure modes, enumeration guidance, audit guidance, and optional auditor agents.
+
+Live runs can also enable `dynamicLensDiscovery`, which asks the model to produce additional lens packs before enumeration. These packs are normalized, bounded, written to `lens_packs.json`, and merged into the current run config. They are reviewable planning artifacts, not findings.
+
 ## Blind Discovery Gate
 
-`npm run check:blind-discovery` runs the framework against a neutral halo2 scalar-multiplication fixture. The fixture does not name a target protocol, impact, or expected bug. The gate passes only if static discovery produces a generic missing-constraint checklist item from source structure alone.
+`npm run check:blind-discovery` runs the framework against a neutral fixture. The fixture does not name a target protocol, impact, or expected bug. The gate passes only if local checklist generation produces a generic missing-constraint audit item from source structure alone.
 
-This is not a substitute for a full target audit. It is a regression gate that prevents the framework from depending on answer-shaped fixture text or prompt hints for this class of issue.
+This is not a substitute for model discovery. Local checklist seeders prepare coverage; only model-backed audit trials count as autonomous bug-discovery evidence.
 
 ## Pi Integration
 
@@ -63,10 +74,10 @@ The command guardrail lives in `src/security/policy.ts` so non-pi integrations c
 
 - `npm run check`: strict TypeScript compile.
 - `npm test`: build plus Node tests for JSON parsing, seeders, dry-run pipeline, mock end-to-end pipeline, and pi extension registration.
-- `npm run dry-run`: static seeder run against fixtures.
+- `npm run dry-run`: local checklist seeder run against fixtures. It must produce zero findings.
 - `npm run mock-run`: full model-shaped pipeline using deterministic mock LLM.
-- `npm run check:blind-discovery`: blind fixture regression for autonomous missing-constraint enumeration.
-- `npm run check:source-discovery -- --source <path>`: external-source assertion for the same generic binding finding without committing that source.
+- `npm run check:blind-discovery`: blind fixture regression for checklist enumeration.
+- `npm run check:source-discovery -- --source <path>`: opt-in live model assertion that requires audit model calls and a model-produced finding without committing that source.
 
 ## Local-Only Verification
 

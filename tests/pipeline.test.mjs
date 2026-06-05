@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, stat } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -14,7 +14,7 @@ const fixtures = path.join(root, "fixtures");
 const basicHalo2Fixture = path.join(fixtures, "halo2_missing_constraint.rs");
 const scalarMulFixture = path.join(fixtures, "halo2_scalar_mul_binding.rs");
 
-test("static seeders enumerate Halo2 missing-constraint audit items", async () => {
+test("checklist seeders enumerate Halo2 missing-constraint audit items", async () => {
   const source = await loadSource([basicHalo2Fixture]);
   const items = runSeeders(source);
   assert.ok(source.every((doc) => !path.isAbsolute(doc.path)));
@@ -23,7 +23,7 @@ test("static seeders enumerate Halo2 missing-constraint audit items", async () =
   assert.ok(items.every((item) => item.location.includes("halo2_missing_constraint.rs")));
 });
 
-test("static seeders autonomously enumerate scalar-mul advice binding risk from unknown source", async () => {
+test("checklist seeders enumerate scalar-mul advice binding questions from source shape", async () => {
   const source = await loadSource([scalarMulFixture]);
   const items = runSeeders(source);
   const bindingItems = items.filter((item) => item.seeder === "halo2_advice_binding");
@@ -44,13 +44,16 @@ test("dry-run pipeline writes checklist and summary without model calls", async 
 
   const result = await runPipeline(cfg);
   assert.equal(result.summary.coverage.itemsTotal, 5);
-  assert.equal(result.summary.coverage.itemsWithFinding, 1);
-  assert.equal(result.summary.coverage.bySeverity.high, 1);
-  assert.match(result.summary.findings[0].title, /Advice input is not visibly bound/);
+  assert.equal(result.summary.coverage.itemsWithFinding, 0);
+  assert.equal(result.summary.coverage.bySeverity.high, 0);
+  assert.deepEqual(result.summary.findings, []);
   await stat(path.join(result.runDir, "checklist.json"));
+  await stat(path.join(result.runDir, "audit_results.json"));
+  await stat(path.join(result.runDir, "lens_packs.json"));
   await stat(path.join(result.runDir, "summary.json"));
   await stat(path.join(result.runDir, "source_index.json"));
   await stat(path.join(result.runDir, "checklist_coverage.json"));
+  assert.deepEqual(await readdir(path.join(result.runDir, "calls")), []);
 });
 
 test("mock pipeline runs enumerate, audit, verify, and report end to end", async () => {
@@ -68,6 +71,8 @@ test("mock pipeline runs enumerate, audit, verify, and report end to end", async
 
   const verification = JSON.parse(await readFile(path.join(result.runDir, "verifications.json"), "utf8"));
   assert.equal(verification.length, 2);
+  const lensPacks = JSON.parse(await readFile(path.join(result.runDir, "lens_packs.json"), "utf8"));
+  assert.equal(lensPacks[0].id, "mock-project-lens");
 
   const coverage = JSON.parse(await readFile(path.join(result.runDir, "run_coverage.json"), "utf8"));
   assert.equal(coverage.checklist.byFailureMode.missing_constraint, 6);

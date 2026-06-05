@@ -12,12 +12,24 @@ Optimize for coverage, specificity, and traceability. Ground each item in source
 export function buildEnumerationPrompt(input: {
   target: string;
   failureModes: FailureMode[];
+  projectProfile: string;
+  projectContext: string;
+  lensPacks: string;
   corpus: string;
   source: string;
 }): string {
   return `Target: ${input.target}
 
 Allowed failure modes: ${input.failureModes.join(", ")}
+
+Project profile:
+${input.projectProfile || "(not available)"}
+
+Project context:
+${input.projectContext || "(none configured)"}
+
+Active lens packs:
+${input.lensPacks || "(none configured)"}
 
 Enumerate concrete audit items. Each item must have:
 - id: short slug
@@ -28,7 +40,7 @@ Enumerate concrete audit items. Each item must have:
 - specRefs: optional list of cited spec/reference snippets
 - attackerControlledInputs: optional list of inputs a malicious actor/prover controls
 
-Prioritize implementation/spec mismatch, under-constrained witness values, conservation of value, uniqueness of spend markers, consensus divergence, and cheap-to-trigger expensive work.
+Prioritize issues that match the project profile and evidence in the loaded material. Consider implementation/spec mismatch, trust-boundary mistakes, under-constrained witness values, value conservation, replay or uniqueness failures, auth/session bugs, injection, SSRF, path traversal, deserialization, unsafe external calls, race conditions, consensus divergence, dependency trust, secret exposure, and cheap-to-trigger expensive work.
 
 Return only a JSON array. No markdown fences.
 
@@ -44,7 +56,7 @@ export const AUDIT_SYSTEM = `You are a specialized auditor inside an authorized 
 Analyze only the assigned item. Real audited code can contain critical bugs, but do not invent findings.
 Reason from actual constraints, checks, and data flow. If the invariant is enforced, say so plainly.`;
 
-export function buildAuditPrompt(item: AuditItem, source: string, registry?: AuditorAgentRegistry): string {
+export function buildAuditPrompt(item: AuditItem, source: string, registry?: AuditorAgentRegistry, lensGuidance = ""): string {
   const agent = getAuditorAgent(item.failureMode, registry);
   return `Audit item:
   id: ${item.id}
@@ -59,6 +71,9 @@ Specialized auditor:
 
 Failure-mode guidance:
 ${agent.guidance}
+
+Project-specific lens guidance:
+${lensGuidance || "(none)"}
 
 Relevant source:
 ${source}

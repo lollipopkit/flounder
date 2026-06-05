@@ -1,4 +1,4 @@
-// Minimal fixture for the static Halo2 missing-constraint seeder.
+// Minimal fixture for the Halo2 missing-constraint checklist seeder.
 // This is not production code.
 
 fn vulnerable_region(region: &mut Region, row: usize, x_p: Value, y_p: Value) -> Result<(), Error> {

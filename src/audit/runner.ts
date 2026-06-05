@@ -1,9 +1,10 @@
 import os from "node:os";
 import type { AuditorConfig } from "../config.js";
+import { effectiveAuditorAgents } from "../config.js";
 import { AUDIT_SYSTEM, buildAuditPrompt } from "../agents/prompts.js";
 import { createAgentRegistry } from "../agents/registry.js";
-import { runStaticAuditors } from "./static.js";
 import { SourceIndex } from "../index/source-index.js";
+import { renderAuditGuidanceForFailureMode } from "../lens/context.js";
 import type { AuditItem, AuditResult, Doc, LlmClient, TrialFinding } from "../types.js";
 import type { RunLogger } from "../trace/logger.js";
 import { extractJsonObject } from "../util/json.js";
@@ -16,19 +17,21 @@ export async function runAudit(input: {
   llm?: LlmClient;
   logger: RunLogger;
 }): Promise<AuditResult[]> {
-  const staticDocs = [...input.source, ...(input.corpus ?? [])];
   if (input.cfg.dryRun || !input.llm) {
-    const dry = runStaticAuditors(input.items, staticDocs);
+    const dry = input.items.map((item) => ({
+      item,
+      nTrials: 0,
+      nHits: 0,
+      hitRate: 0,
+      trials: [],
+    }));
     await input.logger.artifact("audit_results.json", dry);
     return dry;
   }
 
   const index = new SourceIndex(input.source);
-  const agentRegistry = createAgentRegistry(input.cfg.auditorAgents);
-  const staticResults = runStaticAuditors(input.items, staticDocs);
-  const staticById = new Map(staticResults.filter((result) => result.nHits > 0).map((result) => [result.item.id, result]));
-  const modelItems = input.items.filter((item) => !staticById.has(item.id));
-  const modelResults = await mapLimit(modelItems, input.cfg.maxWorkers, async (item) =>
+  const agentRegistry = createAgentRegistry(effectiveAuditorAgents(input.cfg));
+  const results = await mapLimit(input.items, input.cfg.maxWorkers, async (item) =>
     auditItem({
       cfg: input.cfg,
       item,
@@ -38,7 +41,6 @@ export async function runAudit(input: {
       logger: input.logger,
     }),
   );
-  const results = input.items.map((item) => staticById.get(item.id) ?? modelResults.find((result) => result.item.id === item.id)).filter((result): result is AuditResult => result !== undefined);
   await input.logger.artifact("audit_results.json", results);
   return results;
 }
@@ -52,7 +54,8 @@ async function auditItem(input: {
   logger: RunLogger;
 }): Promise<AuditResult> {
   const sourceContext = input.index.contextForItem(input.item, input.cfg.contextCharBudget);
-  const user = buildAuditPrompt(input.item, sourceContext, input.agentRegistry);
+  const lensGuidance = renderAuditGuidanceForFailureMode(input.cfg.lensPacks, input.item.failureMode);
+  const user = buildAuditPrompt(input.item, sourceContext, input.agentRegistry, lensGuidance);
   const trials = await mapLimit(
     Array.from({ length: input.cfg.trials }, (_, idx) => idx),
     Math.min(input.cfg.trials, Math.max(1, Math.floor(os.cpus().length / 2))),

@@ -24,7 +24,7 @@ npm run verify
 - Keep the audit engine independent of `@earendil-works/pi-coding-agent`.
 - Put pi-specific code under `src/pi/` and LLM provider adapters under `src/llm/`.
 - Add new audit lenses through `src/agents/registry.ts`.
-- Add static discovery rules under `src/seeders/`.
+- Add local checklist seeders under `src/seeders/`; they may propose audit questions but must not produce findings.
 - Keep verification local-only and report-oriented.
 - Preserve structured run artifacts so audits remain explainable and reproducible.
 

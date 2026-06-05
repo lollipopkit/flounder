@@ -1,6 +1,6 @@
 # White-Hat Auditor
 
-Use this skill when auditing source code for security bugs, crypto/ZK soundness issues, smart-contract bugs, consensus issues, or value-integrity failures.
+Use this skill when auditing source code for security bugs across application, infrastructure, protocol, cryptography, proof-system, smart-contract, consensus, or value-integrity domains.
 
 ## Rules
 
@@ -13,12 +13,14 @@ Use this skill when auditing source code for security bugs, crypto/ZK soundness 
 ## Workflow
 
 1. Ingest source plus specs, protocol docs, papers, and implementation guides.
-2. Enumerate `(location, security property, failure mode)` checklist items first.
-3. Route each item to a specialized audit lens.
-4. Run multiple independent trials for stochastic coverage.
-5. Aggregate by severity, hit rate, confidence, and evidence quality.
-6. Verify high-priority findings with a separate skeptical pass.
-7. Produce a local-only PoC scaffold and private disclosure draft.
+2. Build or review the project context: assets, attacker capabilities, trust boundaries, invariants, focus areas, and out-of-scope areas.
+3. Let reconnaissance produce project-specific lens packs when the target needs domain-specific audit guidance.
+4. Enumerate `(location, security property, failure mode)` checklist items before claiming bugs.
+5. Route each item to a built-in or project-specific audit lens.
+6. Run multiple independent model-backed trials for stochastic coverage.
+7. Aggregate by severity, hit rate, confidence, and evidence quality.
+8. Verify high-priority findings with a separate skeptical pass.
+9. Produce a local-only PoC scaffold and private disclosure draft.
 
 ## Failure Modes
 
@@ -28,6 +30,12 @@ Use this skill when auditing source code for security bugs, crypto/ZK soundness 
 - Spec-implementation mismatches.
 - Consensus divergence.
 - Integer overflow, truncation, and unchecked arithmetic.
-- Authorization gaps.
+- Input validation, injection, SSRF, path traversal, deserialization, and parser safety.
+- Authorization gaps, tenant isolation, and privilege-boundary failures.
 - Reentrancy.
+- Cryptographic misuse.
+- Race conditions and idempotency failures.
+- Secret exposure and dependency supply-chain trust.
 - DoS/resource amplification.
+
+Local checklist seeders, source indexes, project profiles, and lens packs are planning aids. Findings must come from model-backed audit trials grounded in specific code evidence.

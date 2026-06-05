@@ -1,6 +1,7 @@
 import { isToolCallEventType, type ExtensionAPI, type ToolCallEvent, type UserBashEvent } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { defaultConfig } from "../config.js";
+import { normalizeLensPacks, normalizeProjectContext } from "../lens/context.js";
 import { runPipeline } from "../pipeline.js";
 import { analyzeCommandSafety } from "../security/policy.js";
 
@@ -14,11 +15,14 @@ export default function fullStackAuditorExtension(pi: ExtensionAPI): void {
       target: Type.String({ description: "Target name used for run artifacts." }),
       sourcePaths: Type.Array(Type.String(), { description: "Local source files or directories to audit." }),
       corpusPaths: Type.Optional(Type.Array(Type.String(), { description: "Local spec/reference files or directories." })),
-      provider: Type.Optional(Type.String({ description: "pi-ai provider, for example anthropic or openai." })),
+      provider: Type.Optional(Type.String({ description: "pi-ai provider, for example openai or anthropic." })),
       model: Type.Optional(Type.String({ description: "Model id for enum/audit/verify stages." })),
       trials: Type.Optional(Type.Number({ description: "Independent audit trials per item." })),
       outputDir: Type.Optional(Type.String({ description: "Artifact output directory." })),
-      dryRun: Type.Optional(Type.Boolean({ description: "When true, run static seeders only and make no model calls." })),
+      projectContext: Type.Optional(Type.Any({ description: "Project-specific assets, threats, invariants, focus areas, and out-of-scope notes." })),
+      lensPacks: Type.Optional(Type.Array(Type.Any(), { description: "Project-specific audit lens packs." })),
+      dynamicLensDiscovery: Type.Optional(Type.Boolean({ description: "When true in live runs, let the model propose project-specific lens packs before enumeration." })),
+      dryRun: Type.Optional(Type.Boolean({ description: "When true, run local checklist seeders only and make no model calls." })),
     }),
     async execute(_toolCallId, params) {
       const cfg = defaultConfig();
@@ -29,6 +33,9 @@ export default function fullStackAuditorExtension(pi: ExtensionAPI): void {
       cfg.trials = params.trials ?? cfg.trials;
       cfg.outputDir = params.outputDir ?? cfg.outputDir;
       cfg.dryRun = params.dryRun ?? true;
+      cfg.projectContext = normalizeProjectContext(params.projectContext) ?? cfg.projectContext;
+      cfg.lensPacks = normalizeLensPacks(params.lensPacks);
+      cfg.dynamicLensDiscovery = params.dynamicLensDiscovery ?? cfg.dynamicLensDiscovery;
       if (params.model) {
         cfg.enumModel = params.model;
         cfg.auditModel = params.model;

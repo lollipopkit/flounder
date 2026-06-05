@@ -7,11 +7,21 @@ export type BuiltInFailureMode =
   | "soundness_gap"
   | "spec_impl_mismatch"
   | "integer_overflow"
+  | "input_validation"
+  | "injection"
+  | "ssrf"
+  | "path_traversal"
+  | "deserialization"
   | "access_control"
+  | "privilege_boundary"
   | "reentrancy"
   | "signature_replay"
+  | "cryptographic_misuse"
   | "consensus_divergence"
-  | "dos_resource";
+  | "dos_resource"
+  | "race_condition"
+  | "secret_exposure"
+  | "dependency_supply_chain";
 
 export type FailureMode = BuiltInFailureMode | (string & {});
 
@@ -22,10 +32,42 @@ export interface AuditorAgentDefinition {
   guidance: string;
 }
 
+export interface ProjectContext {
+  summary?: string;
+  criticalAssets?: string[];
+  attackerCapabilities?: string[];
+  trustBoundaries?: string[];
+  securityInvariants?: string[];
+  focusAreas?: string[];
+  outOfScope?: string[];
+  scenarioGuidance?: string[];
+}
+
+export interface AuditLensPackDefinition {
+  id: string;
+  displayName?: string;
+  description?: string;
+  projectContext?: ProjectContext;
+  failureModes?: FailureMode[];
+  auditorAgents?: AuditorAgentDefinition[];
+  enumerationGuidance?: string[];
+  auditGuidance?: string[];
+}
+
 export interface Doc {
   path: string;
   content: string;
   kind: "source" | "corpus";
+}
+
+export interface ProjectProfile {
+  languages: string[];
+  frameworks: string[];
+  packageManagers: string[];
+  manifests: string[];
+  likelySecurityDomains: string[];
+  entrypoints: string[];
+  notes: string[];
 }
 
 export interface AuditItem {

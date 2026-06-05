@@ -12,7 +12,7 @@ test("checklist coverage uses repository-relative public file locations", () => 
       securityProperty: "Property",
       failureMode: "missing_constraint",
       why: "Why",
-      seeder: "static",
+      seeder: "fixture",
     },
     {
       id: "b",

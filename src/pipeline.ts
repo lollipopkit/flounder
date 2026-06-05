@@ -4,7 +4,10 @@ import { runAudit } from "./audit/runner.js";
 import { enumerateAuditItems } from "./enumerate.js";
 import { loadCorpus, loadSource } from "./ingest/source.js";
 import { SourceIndex } from "./index/source-index.js";
+import { mergeProjectContexts } from "./lens/context.js";
+import { discoverLensPacks } from "./lens/discover.js";
 import { PiAiClient } from "./llm/pi-ai.js";
+import { profileProject } from "./profile/project.js";
 import { renderDisclosure } from "./reports/disclosure.js";
 import { summarizeChecklist, summarizeRun, summarizeSourceIndex } from "./reports/coverage.js";
 import { RunLogger } from "./trace/logger.js";
@@ -29,24 +32,32 @@ export async function runPipeline(cfg: AuditorConfig, options: { verifyTopK?: nu
 
   const corpus = await loadCorpus(cfg.corpusPaths);
   const source = await loadSource(cfg.sourcePaths);
+  const projectProfile = profileProject([...source, ...corpus]);
   const sourceIndex = new SourceIndex(source);
   await logger.event("knowledge_loaded", { corpusDocs: corpus.length, sourceDocs: source.length });
+  await logger.artifact("project_profile.json", projectProfile);
   await logger.artifact("source_index.json", summarizeSourceIndex(source, sourceIndex.symbols));
 
   const llm = cfg.dryRun ? undefined : options.llm ?? new PiAiClient(cfg.provider, logger);
   if (llm && "setLogger" in llm && typeof llm.setLogger === "function") {
     llm.setLogger(logger);
   }
-  const items = await enumerateAuditItems({ cfg, corpus, source, ...(llm ? { llm } : {}), logger });
+  const lensPacks = await discoverLensPacks({ cfg, corpus, source, projectProfile, ...(llm ? { llm } : {}), logger });
+  const runCfg = {
+    ...cfg,
+    lensPacks,
+    projectContext: mergeProjectContexts([cfg.projectContext, ...lensPacks.map((pack) => pack.projectContext)]),
+  };
+  const items = await enumerateAuditItems({ cfg: runCfg, corpus, source, projectProfile, ...(llm ? { llm } : {}), logger });
   await logger.artifact("checklist_coverage.json", summarizeChecklist(items));
-  const results = await runAudit({ cfg, items, source, corpus, ...(llm ? { llm } : {}), logger });
+  const results = await runAudit({ cfg: runCfg, items, source, corpus, ...(llm ? { llm } : {}), logger });
   await logger.artifact("run_coverage.json", summarizeRun(items, results));
   const summary = aggregate(results);
   await logger.artifact("summary.json", summary);
 
   if (summary.findings.length > 0) {
     const verifications = await verifyTop({
-      cfg,
+      cfg: runCfg,
       findings: summary.findings,
       source,
       ...(llm ? { llm } : {}),

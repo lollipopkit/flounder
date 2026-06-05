@@ -1,20 +1,24 @@
 # full-stack-auditor
 
-White-hat full-stack security audit agent framework inspired by the Orchard incident workflow.
+White-hat full-stack security audit agent framework for model-driven source auditing across languages, stacks, and security domains.
 
 This implementation is TypeScript-first and uses pi-mono as the agent/runtime integration point. The audit core stays framework-light so it can run as a batch CLI, a pi package extension, a coding-agent workflow, or a future UI/RPC service.
 
 ## Design
 
-The important lesson from the Orchard writeup is the shape of the workflow:
+The core workflow is:
 
 1. Load source, specs, papers, books, and implementation notes.
-2. Enumerate concrete audit items before looking for bugs.
-3. Route each item to a specialized failure-mode agent.
-4. Run multiple independent trials per item.
-5. Aggregate by severity, hit rate, confidence, and evidence quality.
-6. Verify findings separately, in local sandbox-only tests.
-7. Keep a complete audit trail of prompts, model outputs, artifacts, and events.
+2. Build a deterministic project profile from language, framework, manifest, entrypoint, and security-domain signals.
+3. In live runs, let the model perform project reconnaissance and propose dynamic lens packs.
+4. Enumerate concrete audit items before looking for bugs.
+5. Route each item to built-in or project-specific failure-mode agents.
+6. Run multiple independent model audit trials per item.
+7. Aggregate by severity, hit rate, confidence, and evidence quality.
+8. Verify findings separately, in local sandbox-only tests.
+9. Keep a complete audit trail of prompts, model outputs, artifacts, and events.
+
+Only model-backed audit trials produce bug findings. Project profiles, source indexes, dynamic lens packs, and local checklist seeders organize context and propose questions; they do not count as discovery evidence by themselves.
 
 ## Why pi-mono
 
@@ -45,7 +49,7 @@ For live model runs, configure provider credentials in your shell or secret mana
 npm run dry-run
 ```
 
-This reads local source and emits heuristic checklist items without calling a model.
+This reads local source and emits checklist items without calling a model. Dry-run output is useful for coverage inspection, but it cannot produce bug findings.
 
 ## Mock End-to-End Run
 
@@ -55,21 +59,64 @@ npm run mock-run
 
 This runs the full pipeline with a deterministic mock LLM: enumeration, audit trials, aggregation, verification, report generation, and audit-trail logging. It is the no-API-key smoke test.
 
-Dry-run mode does not call a model, but it can still promote strong deterministic static checks into candidate findings.
-
 ## Full Run
 
 ```bash
 fsa run \
-  --target orchard \
-  --source ./halo2/halo2_gadgets/src \
-  --corpus ./specs ./halo2-book \
-  --provider anthropic \
-  --audit-model claude-opus-4-8 \
+  --target protocol-audit \
+  --source ./src ./contracts \
+  --corpus ./docs ./specs \
+  --provider openai \
+  --model gpt-5.5 \
+  --thinking xhigh \
   --trials 4
 ```
 
 Artifacts are written under `runs/<target>-<timestamp>/`.
+
+## Project-Specific Lens Packs
+
+Generic built-in agents are the default baseline. For a real project, add project context and custom lens packs through a JSON config file:
+
+```json
+{
+  "targetName": "example-service",
+  "sourcePaths": ["./src"],
+  "corpusPaths": ["./docs"],
+  "projectContext": {
+    "criticalAssets": ["tenant-owned records", "billing state"],
+    "attackerCapabilities": ["authenticated low-privilege user", "malicious webhook sender"],
+    "trustBoundaries": ["HTTP request to database object ownership"],
+    "securityInvariants": ["users can access only objects in their tenant"],
+    "focusAreas": ["authorization", "webhook processing", "billing state transitions"]
+  },
+  "lensPacks": [
+    {
+      "id": "tenant-isolation",
+      "displayName": "Tenant Isolation",
+      "failureModes": ["cross_tenant_object_access", "access_control"],
+      "auditorAgents": [
+        {
+          "failureMode": "cross_tenant_object_access",
+          "id": "tenant-object-auditor",
+          "displayName": "Tenant Object Auditor",
+          "guidance": "Trace tenant identity, object id, authorization checks, and query predicates together."
+        }
+      ],
+      "enumerationGuidance": ["Find routes and jobs that load objects by id."],
+      "auditGuidance": ["Confirm tenant ownership is enforced in the same query or transaction."]
+    }
+  ]
+}
+```
+
+Run it with:
+
+```bash
+fsa run --config ./audit-config.json --provider openai --model gpt-5.5 --thinking xhigh
+```
+
+Live runs also enable dynamic lens discovery by default. The model reads the project profile and loaded context, writes `lens_packs.json`, and uses those lens packs during enumeration and audit. Disable that stage with `--no-dynamic-lenses` when you want only configured lenses.
 
 ## Public Release Check
 
@@ -85,15 +132,21 @@ This scans the public source surface for local absolute paths and high-confidenc
 npm run check:blind-discovery
 ```
 
-This runs a dry-run audit against a neutral halo2 scalar-multiplication fixture and asserts that the framework autonomously enumerates a generic missing-constraint checklist item without target-specific hints.
+This runs a dry-run audit against a neutral fixture and asserts that the framework can enumerate a generic checklist item without target-specific hints. It is a checklist coverage gate, not proof of model reasoning.
 
-To run the same generic discovery assertion against an external source tree without committing that source:
+To run a live model-only discovery assertion against an external source tree without committing that source:
 
 ```bash
-npm run check:source-discovery -- --source <path>
+npm run check:source-discovery -- \
+  --source <path> \
+  --corpus <reference-paths...> \
+  --provider openai \
+  --model gpt-5.5 \
+  --thinking xhigh \
+  --trials 4
 ```
 
-Add `--corpus <paths...>` and `--expect-severity critical` when validating that source plus neutral specification material proves a system-level impact chain.
+`check:source-discovery` is intentionally not part of default CI because it requires provider credentials and live model calls. It fails unless an audit model call is recorded and a model-produced finding generates a disclosure report.
 
 ## Pi Package Usage
 
@@ -103,13 +156,15 @@ Try the package locally from this directory:
 pi -e .
 ```
 
-The extension registers `fsa_run_audit`. It defaults to `dryRun: true`, so the first call only uses local static seeders. It also blocks bash commands that combine public live networks with exploit/broadcast-style operations.
+The extension registers `fsa_run_audit`. It defaults to `dryRun: true`, so the first call only uses local checklist seeders. It also accepts `projectContext`, `lensPacks`, and `dynamicLensDiscovery` parameters for project-specific audits. The extension blocks bash commands that combine public live networks with exploit/broadcast-style operations.
 
 ## Outputs
 
 Each run writes:
 
 - `checklist.json`: enumerated audit items.
+- `project_profile.json`: deterministic project profile.
+- `lens_packs.json`: configured plus model-generated audit lens packs.
 - `audit_results.json`: per-item, per-trial findings.
 - `summary.json`: ranked finding summary and coverage.
 - `verifications.json`: independent local-only verification notes.

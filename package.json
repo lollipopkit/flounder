@@ -25,7 +25,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test tests/*.test.mjs",
     "check:public": "node scripts/check-public-surface.mjs",
@@ -50,8 +50,10 @@
     "dist/audit/**",
     "dist/index/**",
     "dist/ingest/**",
+    "dist/lens/**",
     "dist/llm/**",
     "dist/pi/**",
+    "dist/profile/**",
     "dist/reports/**",
     "dist/security/**",
     "dist/seeders/**",

@@ -8,6 +8,9 @@
 - Use pi-mono primitives by default for agent/runtime integration, especially `pi-ai` and `pi-coding-agent`. Choose a different framework only when there is a concrete technical reason and document that reason.
 - Keep the architecture ready for future coding-agent use cases. Separate ingestion, source indexing, checklist enumeration, audit workers, verification, reporting, and security policy guardrails.
 - Prefer typed interfaces, schema validation, deterministic tests, and small extension points over ad hoc agent logic.
+- Treat deterministic project profiles, source indexes, checklist seeders, and lens packs as planning aids only. They may route attention, but they must not produce vulnerability findings.
+- In live audits, prefer a project reconnaissance stage that lets the model propose dynamic lens packs from the target's assets, trust boundaries, invariants, and attacker model before checklist enumeration.
+- Let project-specific configuration add context, lens packs, failure modes, and auditor agents without modifying core code.
 
 ## Security And White-Hat Boundaries
 
@@ -15,6 +18,7 @@
 - Verification must run locally or in a sandbox. Use unit tests, fixtures, local devnets, forked nodes, or isolated harnesses.
 - Never broadcast transactions, exploit public networks, or target systems outside the authorized scope.
 - Treat LLM output as untrusted input. Validate structured output, sanitize paths, and never execute generated commands without policy checks.
+- Treat model-generated lens packs as untrusted planning artifacts. Normalize, bound, log, and review them before using them as audit guidance.
 - Default to deny for commands that combine network access with exploit, broadcast, credential, destructive, or persistence behavior.
 - Keep audit artifacts private by default. Redact them before sharing outside the trusted project context.
 

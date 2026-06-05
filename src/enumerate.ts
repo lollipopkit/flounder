@@ -2,8 +2,10 @@ import type { AuditorConfig } from "./config.js";
 import { effectiveFailureModes } from "./config.js";
 import { buildEnumerationPrompt, ENUM_SYSTEM } from "./agents/prompts.js";
 import { assemble } from "./ingest/source.js";
+import { renderLensPacks, renderProjectContext } from "./lens/context.js";
+import { renderProjectProfile } from "./profile/project.js";
 import { runSeeders } from "./seeders/index.js";
-import type { AuditItem, Doc, LlmClient } from "./types.js";
+import type { AuditItem, Doc, LlmClient, ProjectProfile } from "./types.js";
 import { extractJsonArray } from "./util/json.js";
 import type { RunLogger } from "./trace/logger.js";
 
@@ -25,6 +27,7 @@ export async function enumerateAuditItems(input: {
   cfg: AuditorConfig;
   corpus: Doc[];
   source: Doc[];
+  projectProfile?: ProjectProfile;
   llm?: LlmClient;
   logger: RunLogger;
 }): Promise<AuditItem[]> {
@@ -41,6 +44,9 @@ export async function enumerateAuditItems(input: {
   const user = buildEnumerationPrompt({
     target: input.cfg.targetName,
     failureModes: effectiveFailureModes(input.cfg),
+    projectProfile: input.projectProfile ? renderProjectProfile(input.projectProfile) : "",
+    projectContext: renderProjectContext(input.cfg.projectContext),
+    lensPacks: renderLensPacks(input.cfg.lensPacks),
     corpus: corpusText,
     source: sourceText,
   });

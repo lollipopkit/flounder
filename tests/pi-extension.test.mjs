@@ -23,6 +23,7 @@ test("pi extension registers audit tool and runs dry-run", async () => {
   extension(fakePi);
 
   assert.ok(tools.has("fsa_run_audit"));
+  assert.ok(tools.has("fsa_hunt"));
   assert.ok(commands.has("fsa"));
   assert.ok(handlers.has("tool_call"));
   assert.ok(handlers.has("user_bash"));

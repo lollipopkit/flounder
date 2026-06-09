@@ -290,6 +290,8 @@ The project is a pi package. `package.json` exposes:
 
 The extension registers read-only audit tools first. Tools that write tests or run commands should stay behind explicit user confirmation and sandbox guards.
 
+The extension exposes both drivers: `fsa_hunt` for the thin agentic mode and `fsa_run_audit` for the staged pipeline. `fsa_hunt` requires a live provider and routes all local-test execution through the shared sandbox and command-safety policy; verification stays local-only.
+
 `fsa_run_audit` defaults to dry-run so package users can inspect checklist generation before spending model calls. The extension also installs a guardrail on bash tool calls and direct user bash commands that combine public live networks with exploit/broadcast wording.
 
 The command guardrail lives in `src/security/policy.ts` so non-pi integrations can reuse and test the same policy.

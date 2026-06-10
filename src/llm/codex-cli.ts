@@ -15,11 +15,12 @@ export class CodexCliClient implements LlmClient {
     model?: string;
     maxTokens?: number;
     thinkingLevel?: "minimal" | "low" | "medium" | "high" | "xhigh";
+    agentic?: boolean;
   }): Promise<string> {
     if (!input.model) throw new Error("model is required");
     const tmp = await mkdtemp(path.join(os.tmpdir(), "fsa-codex-cli-"));
     const outputFile = path.join(tmp, "last-message.txt");
-    const prompt = renderPrompt(input.system, input.user);
+    const prompt = renderPrompt(input.system, input.user, input.agentic ?? false);
     const args = buildCodexExecArgs({
       model: input.model,
       workdir: tmp,
@@ -122,7 +123,18 @@ export function buildCodexExecArgs(input: {
   return args;
 }
 
-function renderPrompt(system: string, user: string): string {
+function renderPrompt(system: string, user: string, agentic: boolean): string {
+  if (agentic) {
+    return `You are a non-interactive model driving one turn of an automated audit loop.
+The task below defines tools that the surrounding framework runs for you. To act, respond in the exact format the task specifies (a single JSON object) and nothing else. You will receive each tool's result and then take the next turn. Use the tools to investigate the code yourself; do not assume the work is already done.
+
+System instructions:
+${system}
+
+User task:
+${user}
+`;
+  }
   return `You are acting as a non-interactive language model inside an audit pipeline.
 Do not run tools, inspect files, or rely on external context. Answer only from the text below.
 

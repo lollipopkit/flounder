@@ -50,6 +50,7 @@ export async function runHuntLoop(input: {
         model: input.cfg.auditModel,
         maxTokens: input.cfg.maxTokens,
         thinkingLevel: input.cfg.thinkingLevel,
+        agentic: true,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

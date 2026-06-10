@@ -15,10 +15,11 @@ export class ClaudeCodeClient implements LlmClient {
     model?: string;
     maxTokens?: number;
     thinkingLevel?: "minimal" | "low" | "medium" | "high" | "xhigh";
+    agentic?: boolean;
   }): Promise<string> {
     if (!input.model) throw new Error("model is required");
     const tmp = await mkdtemp(path.join(os.tmpdir(), "fsa-claude-code-"));
-    const system = renderSystemPrompt(input.system);
+    const system = renderSystemPrompt(input.system, input.agentic ?? false);
     const args = [
       "-p",
       "--model",
@@ -71,7 +72,20 @@ export class ClaudeCodeClient implements LlmClient {
   }
 }
 
-function renderSystemPrompt(system: string): string {
+function renderSystemPrompt(system: string, agentic: boolean): string {
+  if (agentic) {
+    // Agentic loop: the model must drive its own investigation. The framework
+    // executes the tools the task describes when the model emits a tool action,
+    // so the only constraint is the exact response format. Do NOT tell the model
+    // to avoid inspecting files or to answer only from the provided text — that
+    // would defeat the loop.
+    return `You are a non-interactive model driving one turn of an automated audit loop.
+The task below defines tools that the surrounding framework runs for you. To act, respond in the exact format the task specifies (a single JSON object) and nothing else: no markdown fences, no commentary, no reasoning prose outside that format. You will receive each tool's result and then take the next turn. Use the tools to investigate the code yourself; do not assume the work is already done.
+
+System instructions:
+${system}
+`;
+  }
   return `You are acting as a non-interactive language model inside an audit pipeline.
 Do not run tools, inspect files, or rely on external context. Answer only from the text below.
 Return only the exact response format requested by the user task. Do not include markdown fences, preambles, or reasoning prose outside that requested format.

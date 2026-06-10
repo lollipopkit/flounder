@@ -7,11 +7,11 @@
 - Use TypeScript as the default implementation language.
 - Use pi-mono primitives by default for agent/runtime integration, especially `pi-ai` and `pi-coding-agent`. Choose a different framework only when there is a concrete technical reason and document that reason.
 - Keep model/provider selection runtime-configured. Do not assume every model family is available through every pi provider; use `codex-cli` only as an explicit local fallback when the user selects it.
-- Keep the architecture ready for future coding-agent use cases. Separate ingestion, source indexing, checklist enumeration, audit workers, verification, reporting, and security policy guardrails.
+- Keep the architecture ready for future coding-agent use cases. Separate ingestion, source indexing, agent tools, verification, reporting, and security policy guardrails.
 - Prefer typed interfaces, schema validation, deterministic tests, and small extension points over ad hoc agent logic.
 - Treat deterministic project profiles, source indexes, checklist seeders, and lens packs as planning aids only. They may route attention, but they must not produce vulnerability findings.
 - When new learning materials appear during a specialized audit, study the target domain first so the audit has the required protocol, cryptography, proof-system, financial, or application-specific expertise before running or finalizing the audit.
-- In live audits, prefer a project reconnaissance stage that lets the model propose dynamic lens packs from the target's assets, trust boundaries, invariants, and attacker model before checklist enumeration.
+- In live audits, prefer `fsa hunt`: give the model a thin capability surface and let it decide how to inspect the target's assets, trust boundaries, invariants, and attacker model.
 - Treat `rounds` and `trials` as different mechanisms. Rounds must generate novel checklist coverage from prior observations; trials independently audit one item for stochastic agreement.
 - Later exploration rounds must use duplicate filtering and coverage deltas. Do not call repeated single-pass audits "multi-round" unless they add new source-grounded audit items.
 - Let project-specific configuration add context, lens packs, failure modes, and auditor agents without modifying core code.
@@ -19,7 +19,7 @@
 
 ## Thin-Layer Agentic Mode
 
-- The framework has two drivers: `fsa hunt` (thin agentic) and `fsa run` (staged pipeline). Keep both working over the shared substrate (ingestion, `src/security/sandbox.ts`, verification, reporting, project history, command-safety policy).
+- The framework's default and public driver is `fsa hunt` (thin agentic). Do not add or restore `fsa run` as a default/public staged pipeline path; if a future need arises, recover it from Git deliberately.
 - In agentic mode the framework provides capabilities and guarantees, not strategy. A new component is justified only if it gives the model an affordance it lacks (read/search source, run an isolated local test, recall prior runs) or a guarantee the model cannot self-provide (execution confirmation, sandbox isolation, command safety, durable replayable state). Do not add taxonomy, domain playbooks, or search schedules to the hunt path; if a human prior is useful, expose it as an optional model-callable tool, not as injected prompt preamble.
 - Keep the one hard opinion: a claim is not a finding until a local test confirms it. `report_finding` may only reach `confirmed-executable` by citing a `run_test` that actually passed. Never let the model upgrade confirmation by assertion.
 - All generated-test execution must route through the shared sandbox module and the command-safety policy. Verification stays local-only.

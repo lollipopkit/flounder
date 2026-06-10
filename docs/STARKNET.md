@@ -1,45 +1,34 @@
 # Cairo And Starknet Audits
 
-`configs/cairo-starknet-hunt.default.json` is the default profile for authorized Cairo and Starknet audits, including Starknet OS, Cairo contracts, and StarkGate-style bridge components.
+`configs/cairo-starknet-hunt.default.json` provides optional context for authorized Cairo and Starknet hunts, including Starknet OS, Cairo contracts, and StarkGate-style bridge components.
 
-The profile keeps the framework's discovery rules intact: deterministic project profiles, source indexes, provenance facts, tool outputs, and local seeders are planning evidence only. Findings still require model-backed audit trials, source verification, known-issue checks, and optional local-only reproduction.
+In hunt mode, the profile is context, not a checklist. The agent still decides what to read, suspect, test, and report. Deterministic profiles, provenance facts, source indexes, and local seeders are planning aids only; findings must come from the agent and local evidence.
 
 ## What The Profile Adds
 
 - Cairo/Starknet project context for state transition correctness, OS output commitments, L1/L2 bridge messages, token accounting, class hashes, syscalls, resource accounting, and role or governance authority.
-- Domain lens packs for entrypoint authority, L1/L2 bridge message and accounting, Starknet OS state transition and output commitment, syscall context binding, class-hash deployment or replacement, and resource accounting.
-- Custom auditor agents for Cairo-specific failure modes such as `cairo_entrypoint_authority`, `cairo_l1_l2_message_binding`, `cairo_state_transition_integrity`, `cairo_os_output_commitment`, `cairo_syscall_context_binding`, `cairo_class_hash_binding`, and `cairo_resource_accounting`.
-- Cairo/Starknet provenance extraction for entrypoints, syscalls, storage reads and writes, dict/state update flows, L1/L2 messages, class-hash binding, resource accounting, block context, and OS output commitments.
-- Cairo/Starknet-specific portfolio enumeration that turns provenance facts into candidate audit items for entrypoint authority, bridge payload/accounting, syscall context, state commitments, class hashes, and resource edges.
+- Optional domain hints for entrypoint authority, L1/L2 bridge binding, state transition integrity, OS output commitment, syscall context binding, class-hash binding, and resource accounting.
+- Cairo/Starknet provenance facts for entrypoints, syscalls, storage reads and writes, dict/state update flows, L1/L2 messages, class-hash binding, resource accounting, block context, and OS output commitments.
 
-## Recommended Run
+## Recommended Hunt
 
 ```bash
-fsa run \
+fsa hunt \
   --config ./configs/cairo-starknet-hunt.default.json \
   --target starknet-target-audit \
   --source <target>/src <target>/crates <target>/packages \
   --corpus <target>/README.md <target>/docs <target>/specs \
   --provider openai \
   --model gpt-5.5 \
-  --rounds 3 \
-  --trials 5
+  --thinking xhigh \
+  --max-steps 60
 ```
 
-For larger repositories, use a QMD collection scoped to the target material:
-
-```bash
-fsa run \
-  --config ./configs/cairo-starknet-hunt.default.json \
-  --target starknet-target-audit \
-  --source <target>/src <target>/crates <target>/packages \
-  --corpus <target>/README.md <target>/docs <target>/specs \
-  --qmd-collection target-starknet
-```
+For larger repositories, include the highest-signal specs, bridge message formats, OS design notes, prior audits, test suites, and threat-model material as corpus input.
 
 ## Local Reproduction
 
-The default profile does not plan or execute reproductions during the audit run. After findings are collected, request local-only reproduction planning or execution explicitly:
+Later reproduction can run against an existing hunt artifact:
 
 ```bash
 fsa reproduce \
@@ -60,4 +49,4 @@ Load as much source-backed context as possible:
 - Protocol specs, Starknet OS design docs, bridge message formats, bounty scope notes, prior audits, known limitations, and threat-model notes.
 - Tests are coverage evidence, not proof that a property is enforced.
 
-For high-stakes runs, extend `projectContext` with exact bounty assets, mainnet/testnet out-of-scope notes, privileged actor assumptions, bridge endpoints, token mappings, class-hash governance model, and local reproduction constraints.
+For high-stakes hunts, extend `projectContext` with exact bounty assets, public-network out-of-scope notes, privileged actor assumptions, bridge endpoints, token mappings, class-hash governance model, and local reproduction constraints.

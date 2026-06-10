@@ -1,19 +1,8 @@
 #!/usr/bin/env node
-import { mkdtemp, readFile } from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-import { defaultConfig, runPipeline } from "../dist/index.js";
+import { loadSource, runSeeders } from "../dist/index.js";
 
-const out = await mkdtemp(path.join(os.tmpdir(), "fsa-blind-"));
-const cfg = defaultConfig();
-cfg.targetName = "blind-discovery";
-cfg.sourcePaths = ["fixtures/halo2_scalar_mul_binding.rs"];
-cfg.outputDir = out;
-cfg.dryRun = true;
-cfg.localChecklistSeeders = true;
-
-const result = await runPipeline(cfg);
-const checklist = JSON.parse(await readFile(path.join(result.runDir, "checklist.json"), "utf8"));
+const source = await loadSource(["fixtures/halo2_scalar_mul_binding.rs"]);
+const checklist = runSeeders(source);
 const bindingItems = checklist.filter((item) => item.seeder === "halo2_advice_binding");
 
 if (bindingItems.length !== 1) {

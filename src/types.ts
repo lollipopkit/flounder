@@ -342,5 +342,10 @@ export interface LlmClient {
     model?: string;
     maxTokens?: number;
     thinkingLevel?: "minimal" | "low" | "medium" | "high" | "xhigh";
+    // When true, the call is one turn of an agentic tool loop: the model must be
+    // free to drive its own investigation and emit a tool action. CLI-fallback
+    // providers must not inject a "do not inspect files / answer only from the
+    // text below" preamble in this mode, which would sabotage the loop.
+    agentic?: boolean;
   }): Promise<string>;
 }

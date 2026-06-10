@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { readFile } from "node:fs/promises";
 import { defaultConfig, type AuditorConfig } from "./config.js";
-import { runPipeline } from "./pipeline.js";
 import { runHunt } from "./agent/hunt.js";
 import type { AuditItem, AuditResult, AuditorAgentDefinition } from "./types.js";
 import { loadCorpus, loadSource } from "./ingest/source.js";
@@ -13,7 +12,7 @@ import { createLlmClient } from "./llm/client.js";
 import { MockAuditLlmClient } from "./llm/mock.js";
 import { normalizeLensPacks, normalizeProjectContext } from "./lens/context.js";
 import { resolveLastRunDir } from "./trace/last-run.js";
-import { importRunToProjectHistory, projectHistoryManifestPath, resolveProjectHistoryLatestRunDir, updateProjectHistory } from "./trace/history.js";
+import { importRunToProjectHistory, projectHistoryManifestPath, updateProjectHistory } from "./trace/history.js";
 import { reproduceTop } from "./reproduce/planner.js";
 import { loadProjectLearningFromRun, loadSummaryFromRun, loadVerificationsFromRun } from "./trace/run-state.js";
 import { renderDisclosure, reportArtifactName } from "./reports/disclosure.js";
@@ -28,19 +27,6 @@ async function main(argv: string[]): Promise<void> {
 
   if (cmd === "history") {
     await runHistoryCommand(rest);
-    return;
-  }
-
-  if (cmd === "run") {
-    const { cfg, verifyTopK } = await parseConfig(rest);
-    const resumeRunDir = await readResumeRunDir(rest, cfg);
-    const result = await runPipeline(cfg, {
-      verifyTopK,
-      streamEvents: true,
-      ...(resumeRunDir ? { resumeRunDir } : {}),
-      ...(hasFlag(rest, "--mock-llm") ? { llm: new MockAuditLlmClient() } : {}),
-    });
-    printCoverage(result.runDir, result.summary.coverage);
     return;
   }
 
@@ -355,22 +341,6 @@ function readReproductionModeFlag(args: string[]): AuditorConfig["reproductionMo
   return value === "off" || value === "plan" || value === "execute" ? value : undefined;
 }
 
-async function readResumeRunDir(args: string[], cfg: AuditorConfig): Promise<string | undefined> {
-  const continueProject = readFlag(args, "--continue-project");
-  if (hasFlag(args, "--continue-project") && !continueProject) throw new Error("--continue-project <target> is required");
-  if (continueProject) {
-    if (hasFlag(args, "--resume-last") || readFlag(args, "--resume-run")) {
-      throw new Error("--continue-project cannot be combined with --resume-last or --resume-run");
-    }
-    cfg.targetName = continueProject;
-    return resolveProjectHistoryLatestRunDir(projectHistoryLocation(cfg));
-  }
-  if (hasFlag(args, "--resume-last")) return resolveLastRunDir(cfg.outputDir);
-  const resumeRun = readFlag(args, "--resume-run");
-  if (resumeRun === "last") return resolveLastRunDir(cfg.outputDir);
-  return resumeRun;
-}
-
 function readMultiFlag(args: string[], name: string): string[] {
   const idx = args.indexOf(name);
   if (idx === -1) return [];
@@ -426,60 +396,23 @@ function printHelp(): void {
 
 Usage:
   fsa hunt --target <name> --source <paths...> [--corpus <paths...>] [--max-steps <n>]
-  fsa run --target <name> --source <paths...> [--corpus <paths...>] [--dry-run]
   fsa audit --checklist <file> --source <paths...>
   fsa reproduce --run <dir> --source <paths...> [--repro plan|execute]
   fsa history import-run --target <name> --run <dir> [--history-dir <dir>]
 
 hunt is the thin agentic mode: the model drives its own investigation with
 read/search/run_test tools and durable cross-run memory. The framework supplies
-capability and verification, not a checklist. run is the staged pipeline.
+capability and verification, not a checklist.
 
 Options:
-  --config <file>         JSON config with projectContext, lensPacks, agents, models, paths
+  --config <file>         JSON config with project context, models, and paths
   --provider <name>       pi-ai provider, codex-cli, or claude-code; default openai
-  --model <name>          set enum/audit/verify model
-  --enum-model <name>     model for checklist enumeration
-  --audit-model <name>    model for audit trials
-  --verify-model <name>   model for verification planning
-  --rounds <n>            project exploration rounds, default 1
-                          with --resume-run, append n additional rounds
-  --strategy <name>       breadth|depth|hybrid, default hybrid
+  --model <name>          set model for hunt/reproduce calls
   --history-dir <dir>     project history directory, default <out>/history
-  --continue-project <target>
-                          append rounds to the latest run saved in that project's history
-  --resume-run <dir>      continue from an existing run directory
-  --resume-run last       continue from the last run under --out
-  --resume-last           shorthand for --resume-run last
-  --max-new-items-per-round <n>
-                          cap new deepening items per round, default 16
-  --trials <n>            independent trials per item, default 4
-  --scope-mode <name>     augment|restrict, default augment
-                          augment treats configured lenses as guidance, not a boundary
-  --baseline-exploration-share <n>
-                          in augment mode, reserve this first-round share for lens-free broad enumeration
-  --max-items <n>         cap total audit items across rounds for cost-controlled runs
   --thinking <level>      minimal|low|medium|high|xhigh
-  --context-chars <n>     character budget per audit item context
-  --retrieval <name>      source-index|source-index+qmd, default source-index
-  --qmd-command <cmd>     QMD CLI command when QMD retrieval is enabled, default qmd
-  --qmd-limit <n>         max QMD hits per item, default 6
-  --qmd-min-score <n>     minimum QMD hit score, default 0.25
-  --qmd-timeout-ms <n>    QMD query timeout, default 60000
-  --qmd-collection <names...>
-                          limit QMD retrieval to one or more collections
-  --verify-top <n>        top ranked findings for verification and reproduction, default 3
-                          high-impact findings are added beyond this cap by default
-  --high-impact-max-findings <n>
-                          additional high-impact findings to force through follow-up, default 24
-  --no-high-impact-verification
-                          disable high-impact follow-up expansion
-  --dry-run               no model calls; local checklist seeders only
-  --no-project-learning   disable model initialization learning notes
-  --no-dynamic-lenses     disable model-generated project lens packs
-  --local-seeders         add deterministic local checklist seeders
-  --no-local-seeders      require checklist items to come from model enumeration
-  --repro <mode>          off|plan|execute, default off for run; reproduce defaults to plan
+  --verify-top <n>        reproduce: ranked findings to process, default 3
+  --dry-run               not supported by hunt; use --mock-llm for offline checks
+  --repro <mode>          off|plan|execute; reproduce defaults to plan
   --repro-max-commands <n>
                           cap local reproduction commands per finding, default 3
   --repro-timeout-ms <n>  timeout per local reproduction command, default 120000

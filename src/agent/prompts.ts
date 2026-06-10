@@ -60,19 +60,49 @@ ${input.fileManifest}
 Begin. Respond with one JSON action.`;
 }
 
-export function renderTranscript(steps: TranscriptStep[]): string {
+export interface TranscriptWindow {
+  // Number of most-recent steps whose full observation is kept. Older steps are
+  // compacted to a one-line reference so prompt size stays bounded on long hunts.
+  recentFull: number;
+  // Per-observation cap (chars) for the recent, full steps.
+  fullCap: number;
+  // Per-observation cap (chars) for older, compacted steps.
+  summaryCap: number;
+}
+
+export const DEFAULT_TRANSCRIPT_WINDOW: TranscriptWindow = { recentFull: 8, fullCap: 9000, summaryCap: 160 };
+
+// Render the running transcript for the next prompt. The loop re-sends history
+// every turn, so without windowing a long hunt grows quadratically and burns
+// model quota. Recent steps are kept in full; older observations are elided to a
+// short reference (the path/tool stays visible, so the model knows what it has
+// seen and can re-read on demand).
+export function renderTranscript(steps: TranscriptStep[], window: TranscriptWindow = DEFAULT_TRANSCRIPT_WINDOW): string {
   if (steps.length === 0) return "(no actions yet)";
+  const cutoff = steps.length - Math.max(1, window.recentFull);
   return steps
-    .map((step) => {
+    .map((step, idx) => {
       const args = safeJson(step.args);
-      const parts = [
-        `[step ${step.n}] thought: ${step.thought || "(none)"}`,
-        `action: ${step.tool} ${args}`,
-        `observation: ${step.observation}`,
-      ];
-      return parts.join("\n");
+      const recent = idx >= cutoff;
+      const observation = recent
+        ? clip(step.observation, window.fullCap)
+        : `${firstLine(step.observation, window.summaryCap)} … (elided; re-read if needed)`;
+      const thought = recent ? step.thought || "(none)" : clip(step.thought, window.summaryCap);
+      return [`[step ${step.n}] thought: ${thought}`, `action: ${step.tool} ${args}`, `observation: ${observation}`].join("\n");
     })
     .join("\n\n");
+}
+
+function clip(text: string, cap: number): string {
+  if (text.length <= cap) return text;
+  const head = Math.floor(cap * 0.7);
+  const tail = cap - head;
+  return `${text.slice(0, head)}\n…[${text.length - cap} chars elided]…\n${text.slice(text.length - tail)}`;
+}
+
+function firstLine(text: string, cap: number): string {
+  const line = text.split("\n", 1)[0] ?? "";
+  return line.length > cap ? line.slice(0, cap) : line;
 }
 
 export interface TranscriptStep {

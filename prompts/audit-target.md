@@ -2,19 +2,10 @@
 
 Audit the provided target as an authorized white-hat researcher.
 
-First enumerate a checklist of concrete audit items. Do not jump straight to bug claims.
+You are in full control of the investigation. There is no fixed checklist, failure-mode taxonomy, or required search order. Use the full depth of your own security knowledge: build a model of what the code is supposed to guarantee (its invariants and trust boundaries), then look for where the implementation lets an attacker break that guarantee.
 
-For each item identify:
+Investigate with the tools: read and search the source, write and run local tests, and recall prior runs. Be skeptical of both positive and negative conclusions. A finding is useful only if it is grounded in specific code — a missing check, a missing constraint, or a demonstrable data flow.
 
-- code location
-- relevant spec or design statement
-- security property that must hold
-- failure mode
-- attacker-controlled inputs
-- why this location deserves scrutiny
+Prove your strongest findings. A claim only becomes a confirmed finding when a local test that exercises the actual vulnerable code path passes; everything else is an unconfirmed hypothesis. Record candidates by writing findings.json, citing the confirming test where you have one.
 
-Then audit each item with the appropriate specialized lens. Be skeptical of both positive and negative conclusions. A finding is useful only if it is grounded in specific code, missing checks, missing constraints, or demonstrable data flow.
-
-If running multiple exploration rounds, later rounds must generate novel follow-up checklist items from prior coverage gaps, weak assumptions, neighboring data flow, or skeptical audit observations. Do not repeat the same checklist and call it a new round.
-
-Verification must stay local-only: unit test, regtest, devnet, or forked node. Never target public testnet or mainnet.
+Verification must stay local-only: unit test, regtest, devnet, or forked node. Never target public testnet or mainnet, and never weaponize a bug.

@@ -2,21 +2,10 @@
 import { readFile } from "node:fs/promises";
 import { defaultConfig, type AuditorConfig } from "./config.js";
 import { runHunt } from "./agent/hunt.js";
-import type { AuditItem, AuditResult, AuditorAgentDefinition } from "./types.js";
-import { loadCorpus, loadSource } from "./ingest/source.js";
-import { RunLogger } from "./trace/logger.js";
-import { runAudit } from "./audit/runner.js";
-import { aggregate } from "./audit/aggregate.js";
-import { selectFindingsForFollowUp } from "./audit/impact.js";
-import { createLlmClient } from "./llm/client.js";
+import type { AuditorAgentDefinition } from "./types.js";
 import { MockAuditLlmClient } from "./llm/mock.js";
 import { normalizeLensPacks, normalizeProjectContext } from "./lens/context.js";
-import { resolveLastRunDir } from "./trace/last-run.js";
-import { importRunToProjectHistory, projectHistoryManifestPath, updateProjectHistory } from "./trace/history.js";
-import { reproduceTop } from "./reproduce/planner.js";
-import { loadProjectLearningFromRun, loadSummaryFromRun, loadVerificationsFromRun } from "./trace/run-state.js";
-import { renderDisclosure, reportArtifactName } from "./reports/disclosure.js";
-import type { AuditSummary, Reproduction, Verification } from "./types.js";
+import { importRunToProjectHistory, projectHistoryManifestPath } from "./trace/history.js";
 
 async function main(argv: string[]): Promise<void> {
   const [cmd, ...rest] = argv;
@@ -39,82 +28,6 @@ async function main(argv: string[]): Promise<void> {
       ...(hasFlag(rest, "--mock-llm") ? { llm: new MockAuditLlmClient() } : {}),
     });
     printCoverage(result.runDir, result.summary.coverage);
-    return;
-  }
-
-  if (cmd === "audit") {
-    const { cfg } = await parseConfig(rest);
-    const checklistPath = readFlag(rest, "--checklist");
-    if (!checklistPath) throw new Error("--checklist is required");
-    const checklist = JSON.parse(await readFile(checklistPath, "utf8")) as AuditItem[];
-    const startedAt = new Date();
-    const logger = new RunLogger(cfg.outputDir, cfg.targetName, startedAt, { streamEvents: true });
-    await logger.init();
-    const source = await loadSource(cfg.sourcePaths);
-    const corpus = await loadCorpus(cfg.corpusPaths);
-    const llm = cfg.dryRun ? undefined : hasFlag(rest, "--mock-llm") ? new MockAuditLlmClient(logger) : createLlmClient(cfg, logger);
-    await logger.artifact("checklist.json", checklist);
-    const results = await runAudit({ cfg, items: checklist, source, corpus, ...(llm ? { llm } : {}), logger });
-    const summary = aggregate(results);
-    await logger.artifact("summary.json", summary);
-    await updateProjectHistory({
-      cfg,
-      runDir: logger.runDir,
-      summary,
-      items: checklist,
-      results,
-      completedRounds: roundsFromItems(checklist),
-      startedAt: startedAt.toISOString(),
-    });
-    printCoverage(logger.runDir, summary.coverage);
-    return;
-  }
-
-  if (cmd === "reproduce") {
-    const { cfg, verifyTopK } = await parseConfig(rest);
-    const runDir = readFlag(rest, "--run") ?? readFlag(rest, "--run-dir") ?? (hasFlag(rest, "--resume-last") ? await resolveLastRunDir(cfg.outputDir) : undefined);
-    if (!runDir) throw new Error("--run <dir> is required");
-    if (cfg.sourcePaths.length === 0) throw new Error("--source <paths...> or sourcePaths in --config is required for reproduction");
-    if (cfg.reproductionMode === "off") cfg.reproductionMode = "plan";
-    const summary = await loadSummaryFromRun(runDir);
-    const verifications = await loadVerificationsFromRun(runDir);
-    const projectLearning = await loadProjectLearningFromRun(runDir);
-    const logger = new RunLogger(cfg.outputDir, cfg.targetName, new Date(), { runDir, streamEvents: true });
-    await logger.init();
-    const source = await loadSource(cfg.sourcePaths);
-    const llm = cfg.dryRun ? undefined : hasFlag(rest, "--mock-llm") ? new MockAuditLlmClient(logger) : createLlmClient(cfg, logger);
-    if (llm && "setLogger" in llm && typeof llm.setLogger === "function") {
-      llm.setLogger(logger);
-    }
-    const reproductions = await reproduceTop({
-      cfg,
-      findings: summary.findings,
-      verifications,
-      source,
-      ...(projectLearning ? { projectLearning } : {}),
-      ...(llm ? { llm } : {}),
-      logger,
-      topK: verifyTopK,
-    });
-    applyReproductionStatuses(summary, reproductions);
-    updateVerificationCoverage(summary);
-    await logger.artifact("summary.json", summary);
-    const verificationById = new Map(verifications.map((verification) => [verification.id, verification]));
-    const reproductionByFindingId = new Map(reproductions.map((reproduction) => [reproduction.findingId, reproduction]));
-    for (const finding of selectFindingsForFollowUp(summary.findings, verifyTopK, cfg)) {
-      await logger.artifact(reportArtifactName(finding.id), renderDisclosure(cfg.targetName, finding, verificationById.get(finding.id), reproductionByFindingId.get(finding.id)));
-    }
-    const checklist = await readJsonFile<AuditItem[]>(`${runDir}/checklist.json`);
-    const results = await readJsonFile<AuditResult[]>(`${runDir}/audit_results.json`);
-    await updateProjectHistory({
-      cfg,
-      runDir,
-      summary,
-      items: checklist,
-      results,
-      completedRounds: roundsFromItems(checklist),
-    });
-    printCoverage(runDir, summary.coverage);
     return;
   }
 
@@ -381,14 +294,6 @@ async function runHistoryCommand(args: string[]): Promise<void> {
   console.log(`[history] runs=${manifest.aggregate.totalRuns} materials=${manifest.aggregate.materialsTotal} findings=${manifest.aggregate.findingsTotal}`);
 }
 
-async function readJsonFile<T>(file: string): Promise<T> {
-  return JSON.parse(await readFile(file, "utf8")) as T;
-}
-
-function roundsFromItems(items: AuditItem[]): number {
-  return Math.max(1, ...items.map((item) => (typeof item.round === "number" && Number.isFinite(item.round) ? item.round : 1)));
-}
-
 function projectHistoryLocation(cfg: AuditorConfig): { outputDir: string; targetName: string; historyDir?: string } {
   return {
     outputDir: cfg.outputDir,
@@ -402,8 +307,6 @@ function printHelp(): void {
 
 Usage:
   fsa hunt --target <name> --source <paths...> [--corpus <paths...>] [--max-steps <n>]
-  fsa audit --checklist <file> --source <paths...>
-  fsa reproduce --run <dir> --source <paths...> [--repro plan|execute]
   fsa history import-run --target <name> --run <dir> [--history-dir <dir>]
 
 hunt is the thin agentic mode: the model drives its own investigation with
@@ -412,43 +315,17 @@ supplies capability and verification, not a checklist.
 
 Options:
   --config <file>         JSON config with project context, models, and paths
-  --provider <name>       pi-ai provider, codex-cli, or claude-code; default openai
-  --model <name>          set model for hunt/reproduce calls
+  --provider <name>       pi-ai provider (default openai-codex); codex-cli/claude-code are CLI fallbacks
+  --model <name>          set the hunt model
   --history-dir <dir>     project history directory, default <out>/history
   --thinking <level>      minimal|low|medium|high|xhigh
-  --verify-top <n>        reproduce: ranked findings to process, default 3
-  --dry-run               not supported by hunt; use --mock-llm for offline checks
-  --repro <mode>          off|plan|execute; reproduce defaults to plan
-  --repro-max-commands <n>
-                          cap local reproduction commands per finding, default 3
-  --repro-timeout-ms <n>  timeout per local reproduction command, default 120000
-  --max-steps <n>         hunt: max agent actions before stopping, default 40
+  --max-steps <n>         hunt: max agent turns/actions before stopping, default 40
   --scope-note <text>     hunt: one-line authorized-scope hint for the agent
-  --no-prepare            hunt: skip the toolchain warm-up (deps fetch/build) before the loop
+  --no-prepare            hunt: skip the toolchain warm-up (deps fetch/build)
   --prepare-timeout-ms <n>
                           hunt: per-command timeout for the warm-up, default 600000
   --mock-llm              run with the deterministic mock model
 `);
-}
-
-function applyReproductionStatuses(summary: AuditSummary, reproductions: Reproduction[]): void {
-  const byFindingId = new Map(reproductions.map((reproduction) => [reproduction.findingId, reproduction]));
-  for (const finding of summary.findings) {
-    const reproduction = byFindingId.get(finding.id);
-    if (!reproduction) continue;
-    finding.reproductionStatus = reproduction.status;
-    if (reproduction.confirmationStatus === "confirmed-executable") {
-      finding.confirmationStatus = "confirmed-executable";
-    }
-  }
-}
-
-function updateVerificationCoverage(summary: AuditSummary): void {
-  const verified = summary.findings.filter(
-    (finding) => finding.confirmationStatus === "confirmed-source" || finding.confirmationStatus === "confirmed-executable" || finding.verificationVerdict === "false-positive",
-  ).length;
-  summary.coverage.verifiedFindings = verified;
-  summary.coverage.unverifiedFindings = Math.max(0, summary.findings.length - verified);
 }
 
 main(process.argv.slice(2)).catch((error: unknown) => {

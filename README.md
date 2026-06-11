@@ -99,12 +99,6 @@ Offline smoke test with the deterministic mock model:
 npm run mock-hunt
 ```
 
-Local seeder regression check:
-
-```bash
-npm run check:blind-discovery
-```
-
 Public-surface scan:
 
 ```bash
@@ -119,17 +113,7 @@ npm run verify
 
 ## Reproduction
 
-`fsa hunt` can call `bash` during the hunt to run local tests in the copied workspace. You can also run reproduction work later against an existing run:
-
-```bash
-fsa reproduce \
-  --run runs/<target-run> \
-  --source <source-paths...> \
-  --repro execute \
-  --verify-top 100
-```
-
-Reproduction writes files only inside a copied workspace under the run directory. It does not modify the target source tree. Command safety blocks public-network broadcast, transfer, credential, persistence, and exploit-optimization flows.
+Reproduction is part of the hunt itself: the agent calls `bash` to write and run local tests in the copied workspace, and a finding only reaches `confirmed-executable` when a `purpose=confirm` test passes. The agent writes files only inside a copied workspace under the run directory; it never modifies the target source tree. Command safety blocks public-network broadcast, transfer, credential, persistence, and exploit-optimization flows.
 
 ## Domain Profiles
 

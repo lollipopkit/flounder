@@ -28,17 +28,7 @@ For larger repositories, include the highest-signal specs, bridge message format
 
 ## Local Reproduction
 
-Later reproduction can run against an existing hunt artifact:
-
-```bash
-fsa reproduce \
-  --run runs/<target-run> \
-  --source <target> \
-  --repro plan \
-  --verify-top 20
-```
-
-When execution is enabled, reproduction commands must stay inside local test runners, local fixtures, or isolated devnets. Do not use public mainnet or public testnet message sending, transaction broadcasting, exploit optimization, or credentialed infrastructure.
+Reproduction is part of the hunt: the agent calls `bash` to run local tests in the copied workspace, and a finding only becomes `confirmed-executable` when a `purpose=confirm` test passes. Reproduction commands must stay inside local test runners, local fixtures, or isolated devnets. Do not use public mainnet or public testnet message sending, transaction broadcasting, exploit optimization, or credentialed infrastructure.
 
 ## Input Checklist
 

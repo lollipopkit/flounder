@@ -29,17 +29,7 @@ For larger repositories, include the highest-signal specs, prior audits, test su
 
 ## Local Reproduction
 
-The hunt agent can call `bash` during investigation to run local tests in the copied workspace. Later reproduction can also be run against an existing hunt artifact:
-
-```bash
-fsa reproduce \
-  --run runs/<target-run> \
-  --source <target> \
-  --repro plan \
-  --verify-top 20
-```
-
-When execution is enabled, commands are restricted to local test runners such as:
+Reproduction is part of the hunt: the agent calls `bash` to write and run local tests in the copied workspace, and a finding only becomes `confirmed-executable` when a `purpose=confirm` test passes. Commands are restricted to local test runners such as:
 
 - `forge test`
 - `npx hardhat test`

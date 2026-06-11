@@ -36,4 +36,4 @@ Use this skill when auditing source code for security bugs across application, i
 - Secret exposure and dependency supply-chain trust.
 - DoS/resource amplification.
 
-Local checklist seeders, source indexes, project profiles, provenance facts, and lens packs are planning aids. Findings must come from the agent's investigation grounded in specific code evidence. The framework should provide capability and confirmation guarantees, not tell the model how to think.
+Findings must come from the agent's own investigation grounded in specific code evidence. The framework provides capability and confirmation guarantees (sandboxed tools, a toolchain warm-up, and an execution-confirmation gate), not a checklist or a way to tell the model how to think.

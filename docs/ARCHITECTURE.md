@@ -131,7 +131,6 @@ The command guardrail lives in `src/security/policy.ts` so non-pi integrations c
 - `npm run check`: strict TypeScript compile.
 - `npm test`: build plus Node tests.
 - `npm run mock-hunt`: deterministic offline hunt smoke test.
-- `npm run check:blind-discovery`: local seeder regression check for optional planning aids.
 - `npm run check:public`: public-surface scan for secrets and local paths.
 - `npm run verify`: full local gate.
 

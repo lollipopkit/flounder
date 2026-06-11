@@ -81,5 +81,7 @@ function responseFor(tag: string, _user: string): string {
   // The deterministic mock now only drives the hunt loop; the staged-pipeline
   // tags (learn/enumerate/audit/verify/reproduce) were removed with that pipeline.
   if (tag === "hunt") return huntActionFor(_user);
+  // Independent refutation: the mock skeptic cannot break the (genuinely correct) mock finding.
+  if (tag.startsWith("refute_")) return JSON.stringify({ refuted: false, reason: "mock skeptic could not refute the confirmed finding" });
   return "";
 }

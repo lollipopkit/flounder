@@ -259,6 +259,9 @@ export interface RankedFinding {
   reproductionStatus?: ReproductionStatus;
   impactScore?: number;
   impactSignals?: string[];
+  /** An execution-proven finding an independent skeptic disputes — needs human review. */
+  disputed?: boolean;
+  refutationReason?: string;
 }
 
 export interface AuditSummary {

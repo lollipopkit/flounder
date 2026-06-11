@@ -9,6 +9,7 @@ import { buildTools, ingestFindingsFromScratch, newSession } from "../dist/agent
 import { runHunt } from "../dist/agent/hunt.js";
 import { runHuntLoop } from "../dist/agent/loop.js";
 import { runDifferentialConfirmation } from "../dist/agent/differential.js";
+import { runRefutation } from "../dist/agent/refutation.js";
 import { isPiSessionProvider, mapThinkingLevel } from "../dist/agent/pi-session.js";
 import { MockAuditLlmClient } from "../dist/llm/mock.js";
 import { RunLogger } from "../dist/trace/logger.js";
@@ -198,6 +199,33 @@ test("baseline integrity: the model cannot modify the target source under audit"
   }
 });
 
+test("independent refutation: a skeptic verdict is attached to each confirmed finding", async () => {
+  const dir = await tempDir();
+  try {
+    const cfg = defaultConfig();
+    const logger = await tempLogger(dir);
+    const source = [{ path: "x.rs", kind: "source", content: "fn check() { /* ... */ }\n" }];
+    const findings = [
+      { id: "f1", title: "real", severity: "high", location: "x.rs:1", description: "", evidence: "", exploitSketch: "", fix: "", confidence: 0.9, confirmationStatus: "confirmed-executable" },
+      { id: "f2", title: "bogus", severity: "high", location: "x.rs:1", description: "", evidence: "", exploitSketch: "", fix: "", confidence: 0.9, confirmationStatus: "confirmed-executable" },
+    ];
+    // Skeptic refutes f2 (says it's actually safe) but cannot refute f1.
+    const llm = {
+      async complete(input) {
+        if (input.tag === "refute_f2") return JSON.stringify({ refuted: true, reason: "the property IS enforced at line 1" });
+        return JSON.stringify({ refuted: false, reason: "could not refute" });
+      },
+    };
+    const verdicts = await runRefutation({ findings, source, cfg, llm, logger, max: 8 });
+    assert.equal(verdicts.length, 2);
+    assert.equal(findings[0].refutation.refuted, false);
+    assert.equal(findings[1].refutation.refuted, true);
+    assert.match(findings[1].refutation.reason, /enforced/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("forced finalize: a run that never writes findings.json still captures hypotheses", async () => {
   const dir = await tempDir();
   try {
@@ -309,7 +337,7 @@ test("hunt produces an execution-confirmed finding and banks cross-run memory", 
 
     assert.equal(summary.findings.length, 1);
     const finding = summary.findings[0];
-    assert.equal(finding.confirmationStatus, "confirmed-executable");
+    assert.equal(finding.confirmationStatus, "confirmed-executable", "a finding the skeptic could not refute stays confirmed");
     assert.equal(finding.failureMode, "autonomous", "hunt findings are not forced into a fixed taxonomy");
     assert.equal(summary.coverage.verifiedFindings, 1);
     assert.equal(summary.coverage.unverifiedFindings, 0);

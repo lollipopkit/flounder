@@ -10,6 +10,7 @@ import type { AuditSummary, ConfirmationStatus, Doc, LlmClient, RankedFinding, S
 import { publicPath } from "../util/paths.js";
 import { listWorkspaceFiles, normalizeRelativePath, prepareSandboxWorkspace, writeSandboxFiles, type SandboxWorkspace } from "../security/sandbox.js";
 import { runDifferentialConfirmation, type DifferentialResult } from "./differential.js";
+import { runRefutation } from "./refutation.js";
 import { runHuntLoop } from "./loop.js";
 import { ProjectMemory } from "./memory.js";
 import { isPiSessionProvider, runHuntSession } from "./pi-session.js";
@@ -146,6 +147,24 @@ export async function runHunt(
     if (differentials.length > 0) await logger.artifact("hunt_differential.json", differentials);
   }
 
+  // Independent refutation: a fresh-context skeptic re-derives the invariant and
+  // tries to break each confirmed finding. A single-test confirmation it debunks
+  // is downgraded to a hypothesis; an execution-proven (differential) finding it
+  // disputes is kept but flagged for humans (execution is ground truth).
+  if (cfg.huntRefute) {
+    const candidates = session.findings.filter((finding) => isConfirmed(finding.confirmationStatus));
+    if (candidates.length > 0) {
+      const refuteLlm = options.llm ?? createLlmClient(cfg, logger);
+      const verdicts = await runRefutation({ findings: candidates, source, cfg, llm: refuteLlm, logger, max: 8 });
+      for (const finding of candidates) {
+        if (!finding.refutation?.refuted) continue;
+        if (finding.confirmationStatus === "confirmed-executable") finding.confirmationStatus = "suspected";
+        else if (finding.confirmationStatus === "confirmed-differential") finding.disputed = true;
+      }
+      if (verdicts.length > 0) await logger.artifact("hunt_refutation.json", verdicts);
+    }
+  }
+
   // Hard artifact semantics: only an execution-confirmed candidate is a finding.
   // Everything else is a hypothesis. Hypotheses are surfaced as their own artifact
   // (not buried), but they do not get disclosure reports and are not counted as
@@ -262,6 +281,8 @@ function toRankedFinding(finding: AgentFinding): RankedFinding {
     fix: finding.fix,
     confirmationStatus: finding.confirmationStatus,
     ...(isConfirmed(finding.confirmationStatus) ? { reproductionStatus: "confirmed-executable" as const } : {}),
+    ...(finding.disputed ? { disputed: true } : {}),
+    ...(finding.refutation?.refuted ? { refutationReason: finding.refutation.reason } : {}),
   };
 }
 

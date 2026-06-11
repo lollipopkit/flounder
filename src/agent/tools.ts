@@ -45,6 +45,10 @@ export interface AgentFinding {
   fixPatch?: FixPatch;
   /** Patterns the cited test prints once the exploit is blocked by the applied fix. */
   patchedSuccessPatterns?: string[];
+  /** Independent-skeptic verdict (a fresh-context model that tried to break the claim). */
+  refutation?: { refuted: boolean; reason: string };
+  /** An execution-proven finding an independent skeptic disputes — kept, but flagged for humans. */
+  disputed?: boolean;
 }
 
 export interface CommandRunRecord {

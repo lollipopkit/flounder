@@ -20,6 +20,7 @@ export interface AuditorConfig {
   huntScopeNote?: string;
   huntPrepare: boolean;
   huntPrepareTimeoutMs: number;
+  huntRefute: boolean;
   dryRun: boolean;
 }
 
@@ -40,6 +41,7 @@ export function defaultConfig(): AuditorConfig {
     huntMaxSteps: 40,
     huntPrepare: true,
     huntPrepareTimeoutMs: 600_000,
+    huntRefute: true,
     dryRun: false,
   };
 }

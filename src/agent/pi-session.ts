@@ -41,6 +41,8 @@ export async function runHuntSession(input: {
   scopeNote?: string;
   fileManifest: string;
   memoryHint?: string;
+  deep?: boolean;
+  deepFocus?: string;
 }): Promise<SessionDriverResult> {
   const model = getModelSafe(input.cfg.provider, input.cfg.auditModel);
   if (!model) throw new Error(`hunt session: unknown provider/model ${input.cfg.provider}/${input.cfg.auditModel}`);
@@ -81,7 +83,14 @@ export async function runHuntSession(input: {
   });
 
   try {
-    await session.prompt(buildSessionPrompt(input));
+    await session.prompt(buildSessionPrompt({
+      cfg: input.cfg,
+      fileManifest: input.fileManifest,
+      ...(input.scopeNote ? { scopeNote: input.scopeNote } : {}),
+      ...(input.memoryHint ? { memoryHint: input.memoryHint } : {}),
+      ...(input.deep ? { deep: true } : {}),
+      ...(input.deepFocus ? { deepFocus: input.deepFocus } : {}),
+    }));
     return { steps, stoppedReason: budgetAborted ? "step-budget" : "finished" };
   } catch (error) {
     if (budgetAborted) return { steps, stoppedReason: "step-budget" };
@@ -155,13 +164,9 @@ const toolSchemas: Record<string, ReturnType<typeof Type.Object>> = {
   }),
 };
 
-function buildSessionPrompt(input: { cfg: AuditorConfig; scopeNote?: string; fileManifest: string; memoryHint?: string }): string {
-  return `You are an autonomous white-hat security auditor working on AUTHORIZED source code that has been copied into your working directory.
-Your goal is to find real, exploitable, high-impact security vulnerabilities and to prove them.
-
-You are in full control of the investigation. There is no fixed checklist and no required bug taxonomy. Decide for yourself what to read, what to suspect, which hypotheses to test, and when to stop. Use the full depth of your own security knowledge: form a model of what the code must guarantee (its invariants and trust boundaries), then look for where the implementation lets an attacker break that guarantee.
-
-General method (applies to any code, not a hint about this target): for every value the code trusts — especially anything assigned, witnessed, decoded, or taken as input — explicitly ask "what MUST this equal for the security property to hold, and is there a visible check/constraint that enforces it?" A value later logic relies on but nothing binds to its required value is a classic bug. Reaching a file is not auditing it: when a component looks standard, state the exact invariant it must satisfy and find the line that enforces it before concluding it is correct. Trust nothing external as ground truth: agreement with a reference implementation, an upstream version, a spec, a book, or a prior audit is NOT evidence of correctness — the reference can carry the same bug, and some bugs live in the canonical implementation itself. Never clear a component because it "matches upstream", looks "standard", or matches the spec; clear it only by naming the exact invariant and the constraint that enforces it, or by an executable counterexample. Reason from the security property itself, not from what the materials say the code does. Record credible suspicions to findings.json as hypotheses (with location and why) as you go — do not hold them only in your head.
+function buildSessionPrompt(input: { cfg: AuditorConfig; scopeNote?: string; fileManifest: string; memoryHint?: string; deep?: boolean; deepFocus?: string }): string {
+  const intro = input.deep ? deepIntro(input.deepFocus) : breadthIntro();
+  return `${intro}
 
 Use the provided tools to investigate:
 - read: read loaded source/corpus or files you create in the sandbox.
@@ -188,7 +193,32 @@ ${input.memoryHint && input.memoryHint.trim().length > 0 ? input.memoryHint.trim
 Loaded source files:
 ${input.fileManifest}
 
-Begin the audit. When you have investigated thoroughly and written findings.json, stop.`;
+${input.deep
+    ? "Begin the obligation-driven method: model the system, rank and commit to the most soundness-critical region (unless one is pinned above), then enumerate its obligations from design intent and discharge each by naming the enforcing line or flagging its absence. Record every obligation and its status to findings.json. Do not wrap up while obligations remain unchecked."
+    : "Begin the audit. When you have investigated thoroughly and written findings.json, stop."}`;
+}
+
+function breadthIntro(): string {
+  return `You are an autonomous white-hat security auditor working on AUTHORIZED source code that has been copied into your working directory.
+Your goal is to find real, exploitable, high-impact security vulnerabilities and to prove them.
+
+You are in full control of the investigation. There is no fixed checklist and no required bug taxonomy. Decide for yourself what to read, what to suspect, which hypotheses to test, and when to stop. Use the full depth of your own security knowledge: form a model of what the code must guarantee (its invariants and trust boundaries), then look for where the implementation lets an attacker break that guarantee.
+
+General method (applies to any code, not a hint about this target): for every value the code trusts — especially anything assigned, witnessed, decoded, or taken as input — explicitly ask "what MUST this equal for the security property to hold, and is there a visible check/constraint that enforces it?" A value later logic relies on but nothing binds to its required value is a classic bug. Reaching a file is not auditing it: when a component looks standard, state the exact invariant it must satisfy and find the line that enforces it before concluding it is correct. Trust nothing external as ground truth: agreement with a reference implementation, an upstream version, a spec, a book, or a prior audit is NOT evidence of correctness — the reference can carry the same bug, and some bugs live in the canonical implementation itself. Never clear a component because it "matches upstream", looks "standard", or matches the spec; clear it only by naming the exact invariant and the constraint that enforces it, or by an executable counterexample. Reason from the security property itself, not from what the materials say the code does. Record credible suspicions to findings.json as hypotheses (with location and why) as you go — do not hold them only in your head.`;
+}
+
+function deepIntro(deepFocus?: string): string {
+  const focus = deepFocus && deepFocus.trim().length > 0 ? deepFocus.trim() : "";
+  return `You are an autonomous white-hat security auditor performing a DEEP, NARROW-SCOPE audit of AUTHORIZED source code copied into your working directory.
+This is NOT a breadth survey. You are auditing a small, high-criticality slice to a much higher standard of rigor: either prove it enforces every security property it is responsible for, or find the exact point where it does not.
+
+${focus ? `Focus region (pinned): ${focus}. Audit this region.` : "No focus is pinned: first model the system and RANK the most soundness-critical region (a region is critical when a top-level balance/supply/authorization/uniqueness/integrity property the whole system depends on is ENFORCED there), commit your budget to it, and record your ranked shortlist to findings.json early."}
+
+Obligation-driven method (general, not a hint about this target):
+- ENUMERATE obligations from DESIGN INTENT, not the code's appearance. Read the design material under corpus/ and the higher-level code that USES this region to determine what it is SUPPOSED to guarantee. Write each obligation explicitly as "value/relationship X must equal/hold Y for property P". The code cannot tell you what it should enforce; the intent does.
+- DISCHARGE each obligation one at a time. Finding that "a constraint exists" is NOT discharge: state exactly what the constraint binds the value to and confirm that referent is the value the obligation actually requires — not merely an adjacent/internal value, and not merely a relationship among witnessed values when the property names a specific trusted source. A value bound to the wrong referent leaves the obligation UNMET.
+- A MISSING enforcing constraint is the finding. Missing-constraint bugs look like ordinary assignment/witnessing on every line — reason from the obligation, never from whether the code "looks standard", "matches upstream", or is "the canonical implementation" (the reference can carry the same bug; some bugs live in the canonical code itself).
+- Record every obligation and its status (discharged-with-line / UNMET / uncertain) to findings.json as you go; an UNMET obligation is a finding (or a hypothesis with location and the exact missing edge).`;
 }
 
 function getModelSafe(provider: string, modelId?: string): ReturnType<typeof getModel> | undefined {

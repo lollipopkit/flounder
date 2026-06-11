@@ -56,6 +56,12 @@ async function parseConfig(args: string[]): Promise<{ cfg: AuditorConfig }> {
   if (args.includes("--no-prepare")) cfg.huntPrepare = false;
   cfg.huntPrepareTimeoutMs = readIntFlag(args, "--prepare-timeout-ms") ?? cfg.huntPrepareTimeoutMs;
   if (args.includes("--no-refute")) cfg.huntRefute = false;
+  if (args.includes("--deep")) cfg.huntDeep = true;
+  const deepFocus = readFlag(args, "--deep-focus");
+  if (deepFocus !== undefined) {
+    cfg.huntDeep = true;
+    cfg.huntDeepFocus = deepFocus;
+  }
   if (args.includes("--dry-run")) cfg.dryRun = true;
   const thinking = readFlag(args, "--thinking");
   if (thinking === "minimal" || thinking === "low" || thinking === "medium" || thinking === "high" || thinking === "xhigh") {
@@ -90,6 +96,13 @@ function applyConfigOverrides(cfg: AuditorConfig, raw: Record<string, unknown>):
   if (typeof rawHuntPrepareTimeoutMs === "number" && Number.isFinite(rawHuntPrepareTimeoutMs)) cfg.huntPrepareTimeoutMs = Math.max(10_000, Math.floor(rawHuntPrepareTimeoutMs));
   const rawHuntRefute = raw.huntRefute ?? raw.hunt_refute;
   if (typeof rawHuntRefute === "boolean") cfg.huntRefute = rawHuntRefute;
+  const rawHuntDeep = raw.huntDeep ?? raw.hunt_deep;
+  if (typeof rawHuntDeep === "boolean") cfg.huntDeep = rawHuntDeep;
+  const rawHuntDeepFocus = raw.huntDeepFocus ?? raw.hunt_deep_focus;
+  if (typeof rawHuntDeepFocus === "string" && rawHuntDeepFocus.trim().length > 0) {
+    cfg.huntDeep = true;
+    cfg.huntDeepFocus = rawHuntDeepFocus.trim();
+  }
   if (raw.thinkingLevel === "minimal" || raw.thinkingLevel === "low" || raw.thinkingLevel === "medium" || raw.thinkingLevel === "high" || raw.thinkingLevel === "xhigh") {
     cfg.thinkingLevel = raw.thinkingLevel;
   }
@@ -182,6 +195,8 @@ Options:
   --prepare-timeout-ms <n>
                           hunt: per-command timeout for the warm-up, default 600000
   --no-refute             hunt: skip the independent-refutation pass on confirmed findings
+  --deep                  hunt: deep narrow-scope audit (obligation-driven; model picks the critical region)
+  --deep-focus <path>     hunt: deep audit pinned to a specific region (implies --deep)
   --mock-llm              run with the deterministic mock model
 `);
 }

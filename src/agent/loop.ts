@@ -2,7 +2,7 @@ import type { AuditorConfig } from "../config.js";
 import type { LlmClient } from "../types.js";
 import type { RunLogger } from "../trace/logger.js";
 import { extractJsonArray, extractJsonObject } from "../util/json.js";
-import { buildHuntKickoff, HUNT_SYSTEM, renderTranscript, type TranscriptStep } from "./prompts.js";
+import { buildDeepKickoff, buildHuntKickoff, HUNT_DEEP_SYSTEM, HUNT_SYSTEM, renderTranscript, type TranscriptStep } from "./prompts.js";
 import type { AgentTool, ToolContext } from "./tools.js";
 
 // Provider-agnostic ReAct driver. It runs on top of the plain text-in/text-out
@@ -26,19 +26,33 @@ export async function runHuntLoop(input: {
   scopeNote?: string;
   fileManifest: string;
   memoryHint?: string;
+  /** Deep narrow-scope audit posture (obligation-driven, no breadth/wrap-up pressure). */
+  deep?: boolean;
+  deepFocus?: string;
   /** Base backoff for transient-throttle retries; overridable for tests. */
   transientRetryBaseMs?: number;
 }): Promise<HuntLoopResult> {
   const transientRetryBaseMs = input.transientRetryBaseMs ?? 4000;
+  const systemPrompt = input.deep ? HUNT_DEEP_SYSTEM : HUNT_SYSTEM;
   const toolsByName = new Map(input.tools.map((tool) => [tool.name, tool]));
-  const kickoff = buildHuntKickoff({
-    target: input.cfg.targetName,
-    tools: input.tools,
-    fileManifest: input.fileManifest,
-    maxSteps: input.maxSteps,
-    ...(input.scopeNote ? { scopeNote: input.scopeNote } : {}),
-    ...(input.memoryHint ? { memoryHint: input.memoryHint } : {}),
-  });
+  const kickoff = input.deep
+    ? buildDeepKickoff({
+        target: input.cfg.targetName,
+        tools: input.tools,
+        fileManifest: input.fileManifest,
+        maxSteps: input.maxSteps,
+        ...(input.scopeNote ? { scopeNote: input.scopeNote } : {}),
+        ...(input.memoryHint ? { memoryHint: input.memoryHint } : {}),
+        ...(input.deepFocus ? { deepFocus: input.deepFocus } : {}),
+      })
+    : buildHuntKickoff({
+        target: input.cfg.targetName,
+        tools: input.tools,
+        fileManifest: input.fileManifest,
+        maxSteps: input.maxSteps,
+        ...(input.scopeNote ? { scopeNote: input.scopeNote } : {}),
+        ...(input.memoryHint ? { memoryHint: input.memoryHint } : {}),
+      });
   const steps: TranscriptStep[] = [];
   let consecutiveParseErrors = 0;
 
@@ -78,10 +92,15 @@ export async function runHuntLoop(input: {
     // end force it to write findings.json (findings + best hypotheses) so a deep
     // investigation always produces something.
     const budgetLine = `You are on step ${n} of ${input.maxSteps} (${remaining} action${remaining === 1 ? "" : "s"} left).`;
+    // Deep mode keeps checking obligations to the end — it must NOT be told to
+    // stop investigating; it is told to keep findings.json current. Breadth mode
+    // is told to stop opening new leads and write out its hypotheses.
     const finalizeLine =
-      remaining <= finalizeThreshold
-        ? "\nALMOST OUT OF STEPS — do not open new investigations. Write findings.json NOW with any confirmed findings AND your best unconfirmed hypotheses (each with location and why it is suspected), then emit done. Unrecorded hypotheses are lost."
-        : "";
+      remaining > finalizeThreshold
+        ? ""
+        : input.deep
+          ? "\nBUDGET LOW — make sure findings.json records EVERY obligation and its status (discharged-with-line / UNMET / uncertain). Keep working through the remaining obligations; an UNMET obligation with its exact missing edge is a finding. Unrecorded obligations are lost."
+          : "\nALMOST OUT OF STEPS — do not open new investigations. Write findings.json NOW with any confirmed findings AND your best unconfirmed hypotheses (each with location and why it is suspected), then emit done. Unrecorded hypotheses are lost.";
     const user = `${kickoff}\n\n===== TRANSCRIPT SO FAR =====\n${renderTranscript(steps)}\n\n===== YOUR NEXT ACTION =====\n${budgetLine}${finalizeLine}\nRespond with one JSON tool action or done object.`;
     // Transient throttles (provider rate limits, overload, timeouts) are retried
     // with backoff rather than counted toward the stall guard — a short server-side
@@ -92,7 +111,7 @@ export async function runHuntLoop(input: {
       try {
         raw = await input.llm.complete({
           tag: "hunt",
-          system: HUNT_SYSTEM,
+          system: systemPrompt,
           user,
           model: input.cfg.auditModel,
           maxTokens: input.cfg.maxTokens,

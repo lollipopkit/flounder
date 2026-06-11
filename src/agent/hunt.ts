@@ -101,6 +101,8 @@ export async function runHunt(
       fileManifest,
       ...(scopeNote ? { scopeNote } : {}),
       ...(memoryHint ? { memoryHint } : {}),
+      ...(cfg.huntDeep ? { deep: true } : {}),
+      ...(cfg.huntDeepFocus ? { deepFocus: cfg.huntDeepFocus } : {}),
     });
     steps = result.steps;
     stoppedReason = result.stoppedReason;
@@ -119,6 +121,8 @@ export async function runHunt(
       fileManifest,
       ...(scopeNote ? { scopeNote } : {}),
       ...(memoryHint ? { memoryHint } : {}),
+      ...(cfg.huntDeep ? { deep: true } : {}),
+      ...(cfg.huntDeepFocus ? { deepFocus: cfg.huntDeepFocus } : {}),
     });
     steps = loop.steps;
     stoppedReason = loop.stoppedReason;

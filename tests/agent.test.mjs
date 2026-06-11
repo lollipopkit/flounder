@@ -8,6 +8,7 @@ import { ProjectMemory } from "../dist/agent/memory.js";
 import { buildTools, ingestFindingsFromScratch, newSession } from "../dist/agent/tools.js";
 import { runHunt } from "../dist/agent/hunt.js";
 import { runHuntLoop, isTransientError } from "../dist/agent/loop.js";
+import { buildDeepKickoff, HUNT_DEEP_SYSTEM } from "../dist/agent/prompts.js";
 import { runDifferentialConfirmation } from "../dist/agent/differential.js";
 import { runRefutation } from "../dist/agent/refutation.js";
 import { isPiSessionProvider, mapThinkingLevel } from "../dist/agent/pi-session.js";
@@ -197,6 +198,22 @@ test("baseline integrity: the model cannot modify the target source under audit"
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("deep mode: obligation-driven prompt enforces design-intent enumeration and pins a focus region", () => {
+  // The deep system prompt must carry the method that makes missing-constraint
+  // bugs visible: enumerate obligations from design intent, discharge each by the
+  // enforcing line, treat a constraint to the wrong referent / an absent constraint
+  // as the finding, and never clear on "looks standard".
+  for (const needle of ["obligation", "DESIGN INTENT", "ABSENCE is the finding", "wrong referent", "looks standard"]) {
+    assert.ok(HUNT_DEEP_SYSTEM.includes(needle), `deep system prompt missing: ${needle}`);
+  }
+  const tools = [];
+  const pinned = buildDeepKickoff({ target: "t", tools, fileManifest: "(files)", maxSteps: 30, deepFocus: "ecc/chip/mul" });
+  assert.ok(pinned.includes("Focus region (pinned): ecc/chip/mul"), "pinned focus not surfaced in kickoff");
+  const auto = buildDeepKickoff({ target: "t", tools, fileManifest: "(files)", maxSteps: 30 });
+  assert.ok(auto.includes("No focus pinned"), "auto-select kickoff should ask the model to rank the critical region");
+  assert.ok(auto.includes("corpus/"), "deep kickoff should point the model at design-intent material");
 });
 
 test("transient-throttle classification: server rate limits retry, real quota exhaustion does not", () => {

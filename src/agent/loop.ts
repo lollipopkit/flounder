@@ -39,8 +39,19 @@ export async function runHuntLoop(input: {
   const steps: TranscriptStep[] = [];
   let consecutiveParseErrors = 0;
 
+  const finalizeThreshold = Math.max(3, Math.floor(input.maxSteps * 0.2));
   for (let n = 1; n <= input.maxSteps; n += 1) {
-    const user = `${kickoff}\n\n===== TRANSCRIPT SO FAR =====\n${renderTranscript(steps)}\n\n===== YOUR NEXT ACTION =====\nRespond with one JSON tool action or done object.`;
+    const remaining = input.maxSteps - n + 1;
+    // Budget awareness + finalization: the model otherwise investigates until it
+    // is cut off and records nothing. Tell it the budget every turn, and near the
+    // end force it to write findings.json (findings + best hypotheses) so a deep
+    // investigation always produces something.
+    const budgetLine = `You are on step ${n} of ${input.maxSteps} (${remaining} action${remaining === 1 ? "" : "s"} left).`;
+    const finalizeLine =
+      remaining <= finalizeThreshold
+        ? "\nALMOST OUT OF STEPS — do not open new investigations. Write findings.json NOW with any confirmed findings AND your best unconfirmed hypotheses (each with location and why it is suspected), then emit done. Unrecorded hypotheses are lost."
+        : "";
+    const user = `${kickoff}\n\n===== TRANSCRIPT SO FAR =====\n${renderTranscript(steps)}\n\n===== YOUR NEXT ACTION =====\n${budgetLine}${finalizeLine}\nRespond with one JSON tool action or done object.`;
     let raw: string;
     try {
       raw = await input.llm.complete({

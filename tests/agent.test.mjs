@@ -7,6 +7,7 @@ import { defaultConfig } from "../dist/config.js";
 import { ProjectMemory } from "../dist/agent/memory.js";
 import { buildTools, ingestFindingsFromScratch, newSession } from "../dist/agent/tools.js";
 import { runHunt } from "../dist/agent/hunt.js";
+import { runHuntLoop } from "../dist/agent/loop.js";
 import { runDifferentialConfirmation } from "../dist/agent/differential.js";
 import { isPiSessionProvider, mapThinkingLevel } from "../dist/agent/pi-session.js";
 import { MockAuditLlmClient } from "../dist/llm/mock.js";
@@ -192,6 +193,47 @@ test("baseline integrity: the model cannot modify the target source under audit"
     const edit = await tool("edit").run({ path: "halo2_missing_constraint.rs", old: "assign_advice", new: "x" }, ctx);
     assert.match(edit.observation, /blocked/i);
     assert.equal(session.baselineFiles.has("exploit_test.rs"), false, "new files are not part of the protected baseline");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("forced finalize: a run that never writes findings.json still captures hypotheses", async () => {
+  const dir = await tempDir();
+  try {
+    const cfg = defaultConfig();
+    cfg.huntMaxSteps = 3;
+    const logger = await tempLogger(dir);
+    const session = newSession();
+    const ctx = {
+      cfg,
+      source: [{ path: "x.rs", kind: "source", content: "line1\nline2\nline3\n" }],
+      corpus: [],
+      memory: new ProjectMemory(path.join(dir, "memory.jsonl")),
+      logger,
+      session,
+    };
+    // A model that investigates forever (always reads) and never writes findings.json,
+    // then on the dedicated finalize call returns its residual hypotheses.
+    const llm = {
+      async complete(input) {
+        if (input.tag === "hunt_finalize") {
+          return JSON.stringify([
+            { title: "Residual suspicion in x.rs", severity: "medium", location: "x.rs:2", description: "looked off", confidence: 0.3 },
+          ]);
+        }
+        return JSON.stringify({ thought: "one more read", tool: "read", args: { path: "x.rs" } });
+      },
+    };
+
+    const result = await runHuntLoop({ cfg, llm, tools: buildTools(), ctx, logger, maxSteps: 3, fileManifest: "x.rs" });
+    assert.equal(result.stoppedReason, "step-budget");
+    // The forced finalize wrote findings.json even though the model never did.
+    assert.ok(session.scratchFiles.has("findings.json"), "finalize must capture output when the model never writes it");
+    const ingest = ingestFindingsFromScratch(session);
+    assert.equal(ingest.parsed, 1);
+    assert.equal(session.findings[0].confirmationStatus, "suspected");
+    assert.match(session.findings[0].title, /Residual suspicion/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -1,7 +1,7 @@
 import type { AuditorConfig } from "../config.js";
 import type { LlmClient } from "../types.js";
 import type { RunLogger } from "../trace/logger.js";
-import { extractJsonObject } from "../util/json.js";
+import { extractJsonArray, extractJsonObject } from "../util/json.js";
 import { buildHuntKickoff, HUNT_SYSTEM, renderTranscript, type TranscriptStep } from "./prompts.js";
 import type { AgentTool, ToolContext } from "./tools.js";
 
@@ -39,7 +39,35 @@ export async function runHuntLoop(input: {
   const steps: TranscriptStep[] = [];
   let consecutiveParseErrors = 0;
 
-  const finalizeThreshold = Math.max(3, Math.floor(input.maxSteps * 0.2));
+  const finalizeThreshold = Math.max(4, Math.floor(input.maxSteps * 0.35));
+
+  // Framework guarantee: a run must not end empty. If the model never wrote
+  // findings.json (it tends to keep investigating "one more lead" until cut off),
+  // make one dedicated call that extracts its confirmed findings AND every
+  // residual hypothesis into findings.json. Skips when the model is unresponsive
+  // (e.g. provider quota), where another call would also fail.
+  const finalizeFindings = async (): Promise<void> => {
+    if (input.ctx.session.scratchFiles.has("findings.json")) return;
+    const ask = `Your audit is ending now. Output ONLY a JSON array for findings.json and nothing else (no prose, no fences): every confirmed finding AND every residual hypothesis you formed, each as {"title","severity","location","description","evidence","exploit_sketch","fix","confidence","command_id"?}. Include lower-confidence hypotheses with their location and why they are suspected. If you genuinely found nothing, output [].`;
+    try {
+      const raw = await input.llm.complete({
+        tag: "hunt_finalize",
+        system: HUNT_SYSTEM,
+        user: `${kickoff}\n\n===== TRANSCRIPT SO FAR =====\n${renderTranscript(steps)}\n\n===== FINALIZE =====\n${ask}`,
+        model: input.cfg.auditModel,
+        maxTokens: input.cfg.maxTokens,
+        thinkingLevel: input.cfg.thinkingLevel,
+        agentic: true,
+      });
+      const items = extractJsonArray<unknown>(raw);
+      if (Array.isArray(items)) {
+        input.ctx.session.scratchFiles.set("findings.json", JSON.stringify(items));
+        await input.logger.event("hunt_finalize", { items: items.length });
+      }
+    } catch (error) {
+      await input.logger.event("hunt_finalize_error", { error: error instanceof Error ? error.message.slice(0, 300) : String(error) });
+    }
+  };
   for (let n = 1; n <= input.maxSteps; n += 1) {
     const remaining = input.maxSteps - n + 1;
     // Budget awareness + finalization: the model otherwise investigates until it
@@ -93,6 +121,7 @@ export async function runHuntLoop(input: {
       input.ctx.session.finishSummary = action.summary;
       steps.push({ n, thought: action.thought, tool: "(done)", args: {}, observation: action.summary || "hunt finished." });
       await input.logger.event("hunt_step", { step: n, tool: "(done)" });
+      await finalizeFindings();
       return { steps, stoppedReason: "finished" };
     }
 
@@ -118,9 +147,13 @@ export async function runHuntLoop(input: {
     steps.push({ n, thought: action.thought, tool: action.tool, args: action.args, observation });
     await input.logger.event("hunt_step", { step: n, tool: action.tool });
 
-    if (input.ctx.session.finished) return { steps, stoppedReason: "finished" };
+    if (input.ctx.session.finished) {
+      await finalizeFindings();
+      return { steps, stoppedReason: "finished" };
+    }
   }
 
+  await finalizeFindings();
   return { steps, stoppedReason: "step-budget" };
 }
 

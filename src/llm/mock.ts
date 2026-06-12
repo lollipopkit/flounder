@@ -37,6 +37,27 @@ const HUNT_SUCCESS_PATTERN = "autonomous hunt confirmed the missing constraint l
 // Keeps mock-hunt and tests fully offline.
 function huntActionFor(user: string): string {
   const action = (thought: string, tool: string, args: Record<string, unknown>): string => JSON.stringify({ thought, tool, args });
+  // MAP phase: enumerate the scope inventory into scopes.json, then stop.
+  if (user.includes("Phase: MAP")) {
+    if (!user.includes("wrote scopes.json")) {
+      return action("Apply the lenses and enumerate the scope inventory.", "write", {
+        path: "scopes.json",
+        content: JSON.stringify([
+          {
+            id: "S1",
+            obligation: "the advice cell must be constrained to its trusted source value",
+            region: "halo2_missing_constraint.rs:5",
+            lenses: ["unbound-input"],
+            exposure: "critical",
+            difficulty: "high",
+            score: 9,
+            why: "assign_advice writes a prover-controlled value that downstream checks trust, with no visible equality edge.",
+          },
+        ]),
+      });
+    }
+    return JSON.stringify({ thought: "Scope inventory written.", done: true, summary: "1 scope enumerated." });
+  }
   if (!user.includes("action: read")) {
     return action("Read the region that assigns advice cells to look for a missing enforcement edge.", "read", {
       path: "halo2_missing_constraint.rs",

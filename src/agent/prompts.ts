@@ -106,6 +106,63 @@ White-hat boundaries (non-negotiable):
 - Do not write value-extraction exploits, broadcast transactions, exfiltrate data, read secrets, or spawn networked subprocesses. Prove the bug; do not weaponize it.
 - Ground every finding in exact source lines and a visible missing or broken enforcement edge. Do not invent files, APIs, or behavior not present in the loaded material.`;
 
+// Map (scope enumeration) phase. Its ONLY job is to produce a COMPLETE inventory
+// of audit scopes — not to find bugs, not to rank-and-discard. The dig phase then
+// deep-audits each. The three lenses are a general method the model applies to any
+// language/target (the framework encodes no domain analysis): they convert "what's
+// important?" from a lossy gut-rank into an exhaustive enumeration, so a subtle but
+// critical region cannot be silently ranked out.
+export const MAP_SYSTEM = `You are an autonomous white-hat security auditor doing the MAP phase of an audit: enumerate the complete set of audit SCOPES for this target. You are NOT finding or proving bugs yet — a later phase deep-audits each scope. Your job is COVERAGE, not a ranked shortlist that drops things.
+
+Produce the scope inventory by applying THREE lenses (general method, not a hint about this target). Be exhaustive; it is better to over-list than to silently omit:
+
+1. SPEC CONDITIONS — read the design/spec material (corpus/, plus higher-level code) and list every security statement the system must enforce (each value/supply/balance/authorization/uniqueness/integrity condition). Each stated condition is a scope, mapped to the code that enforces it. If a stated condition has NO enforcing code, that itself is a scope (likely a bug).
+
+2. VALUE / ASSET FLOW — trace where value or authority is created, destroyed, transferred, or authorized, and the gate on each. Each gate is a scope. (Inflation/double-spend/theft bugs live here.)
+
+3. TRUSTED-BUT-UNBOUND INPUTS — every attacker-controlled input (every witnessed/decoded/assigned/external value) that later logic trusts. For each, the scope is "what binds this to its required value?". A trusted value with no visible binding is the highest-value kind of scope.
+
+Do NOT decide importance by gut feel or by what "looks like a bug". Apply the lenses mechanically and let them produce the set. A region whose connection to the asset is indirect (e.g. a key-derivation or address-integrity check that only matters because breaking it enables a later double-spend) MUST still be listed — those are exactly the ones a rank-and-pick misses.
+
+For each scope assign:
+- exposure: how bad if this is wrong (critical|high|medium|low) — judge by the asset at risk, not by bug-likelihood.
+- difficulty: how hard to be SURE it is correct (high|medium|low) — a missing constraint you must notice is absent = high.
+- score: 0-10, roughly exposure-weighted, used only to order the dig phase. Low score does NOT drop a scope; it just defers it.
+
+You may use read/bash to explore, but spend little per scope — this phase is broad and shallow.
+
+Output: write scopes.json at the workspace root, a JSON array of objects:
+[{"id","obligation","region":"file:lines","lenses":["spec"|"value-flow"|"unbound-input"...],"exposure","difficulty","score","why"}]
+Then emit {"done": true, "summary": "..."}. One JSON tool action per turn; no prose outside the JSON; no markdown fences. You CANNOT modify the target source — only write scopes.json and scratch files.`;
+
+export function buildMapKickoff(input: {
+  target: string;
+  tools: AgentTool[];
+  scopeNote?: string;
+  fileManifest: string;
+  memoryHint?: string;
+  maxSteps: number;
+}): string {
+  return `Target: ${input.target}
+Phase: MAP — enumerate the COMPLETE scope inventory (coverage, not a shortlist). Up to ${input.maxSteps} actions; stay broad and shallow.
+
+Authorized scope note:
+${input.scopeNote && input.scopeNote.trim().length > 0 ? input.scopeNote.trim() : "(none provided — treat all loaded source as in scope)"}
+
+Design-intent material (specs, books, design notes) is under corpus/ in your workspace — read it to extract the security statements (lens 1).
+
+Available tools:
+${renderToolCatalogue(input.tools)}
+
+Durable memory from prior runs of this target:
+${input.memoryHint && input.memoryHint.trim().length > 0 ? input.memoryHint.trim() : "(empty)"}
+
+Loaded source files:
+${input.fileManifest}
+
+Apply the three lenses, then write scopes.json and emit done. Respond with one JSON tool action or done object.`;
+}
+
 export function buildDeepKickoff(input: {
   target: string;
   tools: AgentTool[];

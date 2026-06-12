@@ -446,3 +446,33 @@ test("hunt produces an execution-confirmed finding and banks cross-run memory", 
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("map → dig: --deep enumerates scopes then deep-audits each, tagging findings by scope", async () => {
+  const dir = await tempDir();
+  try {
+    const cfg = defaultConfig();
+    cfg.targetName = "mapdig-e2e";
+    cfg.sourcePaths = [fixtures];
+    cfg.corpusPaths = [fixtures];
+    cfg.outputDir = path.join(dir, "runs");
+    cfg.huntDeep = true; // map → dig flow (no pinned focus)
+    cfg.huntMapSteps = 6;
+    cfg.huntDigSteps = 8;
+    cfg.huntMaxScopes = 3;
+
+    const { runDir, summary } = await runHunt(cfg, { llm: new MockAuditLlmClient() });
+
+    // The map phase wrote a scope inventory the dig phase consumed.
+    const scopes = JSON.parse(await readFile(path.join(runDir, "hunt_scopes.json"), "utf8"));
+    assert.equal(scopes.length, 1);
+    assert.equal(scopes[0].status, "audited", "a scope within the cap is deep-audited, not deferred");
+
+    // Dig deep-audited the scope and produced the confirmed finding, tagged by scope.
+    assert.equal(summary.findings.length, 1);
+    assert.equal(summary.findings[0].confirmationStatus, "confirmed-executable");
+    const findingsArtifact = JSON.parse(await readFile(path.join(runDir, "hunt_findings.json"), "utf8"));
+    assert.equal(findingsArtifact[0].scopeId, "S1", "dig findings are tagged with the scope they came from");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

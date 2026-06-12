@@ -26,6 +26,11 @@ export interface AuditorConfig {
   // picks the most soundness-critical region itself.
   huntDeep: boolean;
   huntDeepFocus?: string;
+  // Map → dig flow (used when --deep runs without a pinned focus): map enumerates
+  // an obligation/scope inventory, dig deep-audits the top scopes one at a time.
+  huntMapSteps: number;
+  huntDigSteps: number;
+  huntMaxScopes: number;
   // Per-role model assignment. A role (map/dig/refute) resolves to its own entry,
   // else `default`, else the top-level provider/auditModel/thinkingLevel. Nothing
   // is auto-downgraded: an unspecified role inherits the main model.
@@ -101,6 +106,9 @@ export function defaultConfig(): AuditorConfig {
     huntPrepareTimeoutMs: 600_000,
     huntRefute: true,
     huntDeep: false,
+    huntMapSteps: 20,
+    huntDigSteps: 30,
+    huntMaxScopes: 6,
     dryRun: false,
   };
 }

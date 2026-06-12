@@ -2,7 +2,7 @@ import type { AuditorConfig } from "../config.js";
 import type { LlmClient } from "../types.js";
 import type { RunLogger } from "../trace/logger.js";
 import { extractJsonArray, extractJsonObject } from "../util/json.js";
-import { buildDeepKickoff, buildHuntKickoff, HUNT_DEEP_SYSTEM, HUNT_SYSTEM, renderTranscript, type TranscriptStep } from "./prompts.js";
+import { buildDeepKickoff, buildHuntKickoff, buildMapKickoff, HUNT_DEEP_SYSTEM, HUNT_SYSTEM, MAP_SYSTEM, renderTranscript, type TranscriptStep } from "./prompts.js";
 import type { AgentTool, ToolContext } from "./tools.js";
 
 // Provider-agnostic ReAct driver. It runs on top of the plain text-in/text-out
@@ -29,30 +29,27 @@ export async function runHuntLoop(input: {
   /** Deep narrow-scope audit posture (obligation-driven, no breadth/wrap-up pressure). */
   deep?: boolean;
   deepFocus?: string;
+  /** Map (scope-enumeration) phase: writes scopes.json instead of findings.json. */
+  map?: boolean;
   /** Base backoff for transient-throttle retries; overridable for tests. */
   transientRetryBaseMs?: number;
 }): Promise<HuntLoopResult> {
   const transientRetryBaseMs = input.transientRetryBaseMs ?? 4000;
-  const systemPrompt = input.deep ? HUNT_DEEP_SYSTEM : HUNT_SYSTEM;
+  const systemPrompt = input.map ? MAP_SYSTEM : input.deep ? HUNT_DEEP_SYSTEM : HUNT_SYSTEM;
   const toolsByName = new Map(input.tools.map((tool) => [tool.name, tool]));
-  const kickoff = input.deep
-    ? buildDeepKickoff({
-        target: input.cfg.targetName,
-        tools: input.tools,
-        fileManifest: input.fileManifest,
-        maxSteps: input.maxSteps,
-        ...(input.scopeNote ? { scopeNote: input.scopeNote } : {}),
-        ...(input.memoryHint ? { memoryHint: input.memoryHint } : {}),
-        ...(input.deepFocus ? { deepFocus: input.deepFocus } : {}),
-      })
-    : buildHuntKickoff({
-        target: input.cfg.targetName,
-        tools: input.tools,
-        fileManifest: input.fileManifest,
-        maxSteps: input.maxSteps,
-        ...(input.scopeNote ? { scopeNote: input.scopeNote } : {}),
-        ...(input.memoryHint ? { memoryHint: input.memoryHint } : {}),
-      });
+  const kickoffCommon = {
+    target: input.cfg.targetName,
+    tools: input.tools,
+    fileManifest: input.fileManifest,
+    maxSteps: input.maxSteps,
+    ...(input.scopeNote ? { scopeNote: input.scopeNote } : {}),
+    ...(input.memoryHint ? { memoryHint: input.memoryHint } : {}),
+  };
+  const kickoff = input.map
+    ? buildMapKickoff(kickoffCommon)
+    : input.deep
+      ? buildDeepKickoff({ ...kickoffCommon, ...(input.deepFocus ? { deepFocus: input.deepFocus } : {}) })
+      : buildHuntKickoff(kickoffCommon);
   const steps: TranscriptStep[] = [];
   let consecutiveParseErrors = 0;
 
@@ -64,6 +61,7 @@ export async function runHuntLoop(input: {
   // residual hypothesis into findings.json. Skips when the model is unresponsive
   // (e.g. provider quota), where another call would also fail.
   const finalizeFindings = async (): Promise<void> => {
+    if (input.map) return; // map writes scopes.json, not findings.json
     if (input.ctx.session.scratchFiles.has("findings.json")) return;
     const ask = `Your audit is ending now. Output ONLY a JSON array for findings.json and nothing else (no prose, no fences): every confirmed finding AND every residual hypothesis you formed, each as {"title","severity","location","description","evidence","exploit_sketch","fix","confidence","command_id"?}. Include lower-confidence hypotheses with their location and why they are suspected. If you genuinely found nothing, output [].`;
     try {
@@ -85,6 +83,11 @@ export async function runHuntLoop(input: {
       await input.logger.event("hunt_finalize_error", { error: error instanceof Error ? error.message.slice(0, 300) : String(error) });
     }
   };
+  // Each phase (map, then each dig) is its own loop over the shared session. Clear
+  // the done flag so a previous phase's completion does not abort this one after
+  // its first step.
+  input.ctx.session.finished = false;
+  delete input.ctx.session.finishSummary;
   for (let n = 1; n <= input.maxSteps; n += 1) {
     const remaining = input.maxSteps - n + 1;
     // Budget awareness + finalization: the model otherwise investigates until it
@@ -98,9 +101,11 @@ export async function runHuntLoop(input: {
     const finalizeLine =
       remaining > finalizeThreshold
         ? ""
-        : input.deep
-          ? "\nBUDGET LOW — make sure findings.json records EVERY obligation and its status (discharged-with-line / UNMET / uncertain). Keep working through the remaining obligations; an UNMET obligation with its exact missing edge is a finding. Unrecorded obligations are lost."
-          : "\nALMOST OUT OF STEPS — do not open new investigations. Write findings.json NOW with any confirmed findings AND your best unconfirmed hypotheses (each with location and why it is suspected), then emit done. Unrecorded hypotheses are lost.";
+        : input.map
+          ? "\nBUDGET LOW — write scopes.json NOW with the COMPLETE scope inventory you have so far (each with id, obligation, region, score), then emit done. Unrecorded scopes are lost."
+          : input.deep
+            ? "\nBUDGET LOW — make sure findings.json records EVERY obligation and its status (discharged-with-line / UNMET / uncertain). Keep working through the remaining obligations; an UNMET obligation with its exact missing edge is a finding. Unrecorded obligations are lost."
+            : "\nALMOST OUT OF STEPS — do not open new investigations. Write findings.json NOW with any confirmed findings AND your best unconfirmed hypotheses (each with location and why it is suspected), then emit done. Unrecorded hypotheses are lost.";
     const user = `${kickoff}\n\n===== TRANSCRIPT SO FAR =====\n${renderTranscript(steps)}\n\n===== YOUR NEXT ACTION =====\n${budgetLine}${finalizeLine}\nRespond with one JSON tool action or done object.`;
     // Transient throttles (provider rate limits, overload, timeouts) are retried
     // with backoff rather than counted toward the stall guard — a short server-side

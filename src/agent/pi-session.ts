@@ -43,6 +43,7 @@ export async function runHuntSession(input: {
   memoryHint?: string;
   deep?: boolean;
   deepFocus?: string;
+  map?: boolean;
 }): Promise<SessionDriverResult> {
   const model = getModelSafe(input.cfg.provider, input.cfg.auditModel);
   if (!model) throw new Error(`hunt session: unknown provider/model ${input.cfg.provider}/${input.cfg.auditModel}`);
@@ -90,6 +91,7 @@ export async function runHuntSession(input: {
       ...(input.memoryHint ? { memoryHint: input.memoryHint } : {}),
       ...(input.deep ? { deep: true } : {}),
       ...(input.deepFocus ? { deepFocus: input.deepFocus } : {}),
+      ...(input.map ? { map: true } : {}),
     }));
     return { steps, stoppedReason: budgetAborted ? "step-budget" : "finished" };
   } catch (error) {
@@ -164,8 +166,8 @@ const toolSchemas: Record<string, ReturnType<typeof Type.Object>> = {
   }),
 };
 
-function buildSessionPrompt(input: { cfg: AuditorConfig; scopeNote?: string; fileManifest: string; memoryHint?: string; deep?: boolean; deepFocus?: string }): string {
-  const intro = input.deep ? deepIntro(input.deepFocus) : breadthIntro();
+function buildSessionPrompt(input: { cfg: AuditorConfig; scopeNote?: string; fileManifest: string; memoryHint?: string; deep?: boolean; deepFocus?: string; map?: boolean }): string {
+  const intro = input.map ? mapIntro() : input.deep ? deepIntro(input.deepFocus) : breadthIntro();
   return `${intro}
 
 Use the provided tools to investigate:
@@ -193,9 +195,24 @@ ${input.memoryHint && input.memoryHint.trim().length > 0 ? input.memoryHint.trim
 Loaded source files:
 ${input.fileManifest}
 
-${input.deep
-    ? "Begin the obligation-driven method: model the system, rank and commit to the most soundness-critical region (unless one is pinned above), then enumerate its obligations from design intent and discharge each by naming the enforcing line or flagging its absence. Record every obligation and its status to findings.json. Do not wrap up while obligations remain unchecked."
-    : "Begin the audit. When you have investigated thoroughly and written findings.json, stop."}`;
+${input.map
+    ? "Apply the three lenses and write scopes.json — the COMPLETE scope inventory (each: id, obligation, region, lenses, exposure, difficulty, score, why) — then stop. Do not deep-dive or prove bugs in this phase; coverage over depth."
+    : input.deep
+      ? "Begin the obligation-driven method: model the system, rank and commit to the most soundness-critical region (unless one is pinned above), then enumerate its obligations from design intent and discharge each by naming the enforcing line or flagging its absence. Record every obligation and its status to findings.json. Do not wrap up while obligations remain unchecked."
+      : "Begin the audit. When you have investigated thoroughly and written findings.json, stop."}`;
+}
+
+function mapIntro(): string {
+  return `You are an autonomous white-hat security auditor doing the MAP phase: enumerate the COMPLETE set of audit SCOPES for this target. You are NOT finding or proving bugs yet — a later phase deep-audits each scope. Your job is COVERAGE, not a ranked shortlist that drops things.
+
+Apply THREE lenses (general method, not a hint about this target); be exhaustive, over-list rather than silently omit:
+1. SPEC CONDITIONS — read the design/spec material under corpus/ (and higher-level code) and list every security statement the system must enforce; each maps to the code that enforces it. A stated condition with NO enforcing code is itself a scope.
+2. VALUE / ASSET FLOW — every place value or authority is created, destroyed, transferred, or authorized, and the gate on each.
+3. TRUSTED-BUT-UNBOUND INPUTS — every attacker-controlled value (witnessed/decoded/assigned/external) later logic trusts; the scope is "what binds this to its required value?". A trusted value with no visible binding is the highest-value scope.
+
+Do not judge importance by gut feel or "looks like a bug". A region whose link to the asset is indirect (e.g. a key/address-integrity check that only matters because breaking it enables a later double-spend) MUST still be listed — those are exactly what a rank-and-pick misses. Assign each scope: exposure (critical|high|medium|low, by asset at risk), difficulty (high|medium|low, how hard to be sure it is correct), score (0-10, only to order the dig phase; low score defers, never drops).
+
+Write scopes.json at the workspace root: a JSON array of {"id","obligation","region":"file:lines","lenses":[...],"exposure","difficulty","score","why"}. You may read/bash to explore but spend little per scope — broad and shallow. You CANNOT modify the target source.`;
 }
 
 function breadthIntro(): string {

@@ -49,6 +49,8 @@ export interface AgentFinding {
   refutation?: { refuted: boolean; reason: string };
   /** An execution-proven finding an independent skeptic disputes — kept, but flagged for humans. */
   disputed?: boolean;
+  /** The map-phase scope this finding came from (when the map → dig flow produced it). */
+  scopeId?: string;
 }
 
 export interface CommandRunRecord {
@@ -231,7 +233,7 @@ const writeTool: AgentTool = {
     if (Buffer.byteLength(content, "utf8") > ctx.cfg.reproductionMaxFileBytes) return { observation: "error: content exceeds the configured file-size limit." };
 
     if (baselineProtected(ctx, normalized)) return { observation: baselineBlockMessage(normalized) };
-    if (normalized !== "findings.json") {
+    if (!isReportFile(normalized)) {
       const blockedFile = firstBlockedSandboxFile([{ path: normalized, content }]);
       if (blockedFile) return { observation: `blocked: ${blockedFile}` };
     }
@@ -265,7 +267,7 @@ const editTool: AgentTool = {
 
     const next = asBool(args.replace_all, false) ? existing.content.split(oldText).join(newText) : existing.content.replace(oldText, newText);
     if (Buffer.byteLength(next, "utf8") > ctx.cfg.reproductionMaxFileBytes) return { observation: "error: edited file exceeds the configured file-size limit." };
-    if (existing.path !== "findings.json") {
+    if (!isReportFile(existing.path)) {
       const blockedFile = firstBlockedSandboxFile([{ path: existing.path, content: next }]);
       if (blockedFile) return { observation: `blocked: ${blockedFile}` };
     }
@@ -358,9 +360,14 @@ function confirmFailureReason(
   return `missing success patterns: ${patternCheck.missing.join(" | ")}`;
 }
 
+/** Report files the framework reads back from the workspace (findings + the map's scope inventory). */
+export function isReportFile(normalizedPath: string): boolean {
+  return normalizedPath === "findings.json" || normalizedPath === "scopes.json";
+}
+
 /** True when the path is part of the pristine target source the model may not modify. */
 function baselineProtected(ctx: ToolContext, normalizedPath: string): boolean {
-  if (normalizedPath === "findings.json") return false;
+  if (isReportFile(normalizedPath)) return false;
   return Boolean(ctx.session.baselineFiles?.has(normalizedPath));
 }
 
@@ -432,13 +439,74 @@ function findDoc(ctx: ToolContext, target: string): Doc | undefined {
 }
 
 function findingsJsonEntry(session: AgentSession): { path: string; content: string } | undefined {
-  const direct = session.scratchFiles.get("findings.json");
-  if (direct !== undefined) return { path: "findings.json", content: direct };
+  return scratchReportEntry(session, "findings.json");
+}
+
+function scratchReportEntry(session: AgentSession, basename: string): { path: string; content: string } | undefined {
+  const direct = session.scratchFiles.get(basename);
+  if (direct !== undefined) return { path: basename, content: direct };
   const matches = [...session.scratchFiles.entries()]
-    .filter(([filePath]) => path.posix.basename(filePath) === "findings.json")
+    .filter(([filePath]) => path.posix.basename(filePath) === basename)
     .sort((a, b) => a[0].length - b[0].length);
   const first = matches[0];
   return first ? { path: first[0], content: first[1] } : undefined;
+}
+
+/** A scope produced by the map phase. Free-form but with the fields dig needs. */
+export interface AuditScope {
+  id: string;
+  obligation: string;
+  region: string;
+  lenses: string[];
+  exposure: string;
+  difficulty: string;
+  score: number;
+  why: string;
+  status?: "pending" | "audited" | "deferred";
+}
+
+/** Parse the map phase's scopes.json from scratch (sorted by score, highest first). */
+export function readScratchScopes(session: AgentSession): AuditScope[] {
+  const entry = scratchReportEntry(session, "scopes.json");
+  if (!entry) return [];
+  let raw: unknown;
+  try {
+    raw = JSON.parse(entry.content);
+  } catch {
+    return [];
+  }
+  const items = Array.isArray(raw)
+    ? raw
+    : raw && typeof raw === "object" && Array.isArray((raw as Record<string, unknown>).scopes)
+      ? ((raw as Record<string, unknown>).scopes as unknown[])
+      : [];
+  const scopes: AuditScope[] = [];
+  for (const [idx, item] of items.entries()) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const r = item as Record<string, unknown>;
+    const region = asString(r.region) ?? asString(r.location);
+    const obligation = asString(r.obligation) ?? asString(r.title);
+    if (!region || !obligation) continue;
+    const scoreNum = typeof r.score === "number" ? r.score : Number.parseFloat(asString(r.score) ?? "");
+    scopes.push({
+      id: asString(r.id) ?? `S${idx + 1}`,
+      obligation,
+      region,
+      lenses: Array.isArray(r.lenses) ? r.lenses.filter((x): x is string => typeof x === "string") : [],
+      exposure: asString(r.exposure) ?? "unknown",
+      difficulty: asString(r.difficulty) ?? "unknown",
+      score: Number.isFinite(scoreNum) ? scoreNum : 0,
+      why: asString(r.why) ?? "",
+    });
+  }
+  return scopes.sort((a, b) => b.score - a.score);
+}
+
+/** Drop the findings.json scratch entry so the next dig pass starts from a clean slate. */
+export function clearScratchFindings(session: AgentSession): void {
+  for (const key of [...session.scratchFiles.keys()]) {
+    if (path.posix.basename(key) === "findings.json") session.scratchFiles.delete(key);
+  }
 }
 
 function normalizeBashCommand(

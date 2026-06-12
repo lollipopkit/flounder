@@ -15,7 +15,7 @@ import { runHuntLoop } from "./loop.js";
 import { ProjectMemory } from "./memory.js";
 import { isPiSessionProvider, runHuntSession } from "./pi-session.js";
 import type { TranscriptStep } from "./prompts.js";
-import { buildTools, ingestFindingsFromScratch, newSession, type AgentFinding, type ToolContext } from "./tools.js";
+import { buildTools, clearScratchFindings, ingestFindingsFromScratch, newSession, readScratchScopes, type AgentFinding, type AuditScope, type ToolContext } from "./tools.js";
 
 // Orchestrates one autonomous hunt: load authorized material, give the model the
 // capability surface, run the ReAct loop, then turn whatever it proved into the
@@ -88,50 +88,103 @@ export async function runHunt(
   // AgentSession that owns the loop; the deterministic mock and CLI fallbacks use
   // the legacy per-step complete() loop.
   const fileManifest = renderFileManifest(source, corpusManifest);
-  // The main hunt runs on the `default` role's model; the driver (continuous pi
-  // session vs per-step loop) is chosen from that role's resolved provider.
-  const mainCfg = withRole(cfg, "default");
-  const useSession = !options.llm && isPiSessionProvider(mainCfg.provider);
-  let steps: TranscriptStep[];
-  let stoppedReason: string;
-  if (useSession) {
-    const result = await runHuntSession({
-      cfg: mainCfg,
-      ctx,
-      tools,
-      logger,
-      cwd: workspaceCwd,
-      fileManifest,
-      ...(scopeNote ? { scopeNote } : {}),
-      ...(memoryHint ? { memoryHint } : {}),
-      ...(cfg.huntDeep ? { deep: true } : {}),
-      ...(cfg.huntDeepFocus ? { deepFocus: cfg.huntDeepFocus } : {}),
-    });
-    steps = result.steps;
-    stoppedReason = result.stoppedReason;
-  } else {
-    const llm = options.llm ?? createLlmClient(mainCfg, logger);
+
+  // One phase = one driver run (continuous pi session for pi providers, else the
+  // per-step loop), specialized to a role's model and a mode (breadth/map/dig).
+  const runPhase = async (
+    phaseCfg: AuditorConfig,
+    opts: { mode: "breadth" | "map" | "dig"; deepFocus?: string; maxSteps: number },
+  ): Promise<{ steps: TranscriptStep[]; stoppedReason: string }> => {
+    const flags = {
+      ...(opts.mode === "dig" ? { deep: true } : {}),
+      ...(opts.mode === "map" ? { map: true } : {}),
+      ...(opts.deepFocus ? { deepFocus: opts.deepFocus } : {}),
+    };
+    if (!options.llm && isPiSessionProvider(phaseCfg.provider)) {
+      return runHuntSession({
+        cfg: { ...phaseCfg, huntMaxSteps: opts.maxSteps },
+        ctx,
+        tools,
+        logger,
+        cwd: workspaceCwd,
+        fileManifest,
+        ...(scopeNote ? { scopeNote } : {}),
+        ...(memoryHint ? { memoryHint } : {}),
+        ...flags,
+      });
+    }
+    const llm = options.llm ?? createLlmClient(phaseCfg, logger);
     if (llm && "setLogger" in llm && typeof (llm as { setLogger?: unknown }).setLogger === "function") {
       (llm as { setLogger(logger: RunLogger): void }).setLogger(logger);
     }
-    const loop = await runHuntLoop({
-      cfg: mainCfg,
+    return runHuntLoop({
+      cfg: phaseCfg,
       llm,
       tools,
       ctx,
       logger,
-      maxSteps: Math.max(1, Math.floor(cfg.huntMaxSteps)),
+      maxSteps: Math.max(1, Math.floor(opts.maxSteps)),
       fileManifest,
       ...(scopeNote ? { scopeNote } : {}),
       ...(memoryHint ? { memoryHint } : {}),
-      ...(cfg.huntDeep ? { deep: true } : {}),
-      ...(cfg.huntDeepFocus ? { deepFocus: cfg.huntDeepFocus } : {}),
+      ...flags,
     });
-    steps = loop.steps;
-    stoppedReason = loop.stoppedReason;
+  };
+
+  let steps: TranscriptStep[];
+  let stoppedReason: string;
+  let manualFindings = false;
+  let scopeInventory: AuditScope[] = [];
+
+  if (cfg.huntDeep && !cfg.huntDeepFocus) {
+    // MAP → DIG: map enumerates the full scope inventory; dig deep-audits the top
+    // scopes one at a time. Nothing is silently dropped — scopes past the cap are
+    // recorded as deferred. Findings from each dig are accumulated and tagged.
+    const mapPhase = await runPhase(withRole(cfg, "map"), { mode: "map", maxSteps: cfg.huntMapSteps });
+    scopeInventory = readScratchScopes(session);
+    await logger.event("hunt_map_done", { scopes: scopeInventory.length });
+    clearScratchFindings(session);
+
+    const digCfg = withRole(cfg, "dig");
+    const toDig = scopeInventory.slice(0, Math.max(1, cfg.huntMaxScopes));
+    for (const scope of scopeInventory.slice(toDig.length)) scope.status = "deferred";
+    const aggregated: AgentFinding[] = [];
+    const aggregatedSteps: TranscriptStep[] = [...mapPhase.steps];
+    for (const scope of toDig) {
+      clearScratchFindings(session);
+      const dig = await runPhase(digCfg, {
+        mode: "dig",
+        deepFocus: `${scope.obligation} — code region: ${scope.region}`,
+        maxSteps: cfg.huntDigSteps,
+      });
+      aggregatedSteps.push(...dig.steps);
+      ingestFindingsFromScratch(session);
+      for (const finding of session.findings) {
+        finding.scopeId = scope.id;
+        aggregated.push(finding);
+      }
+      scope.status = "audited";
+      await logger.event("hunt_dig_done", { scope: scope.id, findings: session.findings.length });
+    }
+    session.findings = aggregated;
+    session.counters.finding = aggregated.length;
+    manualFindings = true;
+    steps = aggregatedSteps;
+    stoppedReason = "finished";
+    await logger.artifact("hunt_scopes.json", scopeInventory);
+  } else {
+    // Single run: breadth (default role) or a pinned deep-focus dig (dig role).
+    const pinned = Boolean(cfg.huntDeep && cfg.huntDeepFocus);
+    const result = await runPhase(withRole(cfg, pinned ? "dig" : "default"), {
+      mode: pinned ? "dig" : "breadth",
+      ...(cfg.huntDeepFocus ? { deepFocus: cfg.huntDeepFocus } : {}),
+      maxSteps: cfg.huntMaxSteps,
+    });
+    steps = result.steps;
+    stoppedReason = result.stoppedReason;
   }
 
-  const findingParse = ingestFindingsFromScratch(session);
+  const findingParse = manualFindings ? { parsed: session.findings.length, errors: [] } : ingestFindingsFromScratch(session);
   if (findingParse.errors.length > 0) {
     await logger.artifact("hunt_findings_errors.json", findingParse.errors);
     await logger.event("hunt_findings_parse_errors", { errors: findingParse.errors.length });

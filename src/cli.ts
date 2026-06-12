@@ -57,6 +57,9 @@ async function parseConfig(args: string[]): Promise<{ cfg: AuditorConfig }> {
   cfg.huntPrepareTimeoutMs = readIntFlag(args, "--prepare-timeout-ms") ?? cfg.huntPrepareTimeoutMs;
   if (args.includes("--no-refute")) cfg.huntRefute = false;
   if (args.includes("--deep")) cfg.huntDeep = true;
+  cfg.huntMaxScopes = readIntFlag(args, "--max-scopes") ?? cfg.huntMaxScopes;
+  cfg.huntMapSteps = readIntFlag(args, "--map-steps") ?? cfg.huntMapSteps;
+  cfg.huntDigSteps = readIntFlag(args, "--dig-steps") ?? cfg.huntDigSteps;
   const deepFocus = readFlag(args, "--deep-focus");
   if (deepFocus !== undefined) {
     cfg.huntDeep = true;
@@ -103,6 +106,12 @@ function applyConfigOverrides(cfg: AuditorConfig, raw: Record<string, unknown>):
     cfg.huntDeep = true;
     cfg.huntDeepFocus = rawHuntDeepFocus.trim();
   }
+  const rawMaxScopes = raw.huntMaxScopes ?? raw.hunt_max_scopes;
+  if (typeof rawMaxScopes === "number" && Number.isFinite(rawMaxScopes)) cfg.huntMaxScopes = Math.max(1, Math.floor(rawMaxScopes));
+  const rawMapSteps = raw.huntMapSteps ?? raw.hunt_map_steps;
+  if (typeof rawMapSteps === "number" && Number.isFinite(rawMapSteps)) cfg.huntMapSteps = Math.max(1, Math.floor(rawMapSteps));
+  const rawDigSteps = raw.huntDigSteps ?? raw.hunt_dig_steps;
+  if (typeof rawDigSteps === "number" && Number.isFinite(rawDigSteps)) cfg.huntDigSteps = Math.max(1, Math.floor(rawDigSteps));
   if (raw.thinkingLevel === "minimal" || raw.thinkingLevel === "low" || raw.thinkingLevel === "medium" || raw.thinkingLevel === "high" || raw.thinkingLevel === "xhigh") {
     cfg.thinkingLevel = raw.thinkingLevel;
   }
@@ -197,8 +206,11 @@ Options:
   --prepare-timeout-ms <n>
                           hunt: per-command timeout for the warm-up, default 600000
   --no-refute             hunt: skip the independent-refutation pass on confirmed findings
-  --deep                  hunt: deep narrow-scope audit (obligation-driven; model picks the critical region)
-  --deep-focus <path>     hunt: deep audit pinned to a specific region (implies --deep)
+  --deep                  hunt: map → dig flow (map enumerates scopes, dig deep-audits the top ones)
+  --deep-focus <path>     hunt: skip map and deep-audit one pinned region (implies --deep)
+  --max-scopes <n>        hunt: how many top scopes the dig phase deep-audits, default 6
+  --map-steps <n>         hunt: action budget for the map phase, default 20
+  --dig-steps <n>         hunt: per-scope action budget for the dig phase, default 30
   --mock-llm              run with the deterministic mock model
 `);
 }

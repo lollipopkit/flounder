@@ -64,6 +64,7 @@ async function parseConfig(args: string[]): Promise<{ cfg: AuditorConfig }> {
   cfg.huntMaxScopes = readIntFlag(args, "--max-scopes") ?? cfg.huntMaxScopes;
   cfg.huntMapSteps = readIntFlag(args, "--map-steps") ?? cfg.huntMapSteps;
   cfg.huntDigSteps = readIntFlag(args, "--dig-steps") ?? cfg.huntDigSteps;
+  cfg.huntDigSamples = readIntFlag(args, "--dig-samples") ?? cfg.huntDigSamples;
   if (args.includes("--remap")) cfg.huntRemap = true;
   const scopeSel = readFlag(args, "--scope");
   if (scopeSel) {
@@ -125,6 +126,8 @@ function applyConfigOverrides(cfg: AuditorConfig, raw: Record<string, unknown>):
   if (typeof rawMapSteps === "number" && Number.isFinite(rawMapSteps)) cfg.huntMapSteps = Math.max(1, Math.floor(rawMapSteps));
   const rawDigSteps = raw.huntDigSteps ?? raw.hunt_dig_steps;
   if (typeof rawDigSteps === "number" && Number.isFinite(rawDigSteps)) cfg.huntDigSteps = Math.max(1, Math.floor(rawDigSteps));
+  const rawDigSamples = raw.huntDigSamples ?? raw.hunt_dig_samples;
+  if (typeof rawDigSamples === "number" && Number.isFinite(rawDigSamples)) cfg.huntDigSamples = Math.max(1, Math.floor(rawDigSamples));
   if (raw.thinkingLevel === "minimal" || raw.thinkingLevel === "low" || raw.thinkingLevel === "medium" || raw.thinkingLevel === "high" || raw.thinkingLevel === "xhigh") {
     cfg.thinkingLevel = raw.thinkingLevel;
   }
@@ -224,6 +227,7 @@ Options:
   --max-scopes <n>        hunt: how many un-audited scopes the dig phase audits per run, default 6
   --map-steps <n>         hunt: action budget for the map phase, default 20
   --dig-steps <n>         hunt: per-scope action budget for the dig phase, default 30
+  --dig-samples <n>       hunt: independent dig passes per scope, findings unioned (raises recall), default 1
   --remap                 hunt: re-enumerate scopes from scratch (default resumes the persisted inventory)
   --scope <id[,id...]>    hunt: deep-audit specific scope id(s) from the inventory (implies --deep; run --deep once first to enumerate)
   --mock-llm              run with the deterministic mock model

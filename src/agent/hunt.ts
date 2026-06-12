@@ -16,7 +16,7 @@ import { ProjectMemory } from "./memory.js";
 import { loadScopeInventory, saveScopeInventory, scopeProgress } from "./scope-store.js";
 import { isPiSessionProvider, runHuntSession } from "./pi-session.js";
 import type { TranscriptStep } from "./prompts.js";
-import { buildTools, clearScratchFindings, ingestFindingsFromScratch, newSession, readScratchScopes, type AgentFinding, type AuditScope, type ToolContext } from "./tools.js";
+import { buildTools, clearScratchFindings, dedupeFindings, ingestFindingsFromScratch, newSession, readScratchScopes, type AgentFinding, type AuditScope, type ToolContext } from "./tools.js";
 
 // Orchestrates one autonomous hunt: load authorized material, give the model the
 // capability surface, run the ReAct loop, then turn whatever it proved into the
@@ -184,28 +184,33 @@ export async function runHunt(
         .slice(0, Math.max(1, cfg.huntMaxScopes));
     }
     const aggregated: AgentFinding[] = [];
+    const samples = Math.max(1, Math.floor(cfg.huntDigSamples));
     for (const scope of toDig) {
-      clearScratchFindings(session);
-      const dig = await runPhase(digCfg, {
-        mode: "dig",
-        // The region is the audit boundary; the map's obligation is only a starting
-        // hint, never a limit. Anchoring the dig on that single obligation narrows
-        // it and can miss obligations the map did not name — which contradicts the
-        // dig system prompt's own rule to independently enumerate ALL of a region's
-        // obligations.
-        deepFocus:
-          `code region ${scope.region} — audit this WHOLE region: independently enumerate and discharge ALL of its security obligations; ` +
-          `do NOT limit yourself to any single one. The map flagged one concern as a starting point (not a boundary): "${scope.obligation}"`,
-        maxSteps: cfg.huntDigSteps,
-      });
-      aggregatedSteps.push(...dig.steps);
-      ingestFindingsFromScratch(session);
-      for (const finding of session.findings) {
-        finding.scopeId = scope.id;
-        aggregated.push(finding);
+      // The region is the audit boundary; the map's obligation is only a starting
+      // hint, never a limit (the dig system prompt's own rule is to independently
+      // enumerate ALL of a region's obligations).
+      const deepFocus =
+        `code region ${scope.region} — audit this WHOLE region: independently enumerate and discharge ALL of its security obligations; ` +
+        `do NOT limit yourself to any single one. The map flagged one concern as a starting point (not a boundary): "${scope.obligation}"`;
+      // Run the dig independently `samples` times and union the findings. Per-pass
+      // recall on a subtle obligation is < 1 and stochastic; K independent passes
+      // raise cumulative recall (1 - (1-p)^K) without any bug-specific tuning.
+      const perScope: AgentFinding[] = [];
+      for (let sample = 1; sample <= samples; sample += 1) {
+        clearScratchFindings(session);
+        const dig = await runPhase(digCfg, { mode: "dig", deepFocus, maxSteps: cfg.huntDigSteps });
+        aggregatedSteps.push(...dig.steps);
+        ingestFindingsFromScratch(session);
+        for (const finding of session.findings) {
+          finding.scopeId = scope.id;
+          perScope.push(finding);
+        }
+        if (samples > 1) await logger.event("hunt_dig_sample", { scope: scope.id, sample, of: samples, findings: session.findings.length });
       }
+      const unioned = dedupeFindings(perScope);
+      aggregated.push(...unioned);
       scope.status = "audited";
-      await logger.event("hunt_dig_done", { scope: scope.id, findings: session.findings.length });
+      await logger.event("hunt_dig_done", { scope: scope.id, samples, findings: unioned.length });
     }
     session.findings = aggregated;
     session.counters.finding = aggregated.length;

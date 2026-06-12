@@ -31,6 +31,10 @@ export interface AuditorConfig {
   huntMapSteps: number;
   huntDigSteps: number;
   huntMaxScopes: number;
+  // How many independent dig passes to run per scope; findings are unioned. Raises
+  // recall on scopes where a single pass finds a subtle obligation only sometimes
+  // (cumulative recall 1 - (1-p)^K) — a variance lever, not a bug-specific tweak.
+  huntDigSamples: number;
   // Re-enumerate the scope inventory from scratch instead of resuming the
   // persisted one (which would otherwise continue with the next un-audited scopes).
   huntRemap: boolean;
@@ -115,6 +119,7 @@ export function defaultConfig(): AuditorConfig {
     huntMapSteps: 20,
     huntDigSteps: 30,
     huntMaxScopes: 6,
+    huntDigSamples: 1,
     huntRemap: false,
     dryRun: false,
   };

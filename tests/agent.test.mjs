@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { defaultConfig, resolveRole, withRole, normalizeRoleModels } from "../dist/config.js";
 import { ProjectMemory } from "../dist/agent/memory.js";
-import { buildTools, ingestFindingsFromScratch, newSession } from "../dist/agent/tools.js";
+import { buildTools, ingestFindingsFromScratch, newSession, dedupeFindings } from "../dist/agent/tools.js";
 import { runHunt } from "../dist/agent/hunt.js";
 import { runHuntLoop, isTransientError } from "../dist/agent/loop.js";
 import { buildDeepKickoff, HUNT_DEEP_SYSTEM } from "../dist/agent/prompts.js";
@@ -544,6 +544,45 @@ test("map → dig: --scope picks a specific inventory item to deep-audit (human-
       runHunt({ ...defaultConfig(), ...base, huntScopeIds: ["S99"] }, { llm: new MockAuditLlmClient() }),
       /none of the requested scope ids exist/,
     );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("dedupeFindings: unions multi-sample findings, keeping the strongest-confirmed instance", () => {
+  const mk = (location, title, confirmationStatus, confidence) => ({ location, title, confirmationStatus, confidence });
+  const out = dedupeFindings([
+    mk("mul/incomplete.rs:309", "Unconstrained base", "suspected", 0.6),
+    mk("mul/incomplete.rs:309", "Unconstrained base", "confirmed-executable", 0.7), // same bug, stronger
+    mk("note_commit.rs:728", "Canonicity ok", "suspected", 0.4), // different bug
+    mk("MUL/INCOMPLETE.RS:309", " Unconstrained base ", "suspected", 0.9), // same key (case/space), weaker status
+  ]);
+  assert.equal(out.length, 2, "two distinct (location,title) bugs survive");
+  const base = out.find((f) => f.location.toLowerCase().includes("incomplete"));
+  assert.equal(base.confirmationStatus, "confirmed-executable", "the strongest-confirmed instance is kept");
+});
+
+test("map → dig: --dig-samples runs a scope K times and unions findings (recall lever)", async () => {
+  const dir = await tempDir();
+  try {
+    const cfg = defaultConfig();
+    cfg.targetName = "samples-e2e";
+    cfg.sourcePaths = [fixtures];
+    cfg.corpusPaths = [fixtures];
+    cfg.outputDir = path.join(dir, "runs");
+    cfg.huntDeep = true;
+    cfg.huntMapSteps = 6;
+    cfg.huntDigSteps = 8;
+    cfg.huntMaxScopes = 1;
+    cfg.huntDigSamples = 2;
+
+    const { runDir, summary } = await runHunt(cfg, { llm: new MockAuditLlmClient() });
+
+    // Two independent dig passes ran; the identical finding is unioned to one.
+    const events = (await readFile(path.join(runDir, "events.jsonl"), "utf8")).trim().split("\n").map((l) => JSON.parse(l));
+    const sampleEvents = events.filter((e) => e.kind === "hunt_dig_sample");
+    assert.equal(sampleEvents.length, 2, "two dig samples ran for the scope");
+    assert.equal(summary.findings.length, 1, "the duplicate finding is unioned to one");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

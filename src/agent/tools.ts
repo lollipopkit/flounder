@@ -502,6 +502,33 @@ export function readScratchScopes(session: AgentSession): AuditScope[] {
   return scopes.sort((a, b) => b.score - a.score);
 }
 
+const CONFIRMATION_RANK: Record<string, number> = {
+  suspected: 0,
+  "confirmed-source": 1,
+  "confirmed-executable": 2,
+  "confirmed-differential": 3,
+};
+
+/** Union findings from multiple dig samples: dedupe by (location, title), keeping the
+ *  strongest-confirmed (then highest-confidence) instance. Used when huntDigSamples > 1. */
+export function dedupeFindings(findings: AgentFinding[]): AgentFinding[] {
+  const best = new Map<string, AgentFinding>();
+  for (const finding of findings) {
+    const key = `${(finding.location ?? "").trim().toLowerCase()}::${(finding.title ?? "").trim().toLowerCase()}`;
+    const current = best.get(key);
+    if (!current) {
+      best.set(key, finding);
+      continue;
+    }
+    const rankNew = CONFIRMATION_RANK[finding.confirmationStatus] ?? 0;
+    const rankCur = CONFIRMATION_RANK[current.confirmationStatus] ?? 0;
+    if (rankNew > rankCur || (rankNew === rankCur && (finding.confidence ?? 0) > (current.confidence ?? 0))) {
+      best.set(key, finding);
+    }
+  }
+  return [...best.values()];
+}
+
 /** Drop the findings.json scratch entry so the next dig pass starts from a clean slate. */
 export function clearScratchFindings(session: AgentSession): void {
   for (const key of [...session.scratchFiles.keys()]) {

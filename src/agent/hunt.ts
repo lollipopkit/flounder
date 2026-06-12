@@ -188,7 +188,14 @@ export async function runHunt(
       clearScratchFindings(session);
       const dig = await runPhase(digCfg, {
         mode: "dig",
-        deepFocus: `${scope.obligation} — code region: ${scope.region}`,
+        // The region is the audit boundary; the map's obligation is only a starting
+        // hint, never a limit. Anchoring the dig on that single obligation narrows
+        // it and can miss obligations the map did not name — which contradicts the
+        // dig system prompt's own rule to independently enumerate ALL of a region's
+        // obligations.
+        deepFocus:
+          `code region ${scope.region} — audit this WHOLE region: independently enumerate and discharge ALL of its security obligations; ` +
+          `do NOT limit yourself to any single one. The map flagged one concern as a starting point (not a boundary): "${scope.obligation}"`,
         maxSteps: cfg.huntDigSteps,
       });
       aggregatedSteps.push(...dig.steps);

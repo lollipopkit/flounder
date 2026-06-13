@@ -37,6 +37,7 @@ export async function runDifferentialConfirmation(input: {
   baselineFiles: Set<string>;
   cfg: AuditorConfig;
   logger: RunLogger;
+  cacheDir?: string;
 }): Promise<DifferentialResult> {
   const { finding, exploitRun } = input;
   const base = (reason: string, extra: Partial<DifferentialResult> = {}): DifferentialResult => ({
@@ -78,7 +79,7 @@ export async function runDifferentialConfirmation(input: {
   let patchedRun;
   try {
     await writeSandboxFiles(input.workspace.absolute, [{ path: rel, content: patchedContent }]);
-    patchedRun = await runSandboxCommand(exploitRun.commandSpec, input.workspace.absolute, input.cfg.reproductionMaxLogBytes, input.cfg.sourcePaths);
+    patchedRun = await runSandboxCommand(exploitRun.commandSpec, input.workspace.absolute, input.cfg.reproductionMaxLogBytes, input.cfg.sourcePaths, input.cacheDir);
   } finally {
     // Always restore the pristine target source so other findings see a clean tree.
     await writeSandboxFiles(input.workspace.absolute, [{ path: rel, content: original }]);

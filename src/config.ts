@@ -4,6 +4,11 @@ export interface AuditorConfig {
   targetName: string;
   sourcePaths: string[];
   corpusPaths: string[];
+  // Directory copied into the sandbox so the workspace is buildable (e.g. a Cargo
+  // workspace root whose members the audited crate path-depends on). Defaults to
+  // sourcePaths. Separates "what gets built" from "what the model reads" so a
+  // narrow audit scope can still compile against its full project.
+  buildRoot?: string;
   outputDir: string;
   historyDir?: string;
   provider: string;

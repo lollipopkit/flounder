@@ -67,9 +67,16 @@ export async function runHunt(
   let workspaceCwd = process.cwd();
   const corpusManifest: string[] = [];
   if (cfg.sourcePaths.length > 0) {
-    const workspace = await prepareSandboxWorkspace(cfg.sourcePaths, logger.runDir, "hunt/workspace");
+    // The sandbox copies the build root (a buildable project, e.g. a workspace
+    // root) when one is set, so a narrow audit scope can still compile; otherwise
+    // it copies the audited source. The model still reads only `sourcePaths`.
+    const workspaceRoots = cfg.buildRoot ? [cfg.buildRoot] : cfg.sourcePaths;
+    const workspace = await prepareSandboxWorkspace(workspaceRoots, logger.runDir, "hunt/workspace");
     session.workspace = workspace;
     workspaceCwd = workspace.absolute;
+    // Persistent, host-isolated package cache so dependency builds are downloaded
+    // once and reused across runs (HOME stays the per-run workspace).
+    session.buildCacheDir = path.join(projectHistoryDir(historyLocation(cfg)), "build-cache");
     // Capture the pristine target source before anything else touches the
     // workspace, so the model cannot modify the code it is auditing — a
     // confirmation must run against untampered source.
@@ -248,7 +255,7 @@ export async function runHunt(
       if (finding.confirmationStatus !== "confirmed-executable" || !finding.fixPatch || !finding.commandRunId) continue;
       const exploitRun = session.commandRuns.find((run) => run.id === finding.commandRunId);
       if (!exploitRun) continue;
-      const result = await runDifferentialConfirmation({ workspace: session.workspace, finding, exploitRun, baselineFiles: session.baselineFiles, cfg, logger });
+      const result = await runDifferentialConfirmation({ workspace: session.workspace, finding, exploitRun, baselineFiles: session.baselineFiles, cfg, logger, ...(session.buildCacheDir ? { cacheDir: session.buildCacheDir } : {}) });
       differentials.push(result);
       if (result.confirmed) finding.confirmationStatus = "confirmed-differential";
     }

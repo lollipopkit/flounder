@@ -83,6 +83,7 @@ export async function runSandboxCommand(
   workspaceAbsolute: string,
   maxLogBytes: number,
   redactPaths: string[],
+  cacheDir?: string,
 ): Promise<ReproductionCommandResult> {
   const cwd = command.cwd ? resolveWorkspacePath(workspaceAbsolute, command.cwd) : workspaceAbsolute;
   const started = Date.now();
@@ -92,10 +93,14 @@ export async function runSandboxCommand(
   let exitCode: number | null = null;
   const tmpDir = path.join(workspaceAbsolute, ".tmp");
   await mkdir(tmpDir, { recursive: true });
+  // A persistent, host-isolated package cache (CARGO_HOME etc.) when provided, so
+  // dependency builds are downloaded once and reused across runs. HOME stays the
+  // per-run workspace either way, so host credentials/config are never exposed.
+  if (cacheDir) await mkdir(cacheDir, { recursive: true });
   const child = spawn(command.program, command.args, {
     cwd,
     shell: false,
-    env: localSandboxEnv(workspaceAbsolute, tmpDir),
+    env: localSandboxEnv(workspaceAbsolute, tmpDir, cacheDir),
   });
   const timer = setTimeout(() => {
     timedOut = true;
@@ -262,18 +267,22 @@ function replaceAll(input: string, needle: string, replacement: string): string 
   return input.split(needle).join(replacement);
 }
 
-function localSandboxEnv(workspace: string, tmpDir: string): NodeJS.ProcessEnv {
+function localSandboxEnv(workspace: string, tmpDir: string, cacheDir?: string): NodeJS.ProcessEnv {
+  // HOME is always the per-run workspace (host config/credentials stay hidden).
+  // Package caches go to a persistent cacheDir when one is supplied, else the
+  // per-run tmpDir (which is discarded with the run).
+  const pkgCache = cacheDir ?? tmpDir;
   const out: NodeJS.ProcessEnv = {
     CI: "1",
     HOME: workspace,
     TMPDIR: tmpDir,
     TEMP: tmpDir,
     TMP: tmpDir,
-    XDG_CACHE_HOME: path.join(tmpDir, "xdg-cache"),
-    CARGO_HOME: path.join(tmpDir, "cargo-home"),
-    GOCACHE: path.join(tmpDir, "go-build-cache"),
-    GOMODCACHE: path.join(tmpDir, "go-mod-cache"),
-    NPM_CONFIG_CACHE: path.join(tmpDir, "npm-cache"),
+    XDG_CACHE_HOME: path.join(pkgCache, "xdg-cache"),
+    CARGO_HOME: path.join(pkgCache, "cargo-home"),
+    GOCACHE: path.join(pkgCache, "go-build-cache"),
+    GOMODCACHE: path.join(pkgCache, "go-mod-cache"),
+    NPM_CONFIG_CACHE: path.join(pkgCache, "npm-cache"),
   };
   if (process.env.PATH !== undefined) out.PATH = process.env.PATH;
   if (process.env.LANG !== undefined) out.LANG = process.env.LANG;

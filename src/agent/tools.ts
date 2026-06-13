@@ -78,6 +78,8 @@ export interface AgentSession {
   scratchFiles: Map<string, string>;
   /** Whether the toolchain warm-up has run for this session's workspace. */
   prepared?: boolean;
+  /** Persistent, host-isolated package cache (CARGO_HOME etc.) reused across runs. */
+  buildCacheDir?: string;
   /**
    * Workspace-relative paths of the pristine target source (captured right after
    * copy). The model may not write/edit these, so a confirmation runs against
@@ -297,7 +299,7 @@ const bashTool: AgentTool = {
     if (isAgentConfirmCommand(normalized.command) || isAgentBuildCommand(normalized.command)) await ensurePrepared(ctx, workspace);
     ctx.session.counters.command += 1;
     const runId = `cmd${ctx.session.counters.command}`;
-    const result = await runSandboxCommand(normalized.command, workspace.absolute, ctx.cfg.reproductionMaxLogBytes, ctx.cfg.sourcePaths);
+    const result = await runSandboxCommand(normalized.command, workspace.absolute, ctx.cfg.reproductionMaxLogBytes, ctx.cfg.sourcePaths, ctx.session.buildCacheDir);
     const exitMatched = result.exitCode === result.expectedExitCode && !result.timedOut;
     const isConfirm = normalized.purpose === "confirm";
     const eligibleByType = isAgentConfirmCommand(normalized.command);

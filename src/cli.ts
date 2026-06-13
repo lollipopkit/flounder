@@ -47,6 +47,8 @@ async function parseConfig(args: string[]): Promise<{ cfg: AuditorConfig }> {
   const corpusPaths = readMultiFlag(args, "--corpus");
   if (sourcePaths.length > 0) cfg.sourcePaths = sourcePaths;
   if (corpusPaths.length > 0) cfg.corpusPaths = corpusPaths;
+  const buildRoot = readFlag(args, "--build-root");
+  if (buildRoot !== undefined) cfg.buildRoot = buildRoot;
   cfg.outputDir = readFlag(args, "--out") ?? cfg.outputDir;
   const historyDir = readFlag(args, "--history-dir");
   if (historyDir !== undefined) cfg.historyDir = historyDir;
@@ -92,6 +94,8 @@ function applyConfigOverrides(cfg: AuditorConfig, raw: Record<string, unknown>):
   if (typeof raw.targetName === "string") cfg.targetName = raw.targetName;
   if (Array.isArray(raw.sourcePaths) && raw.sourcePaths.every((value) => typeof value === "string")) cfg.sourcePaths = raw.sourcePaths;
   if (Array.isArray(raw.corpusPaths) && raw.corpusPaths.every((value) => typeof value === "string")) cfg.corpusPaths = raw.corpusPaths;
+  const rawBuildRoot = raw.buildRoot ?? raw.build_root;
+  if (typeof rawBuildRoot === "string" && rawBuildRoot.trim().length > 0) cfg.buildRoot = rawBuildRoot.trim();
   if (typeof raw.outputDir === "string") cfg.outputDir = raw.outputDir;
   if (typeof raw.historyDir === "string") cfg.historyDir = raw.historyDir;
   if (typeof raw.history_dir === "string") cfg.historyDir = raw.history_dir;
@@ -221,6 +225,7 @@ Options:
   --no-prepare            hunt: skip the toolchain warm-up (deps fetch/build)
   --prepare-timeout-ms <n>
                           hunt: per-command timeout for the warm-up, default 600000
+  --build-root <path>     hunt: directory copied into the sandbox so it is buildable (e.g. a workspace root); defaults to --source
   --no-refute             hunt: skip the independent-refutation pass on confirmed findings
   --deep                  hunt: map → dig flow (map enumerates scopes, dig deep-audits the top ones)
   --deep-focus <path>     hunt: skip map and deep-audit one pinned region (implies --deep)

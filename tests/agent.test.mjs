@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -509,6 +509,33 @@ test("map → dig is resumable: a second run skips map and audits the next pendi
     assert.ok(events2.some((e) => e.kind === "hunt_map_resumed"), "run 2 resumes the persisted inventory");
     const run2Findings = JSON.parse(await readFile(path.join(run2.runDir, "hunt_findings.json"), "utf8"));
     assert.equal(run2Findings[0]?.scopeId, "S2", "run 2 audits the previously-pending scope (S2)");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("buildRoot: the sandbox copies the buildable root, while the model reads only the narrow source", async () => {
+  const dir = await tempDir();
+  try {
+    // A buildable project: manifest at the root, audited source in a subdir.
+    const buildRoot = path.join(dir, "project");
+    await mkdir(path.join(buildRoot, "crate", "src"), { recursive: true });
+    await writeFile(path.join(buildRoot, "Cargo.toml"), "[workspace]\nmembers=[\"crate\"]\n");
+    await writeFile(path.join(buildRoot, "crate", "src", "lib.rs"), "// audited unit\npub fn f() {}\n");
+
+    const cfg = defaultConfig();
+    cfg.targetName = "buildroot-e2e";
+    cfg.sourcePaths = [path.join(buildRoot, "crate", "src")]; // narrow audit scope
+    cfg.buildRoot = buildRoot; // full buildable workspace
+    cfg.outputDir = path.join(dir, "runs");
+    cfg.huntMaxSteps = 6;
+
+    const { runDir } = await runHunt(cfg, { llm: new MockAuditLlmClient() });
+
+    // The sandbox workspace contains the build root's manifest (copied from buildRoot),
+    // which is NOT under the narrow sourcePaths subdir — proving buildRoot drove the copy.
+    const manifest = path.join(runDir, "hunt", "workspace", "Cargo.toml");
+    assert.ok((await stat(manifest)).isFile(), "the buildable root's manifest must be copied into the sandbox");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

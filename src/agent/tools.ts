@@ -467,6 +467,26 @@ export interface AuditScope {
   status?: "pending" | "audited" | "deferred";
 }
 
+/** Non-mutating check: did the session write a non-empty findings.json to scratch?
+ *  Used by the session driver to decide whether a dig needs a forced finalize
+ *  (the dig writes ALL obligations — discharged and flagged — so "empty" means the
+ *  obligation analysis was never persisted, not that the region is clean). */
+export function scratchHasFindings(session: AgentSession): boolean {
+  const entry = scratchReportEntry(session, "findings.json");
+  if (!entry) return false;
+  try {
+    const raw: unknown = JSON.parse(entry.content);
+    const items = Array.isArray(raw)
+      ? raw
+      : raw && typeof raw === "object" && Array.isArray((raw as Record<string, unknown>).findings)
+        ? ((raw as Record<string, unknown>).findings as unknown[])
+        : [];
+    return items.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 /** Parse the map phase's scopes.json from scratch (sorted by score, highest first). */
 export function readScratchScopes(session: AgentSession): AuditScope[] {
   const entry = scratchReportEntry(session, "scopes.json");

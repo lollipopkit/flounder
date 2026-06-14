@@ -4,7 +4,7 @@ import { Type } from "typebox";
 import type { AuditorConfig } from "../config.js";
 import type { RunLogger } from "../trace/logger.js";
 import type { TranscriptStep } from "./prompts.js";
-import { readScratchScopes, type AgentTool, type ToolContext } from "./tools.js";
+import { readScratchScopes, scratchHasFindings, type AgentTool, type ToolContext } from "./tools.js";
 
 // Continuous-session driver (point 5). Instead of re-driving a stateless
 // complete() once per step — which re-sends the whole transcript every turn and
@@ -103,21 +103,38 @@ export async function runHuntSession(input: {
     }
   });
 
-  // Map-phase forced finalize: if the map stopped (cleanly or on budget) without a
-  // usable scope inventory, spend a bounded extra turn asking explicitly for it.
-  // readScratchScopes reads the same in-memory scratch the tools write and that
-  // hunt.ts reads after this returns, so this is the exact "0 scopes" condition.
-  const finalizeMapIfEmpty = async (): Promise<void> => {
-    if (!input.map || finalizing) return;
-    if (readScratchScopes(input.ctx.session).length > 0) return;
-    finalizing = true;
-    await input.logger.event("hunt_map_finalize", { reason: "no scopes written before stop" });
-    try {
-      await session.prompt(MAP_FINALIZE_PROMPT);
-    } catch {
-      // best-effort: an abort during the finalize turns is expected
+  // Forced finalize: if the phase stopped (cleanly or on budget) without persisting
+  // its required artifact, spend a bounded extra turn asking explicitly for it. The
+  // map owes scopes.json; every other phase (breadth/deep/dig) owes findings.json —
+  // a dig can otherwise spend its whole budget exploring and persist zero obligation
+  // analysis (observed: a 50-turn Vault dig wrote no hypotheses). The scratch read is
+  // the same in-memory source hunt.ts reads after this returns, so the empty checks
+  // are exact. The findings finalize must NOT bypass the confirmation gate: it asks
+  // only for the obligation analysis (discharged or suspected), never for a confirmed
+  // status without a passing test.
+  const finalizeIfEmpty = async (): Promise<void> => {
+    if (finalizing) return;
+    if (input.map) {
+      if (readScratchScopes(input.ctx.session).length > 0) return;
+      finalizing = true;
+      await input.logger.event("hunt_map_finalize", { reason: "no scopes written before stop" });
+      try {
+        await session.prompt(MAP_FINALIZE_PROMPT);
+      } catch {
+        // best-effort: an abort during the finalize turns is expected
+      }
+      await input.logger.event("hunt_map_finalize_done", { scopes: readScratchScopes(input.ctx.session).length });
+      return;
     }
-    await input.logger.event("hunt_map_finalize_done", { scopes: readScratchScopes(input.ctx.session).length });
+    if (scratchHasFindings(input.ctx.session)) return;
+    finalizing = true;
+    await input.logger.event("hunt_findings_finalize", { reason: "no findings written before stop" });
+    try {
+      await session.prompt(FINDINGS_FINALIZE_PROMPT);
+    } catch {
+      // best-effort
+    }
+    await input.logger.event("hunt_findings_finalize_done", { hasFindings: scratchHasFindings(input.ctx.session) });
   };
 
   try {
@@ -147,7 +164,7 @@ export async function runHuntSession(input: {
       }
       // budgetAborted: fall through to the forced finalize below
     }
-    await finalizeMapIfEmpty();
+    await finalizeIfEmpty();
     return { steps, stoppedReason: budgetAborted ? "step-budget" : "finished" };
   } finally {
     unsubscribe();
@@ -245,6 +262,8 @@ ${input.map
 }
 
 const MAP_FINALIZE_PROMPT = `Your exploration budget is spent. Do NOT read, grep, or run anything else. Based ONLY on what you have already examined, WRITE scopes.json now at the workspace root as your very next action — call the write tool once with a JSON array of objects {"id","obligation","region":"file:lines","lenses":[...],"exposure","difficulty","score","why"} covering the most soundness-critical regions you saw (entrypoints that move value, accounting/share math, authorization, liquidation/swap invariants, oracle binding). Partial but concrete beats empty. After writing, emit {"done": true}. Output only the write tool call.`;
+
+const FINDINGS_FINALIZE_PROMPT = `Your budget is spent. Do NOT read, grep, or run anything else. Based ONLY on the analysis you have already done, WRITE findings.json now at the workspace root as your very next action — call the write tool once with the obligations you enumerated for this region and EACH one's status: either discharged (state the exact enforcing line) or suspected (state root cause, exact location, attacker impact, and a fix). Do NOT mark anything confirmed/confirmed-executable — that status requires a test you actually ran and passed, and the budget is gone. Persisting your suspected/discharged analysis is the goal; partial but concrete beats empty. After writing, emit {"done": true}. Output only the write tool call.`;
 
 function mapIntro(): string {
   return `You are an autonomous white-hat security auditor doing the MAP phase: enumerate the COMPLETE set of audit SCOPES for this target. You are NOT finding or proving bugs yet — a later phase deep-audits each scope. Your job is COVERAGE, not a ranked shortlist that drops things.

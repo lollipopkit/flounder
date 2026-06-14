@@ -231,7 +231,7 @@ export async function runHunt(
       // differential confirmation, so parallel digs cannot corrupt each other's
       // test files, build output, or findings. A bounded pool caps simultaneous digs.
       const workspaceRoots = cfg.buildRoot ? [cfg.buildRoot] : cfg.sourcePaths;
-      const digScope = async (scope: AuditScope): Promise<AgentFinding[]> => {
+      const digScope = async (scope: AuditScope): Promise<{ findings: AgentFinding[]; steps: TranscriptStep[]; commandRuns: typeof session.commandRuns }> => {
         const ws = await prepareSandboxWorkspace(workspaceRoots, logger.runDir, `hunt/dig-${safeScopeDir(scope.id)}`);
         const digSession = newSession();
         digSession.workspace = ws;
@@ -239,7 +239,7 @@ export async function runHunt(
         if (session.buildCacheDir) digSession.buildCacheDir = session.buildCacheDir; // shared dep cache; per-dig target/
         await copyCorpusIntoWorkspace(ws, corpus);
         const digCtx: ToolContext = { cfg: digCfg, source, corpus, memory, logger, session: digSession };
-        const { findings: unioned } = await digSamples(scope, digSession, { ctx: digCtx, cwd: ws.absolute });
+        const { findings: unioned, steps: digSteps } = await digSamples(scope, digSession, { ctx: digCtx, cwd: ws.absolute });
         for (const finding of unioned) {
           if (finding.confirmationStatus !== "confirmed-executable" || !finding.fixPatch || !finding.commandRunId) continue;
           const exploitRun = digSession.commandRuns.find((run) => run.id === finding.commandRunId);
@@ -247,13 +247,29 @@ export async function runHunt(
           const dr = await runDifferentialConfirmation({ workspace: ws, finding, exploitRun, baselineFiles: digSession.baselineFiles, cfg: digCfg, logger, ...(digSession.buildCacheDir ? { cacheDir: digSession.buildCacheDir } : {}) });
           if (dr.confirmed) finding.confirmationStatus = "confirmed-differential";
         }
+        // Each isolated dig session numbers its command runs cmd1.. independently, so
+        // they collide across concurrent scopes. Namespace by scope id and rewrite
+        // each finding's commandRunId link so the aggregated hunt_command_runs.json
+        // keeps every dig's evidence and a confirmed finding's citation still resolves
+        // (the differential above already ran with the original, per-session ids).
+        const scopedRuns = digSession.commandRuns.map((run) => ({ ...run, id: `${scope.id}:${run.id}` }));
+        for (const finding of unioned) {
+          if (finding.commandRunId) finding.commandRunId = `${scope.id}:${finding.commandRunId}`;
+        }
         scope.status = "audited";
         await logger.event("hunt_dig_done", { scope: scope.id, samples, findings: unioned.length, concurrent: true });
-        return unioned;
+        return { findings: unioned, steps: digSteps, commandRuns: scopedRuns };
       };
       await logger.event("hunt_dig_concurrent_start", { scopes: toDig.length, concurrency });
-      const perScopeFindings = await runWithConcurrency(toDig, concurrency, digScope);
-      for (const findings of perScopeFindings) aggregated.push(...findings);
+      const perScope = await runWithConcurrency(toDig, concurrency, digScope);
+      // Merge every dig's findings, transcript steps, and command runs into the run
+      // aggregates so the persisted artifacts reflect the concurrent digs, not just
+      // the map phase. runWithConcurrency preserves scope order.
+      for (const result of perScope) {
+        aggregated.push(...result.findings);
+        aggregatedSteps.push(...result.steps);
+        session.commandRuns.push(...result.commandRuns);
+      }
       digDifferentialDone = true; // each dig confirmed differentially in its own workspace
     } else {
       // Sequential: reuse the shared map workspace (one warm-up) and let the

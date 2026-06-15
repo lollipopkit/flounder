@@ -44,6 +44,7 @@ export async function runHuntSession(input: {
   deep?: boolean;
   deepFocus?: string;
   map?: boolean;
+  verify?: string;
 }): Promise<SessionDriverResult> {
   const model = getModelSafe(input.cfg.provider, input.cfg.auditModel);
   if (!model) throw new Error(`hunt session: unknown provider/model ${input.cfg.provider}/${input.cfg.auditModel}`);
@@ -147,6 +148,7 @@ export async function runHuntSession(input: {
         ...(input.deep ? { deep: true } : {}),
         ...(input.deepFocus ? { deepFocus: input.deepFocus } : {}),
         ...(input.map ? { map: true } : {}),
+        ...(input.verify ? { verify: input.verify } : {}),
       }));
     } catch (error) {
       if (!budgetAborted) {
@@ -225,8 +227,8 @@ const toolSchemas: Record<string, ReturnType<typeof Type.Object>> = {
   }),
 };
 
-function buildSessionPrompt(input: { cfg: AuditorConfig; scopeNote?: string; fileManifest: string; memoryHint?: string; deep?: boolean; deepFocus?: string; map?: boolean }): string {
-  const intro = input.map ? mapIntro() : input.deep ? deepIntro(input.deepFocus) : breadthIntro();
+function buildSessionPrompt(input: { cfg: AuditorConfig; scopeNote?: string; fileManifest: string; memoryHint?: string; deep?: boolean; deepFocus?: string; map?: boolean; verify?: string }): string {
+  const intro = input.verify ? verifyIntro(input.verify) : input.map ? mapIntro() : input.deep ? deepIntro(input.deepFocus) : breadthIntro();
   return `${intro}
 
 Use the provided tools to investigate:
@@ -264,6 +266,15 @@ ${input.map
 const MAP_FINALIZE_PROMPT = `Your exploration budget is spent. Do NOT read, grep, or run anything else. Based ONLY on what you have already examined, WRITE scopes.json now at the workspace root as your very next action — call the write tool once with a JSON array of objects {"id","obligation","region":"file:lines","lenses":[...],"exposure","difficulty","score","why"} covering the most soundness-critical regions you saw (entrypoints that move value, accounting/share math, authorization, liquidation/swap invariants, oracle binding). Partial but concrete beats empty. After writing, emit {"done": true}. Output only the write tool call.`;
 
 const FINDINGS_FINALIZE_PROMPT = `Your budget is spent. Do NOT read, grep, or run anything else. Based ONLY on the analysis you have already done, WRITE findings.json now at the workspace root as your very next action — call the write tool once with the obligations you enumerated for this region and EACH one's status: either discharged (state the exact enforcing line) or suspected (state root cause, exact location, attacker impact, and a fix). Do NOT mark anything confirmed/confirmed-executable — that status requires a test you actually ran and passed, and the budget is gone. Persisting your suspected/discharged analysis is the goal; partial but concrete beats empty. After writing, emit {"done": true}. Output only the write tool call.`;
+
+function verifyIntro(claim: string): string {
+  return `You are an autonomous white-hat security auditor in VERIFY mode: you are handed ONE specific suspected finding and must determine BY EXECUTION whether it is REAL or a FALSE POSITIVE. Do NOT enumerate new issues.
+
+The suspected finding to verify:
+${claim}
+
+Method: (1) read the cited code + its callers/callees/modifiers, and check whether the claimed-unconstrained value is actually bound elsewhere (a verified hash/proof, a require, a check) — many "X is unconstrained" claims are false. (2) Write a NEW PoC test in the sandbox that exercises the ACTUAL code path and triggers the claimed bug; run it with purpose=confirm and success_patterns. (3) Verdict in findings.json: if the PoC passes and triggers the bug, record the finding at its true severity citing command_id, and supply fix_patch + patched_success_patterns for differential confirmation; if after genuine effort it cannot reproduce because the claim is mitigated/false, record ONE finding of severity "info" whose title starts "REFUTED:" with evidence citing the exact mitigating line. Never confirm by assertion — default to refuting unless an executable PoC proves it.`;
+}
 
 function mapIntro(): string {
   return `You are an autonomous white-hat security auditor doing the MAP phase: enumerate the COMPLETE set of audit SCOPES for this target. You are NOT finding or proving bugs yet — a later phase deep-audits each scope. Your job is COVERAGE, not a ranked shortlist that drops things.

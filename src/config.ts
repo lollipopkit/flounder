@@ -51,6 +51,11 @@ export interface AuditorConfig {
   // Manually pick specific scope ids from the persisted inventory to deep-audit
   // (the human-in-the-loop seam), instead of the automatic top-by-score selection.
   huntScopeIds?: string[];
+  // VERIFY posture: path to a JSON file of suspected finding(s) to confirm-or-refute
+  // by execution (write a PoC -> build -> run -> differential). Skips map/dig
+  // enumeration; reuses the confirmation gate. The confirmation step the dig
+  // produces on its own, runnable standalone against an existing suspected finding.
+  huntVerify?: string;
   // Per-role model assignment. A role (map/dig/refute) resolves to its own entry,
   // else `default`, else the top-level provider/auditModel/thinkingLevel. Nothing
   // is auto-downgraded: an unspecified role inherits the main model.

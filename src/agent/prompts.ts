@@ -197,6 +197,49 @@ ${input.fileManifest}
 Begin the obligation-driven method: ${focus ? "enumerate this region's obligations from design intent, then discharge each by naming the enforcing line or flagging its absence." : "model the system, rank and commit to the critical region, then enumerate and discharge its obligations."} Respond with one JSON tool action or done object.`;
 }
 
+export const HUNT_VERIFY_SYSTEM = `You are an autonomous white-hat security auditor in VERIFY mode on AUTHORIZED source code. You are handed ONE specific suspected finding (a claim) and must determine, BY EXECUTION, whether it is REAL or a FALSE POSITIVE. You are NOT enumerating new issues.
+
+Method:
+1. Read the exact cited code, its callers/callees/modifiers, and — critically — whether the claimed-unconstrained value is actually bound elsewhere (a verified hash/proof, a require, a modifier, a check in the caller). Many "X is unconstrained" claims are false because X is committed in a verified hash or checked nearby.
+2. Build a local PoC test (a NEW test/scratch file in the sandbox) that exercises the ACTUAL code path and demonstrates the claimed bug: construct the malicious input/condition and show the invariant breaks or the code accepts what it must reject. Run it with purpose=confirm and declared success_patterns.
+3. Reach a verdict and write findings.json:
+   - REAL: the PoC passes and triggers the bug -> record the finding at its true severity, cite command_id of the passing confirm run, and supply fix_patch + patched_success_patterns so the framework can differentially confirm (exploit reproduces before the fix, blocked after).
+   - FALSE POSITIVE: after genuine effort the bug does NOT reproduce because it is mitigated/false -> record ONE finding of severity "info" whose title starts "REFUTED:" and whose evidence cites the exact mitigating code (file:line) that makes it safe.
+
+The one hard rule: a claim is only confirmed-executable by citing command_id of a purpose=confirm run that actually passed and actually triggered the vulnerable path. Never confirm by assertion or by re-reasoning. Be skeptical: default to refuting unless an executable PoC proves the bug.`;
+
+export function buildVerifyKickoff(input: {
+  target: string;
+  tools: AgentTool[];
+  scopeNote?: string;
+  fileManifest: string;
+  memoryHint?: string;
+  maxSteps: number;
+  verify: string;
+}): string {
+  return `Target: ${input.target}
+Mode: VERIFY — confirm-or-refute ONE specific suspected finding by execution. Up to ${input.maxSteps} actions.
+
+The suspected finding to verify:
+${input.verify}
+
+Authorized scope note:
+${input.scopeNote && input.scopeNote.trim().length > 0 ? input.scopeNote.trim() : "(none provided — treat all loaded source as in scope)"}
+
+Design-intent material (specs, books, design notes) is under corpus/ in your workspace — read it to judge whether the claimed missing/broken obligation is actually enforced.
+
+Available tools:
+${renderToolCatalogue(input.tools)}
+
+Durable memory from prior runs of this target:
+${input.memoryHint && input.memoryHint.trim().length > 0 ? input.memoryHint.trim() : "(empty)"}
+
+Loaded source files:
+${input.fileManifest}
+
+Verify the claim: read the cited code and its bindings, then write and run a PoC test that either reproduces the bug (-> confirmed, with fix_patch + patched_success_patterns) or, after genuine effort, demonstrates it cannot reproduce (-> write a "REFUTED:" info finding citing the mitigating code). Respond with one JSON tool action or done object.`;
+}
+
 export function buildHuntKickoff(input: {
   target: string;
   tools: AgentTool[];

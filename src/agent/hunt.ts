@@ -103,7 +103,7 @@ export async function runHunt(
   // per-step loop), specialized to a role's model and a mode (breadth/map/dig).
   const runPhase = async (
     phaseCfg: AuditorConfig,
-    opts: { mode: "breadth" | "map" | "dig"; deepFocus?: string; maxSteps: number },
+    opts: { mode: "breadth" | "map" | "dig" | "verify"; deepFocus?: string; verifySeed?: string; maxSteps: number },
     over?: { ctx: ToolContext; cwd: string },
   ): Promise<{ steps: TranscriptStep[]; stoppedReason: string }> => {
     const phaseCtx = over?.ctx ?? ctx;
@@ -112,6 +112,7 @@ export async function runHunt(
       ...(opts.mode === "dig" ? { deep: true } : {}),
       ...(opts.mode === "map" ? { map: true } : {}),
       ...(opts.deepFocus ? { deepFocus: opts.deepFocus } : {}),
+      ...(opts.verifySeed ? { verify: opts.verifySeed } : {}),
     };
     if (!options.llm && isPiSessionProvider(phaseCfg.provider)) {
       return runHuntSession({
@@ -152,7 +153,35 @@ export async function runHunt(
   // isolated workspaces, so the shared post-loop differential stage skips them.
   let digDifferentialDone = false;
 
-  if (cfg.huntDeep && !cfg.huntDeepFocus) {
+  if (cfg.huntVerify) {
+    // VERIFY posture: confirm-or-refute existing suspected finding(s) by execution.
+    // Skips map/dig enumeration; for each finding it runs a focused session seeded
+    // with the claim ("write a PoC that triggers it, or refute it"), routed through
+    // the same confirmation gate. The shared post-loop differential stage then
+    // upgrades any confirmed-executable finding to confirmed-differential. This is
+    // exactly the confirmation tail of a dig, runnable standalone on a prior finding.
+    const toVerify = await loadFindingsToVerify(cfg.huntVerify);
+    await logger.event("hunt_verify_start", { findings: toVerify.length });
+    const verifyCfg = withRole(cfg, "dig");
+    const aggregated: AgentFinding[] = [];
+    const aggregatedSteps: TranscriptStep[] = [];
+    for (const [idx, finding] of toVerify.entries()) {
+      clearScratchFindings(session);
+      const phase = await runPhase(verifyCfg, { mode: "verify", verifySeed: buildVerifySeed(finding), maxSteps: cfg.huntDigSteps });
+      aggregatedSteps.push(...phase.steps);
+      ingestFindingsFromScratch(session);
+      for (const produced of session.findings) aggregated.push(produced);
+      await logger.event("hunt_verify_done", { index: idx + 1, of: toVerify.length, claim: String(finding.title ?? "").slice(0, 90), produced: session.findings.length });
+    }
+    aggregated.forEach((produced, i) => {
+      produced.id = `f${i + 1}`;
+    });
+    session.findings = aggregated;
+    session.counters.finding = aggregated.length;
+    manualFindings = true;
+    steps = aggregatedSteps;
+    stoppedReason = "finished";
+  } else if (cfg.huntDeep && !cfg.huntDeepFocus) {
     // MAP → DIG, resumable. The complete scope inventory is persisted under the
     // project history dir; each run deep-audits the next batch of un-audited
     // scopes and updates their status. Re-running the same command therefore
@@ -524,6 +553,54 @@ async function persistFindingMemory(memory: ProjectMemory, confirmed: AgentFindi
 
 function isConfirmed(status: ConfirmationStatus): boolean {
   return status === "confirmed-executable" || status === "confirmed-differential";
+}
+
+// --verify input: a JSON file holding one suspected finding, an array of them, or
+// a {findings:[...]} object (so a prior run's hunt_findings.json / hunt_hypotheses.json
+// can be fed directly). Returns the loose finding records to confirm-or-refute.
+async function loadFindingsToVerify(filePath: string): Promise<Array<Record<string, unknown>>> {
+  const { readFile } = await import("node:fs/promises");
+  let raw: unknown;
+  try {
+    raw = JSON.parse(await readFile(filePath, "utf8"));
+  } catch (error) {
+    throw new Error(`--verify: cannot read or parse ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const list = Array.isArray(raw)
+    ? raw
+    : raw && typeof raw === "object" && Array.isArray((raw as Record<string, unknown>).findings)
+      ? ((raw as Record<string, unknown>).findings as unknown[])
+      : raw && typeof raw === "object"
+        ? [raw]
+        : [];
+  const findings = list.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item));
+  if (findings.length === 0) throw new Error(`--verify: no finding objects found in ${filePath}`);
+  return findings;
+}
+
+// Format one suspected finding into the claim text the verify session must
+// confirm-or-refute. The auditor's prior reasoning is included as a lead to CHECK,
+// explicitly not as ground truth.
+function buildVerifySeed(finding: Record<string, unknown>): string {
+  const str = (key: string): string => {
+    const value = finding[key];
+    return typeof value === "string" ? value : value === undefined || value === null ? "" : JSON.stringify(value);
+  };
+  const lines = [
+    `Title: ${str("title")}`,
+    `Claimed severity: ${str("severity")}`,
+    `Location: ${str("location")}`,
+    `Claim / root cause: ${str("description") || str("claim") || str("why")}`,
+  ];
+  const evidence = str("evidence");
+  if (evidence) lines.push(`Suspecting auditor's reasoning (a lead to CHECK, not ground truth): ${evidence.slice(0, 1200)}`);
+  const sketch = str("exploit_sketch") || str("exploitSketch");
+  if (sketch) lines.push(`Claimed exploit sketch: ${sketch.slice(0, 800)}`);
+  const fix = str("fix");
+  if (fix) lines.push(`Proposed fix: ${fix.slice(0, 400)}`);
+  const fixPatch = finding["fix_patch"] ?? finding["fixPatch"];
+  if (fixPatch) lines.push(`Proposed fix_patch: ${JSON.stringify(fixPatch).slice(0, 800)}`);
+  return lines.join("\n");
 }
 
 function toRankedFinding(finding: AgentFinding): RankedFinding {

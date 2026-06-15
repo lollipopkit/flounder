@@ -78,6 +78,8 @@ async function parseConfig(args: string[]): Promise<{ cfg: AuditorConfig }> {
       cfg.huntDeep = true; // picking a scope is a deep (map → dig) operation
     }
   }
+  const verifyPath = readFlag(args, "--verify");
+  if (verifyPath !== undefined) cfg.huntVerify = verifyPath;
   const deepFocus = readFlag(args, "--deep-focus");
   if (deepFocus !== undefined) {
     cfg.huntDeep = true;
@@ -242,6 +244,7 @@ Options:
   --dig-concurrency <n>   hunt: how many scopes to deep-audit in parallel (isolated workspaces), default 1
   --remap                 hunt: re-enumerate scopes from scratch (default resumes the persisted inventory)
   --scope <id[,id...]>    hunt: deep-audit specific scope id(s) from the inventory (implies --deep; run --deep once first to enumerate)
+  --verify <file>         hunt: confirm-or-refute existing suspected finding(s) by execution. <file> is JSON (one finding or an array; each: title, location, description, exploit_sketch?, fix_patch?). Skips map/dig; writes a PoC, builds, runs it through the confirmation gate + differential, and marks each confirmed-differential / confirmed-executable / REFUTED. Needs a buildable target (do not pass --no-prepare).
   --mock-llm              run with the deterministic mock model
 `);
 }

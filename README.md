@@ -80,35 +80,63 @@ For live model runs, configure provider credentials in your shell or secret mana
 
 ## Running Hunts
 
-Basic live hunt:
+One command; the model decides what to read, test, and report. The flags below shape *what* it audits and *how thoroughly* — never *what the bug is*.
+
+### Materials
+
+- `--source <paths...>` — the code under audit. Point it at the buildable project root (the directory holding the manifest/lockfile) so the agent can execution-confirm.
+- `--build-root <dir>` — when `--source` is narrow inside a larger workspace, the build root the sandbox copies so the project compiles (the model still reads only `--source`). A buildable workspace is what separates `confirmed` from `suspected`.
+- `--corpus <paths...>` — design **intent** the model reads to derive what the code MUST enforce: the project's real specs, whitepapers, design notes, prior audits, or a strictly factual incident brief. Corpus is context, never answers — it must not name the bug, its location, or its mechanism, and you should not author it yourself. Give the spec and let the model find the gap.
+
+### Modes
+
+All modes share the tools, the confirmation gate, and the local-only boundary.
+
+| Mode | When to use |
+|---|---|
+| breadth (default) | a quick survey of a small target |
+| `--deep` (map → dig) | **the default for a real audit** — MAP enumerates and scores a complete scope inventory; DIG deep-audits the highest-scored scopes obligation-by-obligation and execution-confirms. Resumable, never silently drops a scope. |
+| `--deep-focus <region>` | skip enumeration; deep-audit one region you already care about |
+| `--scope <id,...>` | after a `--deep` map, dig specific inventory items (the human-in-the-loop pick over the complete map) |
+| `--verify <findings.json>` | confirm-or-refute existing suspected findings by execution — the standalone confirmation step on a prior run's `hunt_findings.json` |
+
+### Most effective setup
+
+For a real audit, run `--deep` on a buildable target:
 
 ```bash
-fsa hunt \
-  --target protocol-audit \
-  --source ./src ./contracts \
-  --corpus ./docs ./specs \
-  --provider openai \
-  --model gpt-5.5 \
-  --thinking xhigh \
-  --max-steps 40
+fsa hunt --deep \
+  --target protocol \
+  --source ./contracts --build-root . \
+  --corpus ./docs/specs \
+  --provider openai-codex \
+  --map-steps 60 --dig-steps 60 --dig-samples 2
 ```
 
-Offline smoke test with the deterministic mock model:
+- Set `--build-root` so the dig can execution-confirm — without it you only get `suspected` findings.
+- Give generous budgets and **do not interrupt a dig**; a decisive obligation can surface late in its step budget.
+- `--dig-samples K` unions K independent passes (variance reduction); `--dig-concurrency N` digs N scopes in parallel; `--remap` re-enumerates. Reliability comes from coverage and repetition, not prompt tuning.
+- The codex provider (`openai-codex`) is the recommended autonomous path; it needs a one-time interactive `pi` `/login`.
+
+### Confirmation ladder
+
+`suspected` → `confirmed-executable` (a cited `purpose=confirm` test actually passed) → `confirmed-differential` (the model's fix, applied to pristine source, blocks the exploit). An independent refutation skeptic then re-judges every confirmation: a **vacuous** one — a PoC that only triggers by giving a trusted/pinned component behavior a real attacker cannot cause — is downgraded and flagged, never silently dropped. A downgraded finding gets one **appeal**: it rebuilds a faithful PoC answering the exact objection, and if that survives re-judgement the finding is recovered; the original confirmation, the refutation, and the appeal outcome are all kept (`--no-appeal` to skip). Build the PoC the way the attacker would — assume only capabilities a real attacker has, exercise the real components, and never grant yourself something the deployed system would deny.
+
+### Examples
+
+**Zcash — Rust ZK circuits (stack-agnostic, execution-confirmed).** Audit a circuit crate for a soundness gap: `--source` the crate, `--build-root` the cargo workspace, `--corpus` the circuit's design spec. `--deep` makes MAP enumerate the circuit's constraints — including operands the spec treats as given, a classic under-constrained-witness bug — and DIG write a `MockProver` malicious-witness test. A real crate-internal soundness bug reached `confirmed-differential` this way (the model wrote the exploit, the framework built and ran it, then applied the model's fix and re-ran to show it blocked). A subtle one needs `--scope` + `--dig-samples` and an uninterrupted dig.
+
+**Aztec — Solidity rollup (incident analysis and cold audit).** Two scenarios on the deployed `RollupProcessorV3`:
+
+- *Incident analysis* — give the agent the real deployed contracts (`--source`/`--build-root` on the Foundry project), the official Aztec specs, and a strictly factual on-chain incident brief (`--corpus`); nothing you authored, no hand-picked scope. Let it localize, then `--verify` (or the dig) confirms by execution.
+- *Cold audit* — the same materials **minus** the incident brief. From scratch, `--deep` independently flagged the decode/settlement region and reached `confirmed-differential` on an unbound-input bug (`numRealTransactions` not bound to the verifier's public-input hash), with a faithful proof-of-malleability PoC — with no knowledge that an incident had ever occurred.
+
+### Local checks
 
 ```bash
-npm run mock-hunt
-```
-
-Public-surface scan:
-
-```bash
-npm run check:public
-```
-
-Full local verification gate:
-
-```bash
-npm run verify
+npm run mock-hunt     # offline smoke test with the deterministic mock model
+npm run check:public  # public-surface scan for secrets and local paths
+npm run verify        # full local verification gate
 ```
 
 ## Reproduction

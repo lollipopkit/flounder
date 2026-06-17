@@ -250,9 +250,10 @@ export async function runAudit(
       await logger.event("audit_scope_picked", { ids: toDig.map((scope) => scope.id) });
     } else {
       // Audit the highest-scored scopes not yet audited; the rest stay pending for
-      // a future run (visible, never silently dropped).
+      // a future run (visible, never silently dropped). A "deferred" scope is one the
+      // operator chose to skip, so auto-selection excludes it (an explicit --scope still digs it).
       toDig = scopeInventory
-        .filter((scope) => scope.status !== "audited")
+        .filter((scope) => scope.status !== "audited" && scope.status !== "deferred")
         .sort((a, b) => b.score - a.score)
         .slice(0, Math.max(1, cfg.auditMaxScopes));
     }

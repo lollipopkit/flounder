@@ -89,6 +89,13 @@
   .progress > span { display: block; height: 100%; }
   .progress > .audited { background: var(--success-emphasis); }
   .progress > .pending { background: var(--neutral-emphasis); opacity: .4; }
+  .progress > .deferred { background: var(--attention-fg); opacity: .55; }
+  .rowbtn { cursor: pointer; background: transparent; border: 1px solid var(--border); color: var(--fg-muted); border-radius: 6px; padding: 2px 9px; font: 500 11px/1.5 var(--sans); }
+  .rowbtn:hover { border-color: var(--fg-subtle); color: var(--fg); }
+  .rowbtn.danger:hover { border-color: var(--danger-fg); color: var(--danger-fg); }
+  .s-pending { color: var(--fg-muted); border-color: var(--border); }
+  .s-audited { color: var(--success-fg); border-color: rgba(63,185,80,.4); background: rgba(63,185,80,.1); }
+  .s-deferred { color: var(--attention-fg); border-color: rgba(210,153,34,.4); background: rgba(210,153,34,.1); }
 
   .confirmed-box { border: 1px solid rgba(63,185,80,.4); background: rgba(63,185,80,.08); border-radius: 6px; padding: 2px 14px; }
   .cbug { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border-muted); }
@@ -298,9 +305,9 @@ function renderList() {
     const st = p.activeRuns > 0 ? "running" : (p.latestRun ? p.latestRun.status : "");
     return '<div class="box-row ' + (state.selected === p.name ? "sel" : "") + '" data-name="' + esc(p.name) + '">'
       + '<div class="top"><span class="name">' + esc(p.name) + '</span><span style="flex:1"></span>' + stateBadge(st) + '</div>'
-      + '<div class="muted" style="margin-top:6px">scopes ' + pr.audited + '/' + pr.total + ' audited · ' + pr.pending + ' pending · ' + p.runCount + ' run' + (p.runCount === 1 ? "" : "s")
+      + '<div class="muted" style="margin-top:6px">scopes ' + pr.audited + '/' + pr.total + ' audited · ' + pr.pending + ' pending' + (pr.deferred ? ' · ' + pr.deferred + ' skipped' : '') + ' · ' + p.runCount + ' run' + (p.runCount === 1 ? "" : "s")
         + (p.confirmedBugs ? ' · <span class="confirmed-tag">✓ ' + p.confirmedBugs + ' confirmed</span>' : '') + '</div>'
-      + '<div class="progress"><span class="audited" style="width:' + pct(pr.audited, pr.total) + '%"></span><span class="pending" style="width:' + pct(pr.pending, pr.total) + '%"></span></div>'
+      + '<div class="progress"><span class="audited" style="width:' + pct(pr.audited, pr.total) + '%"></span><span class="pending" style="width:' + pct(pr.pending, pr.total) + '%"></span><span class="deferred" style="width:' + pct(pr.deferred || 0, pr.total) + '%"></span></div>'
       + (labels ? '<div class="labels">' + labels + '</div>' : '<div class="muted" style="margin-top:10px">' + p.findingsTotal + ' findings</div>')
       + '</div>';
   }).join("");
@@ -326,6 +333,10 @@ async function loadDetail() {
   if (!state.selected) return;
   const res = await fetch("/api/projects/" + encodeURIComponent(state.selected));
   state.detail = res.ok ? await res.json() : null;
+  if (state.detail) {
+    const sr = await fetch("/api/projects/" + encodeURIComponent(state.selected) + "/scopes");
+    state.detail.scopes = sr.ok ? (await sr.json()).scopes : [];
+  }
   renderDetail();
 }
 
@@ -347,7 +358,7 @@ function renderDetail() {
   const el = $("#detail");
   const d = state.detail;
   if (!d) { el.innerHTML = '<div class="empty">Select a project, or create one with “New project”.</div>'; return; }
-  const cfg = (() => { try { return JSON.parse(d.project.config_json); } catch { return {}; } })();
+  const cfg = (() => { try { return JSON.parse(d.project.config_json) || {}; } catch { return {}; } })();
   const pr = d.progress;
   const running = state.active.filter((a) => a.target === d.project.name);
   const runningRuns = d.runs.filter((r) => r.status === "running"); // stoppable, carry run ids
@@ -362,7 +373,19 @@ function renderDetail() {
     return r.findings_total != null ? r.findings_total + " findings" : "—";
   };
   const runsRows = d.runs.map((r) => '<tr><td><span style="display:inline-flex;gap:7px;align-items:center">' + stateBadge(r.status) + ' ' + r.kind + '</span></td><td class="mono muted">' + runProgress(r)
-    + '</td><td class="mono muted">' + esc((r.run_dir || "").split("/").pop()) + '</td><td class="mono muted">' + esc(r.started_at) + '</td></tr>').join("");
+    + '</td><td class="mono muted">' + esc((r.run_dir || "").split("/").pop()) + '</td><td class="mono muted">' + esc(r.started_at)
+    + '</td><td>' + (r.status === "running" ? "" : '<button class="rowbtn danger" data-delrun="' + r.id + '">delete</button>') + '</td></tr>').join("");
+  const scopeRows = (d.scopes || []).map((sc) => {
+    const act = sc.status === "audited" ? ""
+      : sc.status === "deferred" ? '<button class="rowbtn" data-scope="' + esc(sc.scope_id) + '" data-sstatus="pending">Resume</button>'
+      : '<button class="rowbtn" data-scope="' + esc(sc.scope_id) + '" data-sstatus="deferred">Skip</button>';
+    return '<tr><td><span class="label s-' + sc.status + '">' + sc.status + '</span></td><td class="mono">' + esc(sc.scope_id) + '</td><td>' + esc(sc.title)
+      + '</td><td class="mono muted">' + esc(sc.location) + '</td><td class="mono muted">' + (sc.score != null ? Number(sc.score).toFixed(1) : "") + '</td><td>' + act + '</td></tr>';
+  }).join("");
+  const scopesSection = (d.scopes && d.scopes.length)
+    ? '<div class="section-title">' + icon("bug") + 'Scopes <span class="muted">(Skip to exclude from auto-dig)</span></div>'
+      + '<div style="max-height:340px;overflow-y:auto"><table><thead><tr><th>status</th><th>id</th><th>obligation</th><th>location</th><th>score</th><th></th></tr></thead><tbody>' + scopeRows + '</tbody></table></div>'
+    : "";
   // Confirmed bugs = decisions that actually reproduced on the real target (the payoff).
   const confirmed = d.confirmDecisions.filter((c) => c.reproduced === "yes");
   const recBadge = (rec) => { const m = { "submit-candidate": "done", "needs-human": "running", "drop": "killed" }; return '<span class="state ' + (m[rec] || "none") + '">' + esc(rec || "—") + '</span>'; };
@@ -376,11 +399,12 @@ function renderDetail() {
     '<div class="d-head"><h2>' + esc(d.project.name) + '</h2>' + stateBadge(st) + '</div>'
     + '<div class="muted mono" style="margin-top:6px">' + esc(cfg.provider || "") + (cfg.model ? " · " + esc(cfg.model) : "") + (cfg.thinking ? " · " + esc(cfg.thinking) : "")
       + " · max-scopes " + (cfg.maxScopes ?? "-") + " · map/dig steps " + (cfg.mapSteps ?? "∞") + "/" + (cfg.digSteps ?? "∞") + '</div>'
-    + '<div class="progress" style="margin-top:16px;height:10px"><span class="audited" style="width:' + pct(pr.audited, pr.total) + '%"></span><span class="pending" style="width:' + pct(pr.pending, pr.total) + '%"></span></div>'
+    + '<div class="progress" style="margin-top:16px;height:10px"><span class="audited" style="width:' + pct(pr.audited, pr.total) + '%"></span><span class="pending" style="width:' + pct(pr.pending, pr.total) + '%"></span><span class="deferred" style="width:' + pct(pr.deferred || 0, pr.total) + '%"></span></div>'
     + '<div class="stats">'
       + '<div class="stat"><div class="n">' + pr.total + '</div><div class="k">scopes mapped</div></div>'
       + '<div class="stat"><div class="n" style="color:var(--success-fg)">' + pr.audited + '</div><div class="k">audited</div></div>'
       + '<div class="stat"><div class="n">' + pr.pending + '</div><div class="k">pending</div></div>'
+      + (pr.deferred ? '<div class="stat"><div class="n" style="color:var(--attention-fg)">' + pr.deferred + '</div><div class="k">skipped</div></div>' : '')
       + '<div class="stat"><div class="n">' + d.findingsTotal + '</div><div class="k">findings</div></div>'
       + '<div class="stat"><div class="n" style="color:var(--success-fg)">' + confirmed.length + '</div><div class="k">confirmed bugs</div></div>'
       + '<div class="stat"><div class="n">' + d.runsTotal + '</div><div class="k">runs</div></div>'
@@ -396,7 +420,8 @@ function renderDetail() {
     + confirmedSection
     + (d.runs.length ? '<div class="section-title">' + icon("play") + 'Live activity <span class="muted">(' + (d.runs[0] ? d.runs[0].kind + " run #" + d.runs[0].id : "") + ' — model thinking, output &amp; tool calls)</span></div><div id="activitySlot"></div>' : "")
     + '<div class="section-title">' + icon("play") + 'Runs <span class="muted">(' + d.runsTotal + (d.runsTotal > d.runs.length ? ", showing " + d.runs.length : "") + ')</span></div>'
-    + (d.runs.length ? '<table><thead><tr><th>kind</th><th>progress</th><th>dir</th><th>started</th></tr></thead><tbody>' + runsRows + '</tbody></table>' : '<div class="muted">none</div>')
+    + (d.runs.length ? '<table><thead><tr><th>kind</th><th>progress</th><th>dir</th><th>started</th><th></th></tr></thead><tbody>' + runsRows + '</tbody></table>' : '<div class="muted">none</div>')
+    + scopesSection
     + '<div class="section-title">' + icon("bug") + 'Findings</div>'
     + '<div class="chips" id="chips"></div><div id="findings"></div>'
     + (d.confirmDecisions.length ? '<div class="section-title">Confirm decisions</div><table><thead><tr><th>bug</th><th>reproduced</th><th>recommendation</th></tr></thead><tbody>'
@@ -413,6 +438,15 @@ function renderDetail() {
     $("#detail").innerHTML = '<div class="empty">Select a project, or create one with “New project”.</div>';
   };
   el.querySelectorAll("[data-runid]").forEach((b) => b.onclick = () => fetch("/api/runs/" + b.dataset.runid + "/stop", { method: "POST" }));
+  el.querySelectorAll("[data-delrun]").forEach((b) => b.onclick = async () => {
+    if (!confirm("Delete this run and its findings & decisions? (the project's scopes and on-disk artifacts are kept)")) return;
+    await fetch("/api/runs/" + b.dataset.delrun, { method: "DELETE" });
+    loadDetail();
+  });
+  el.querySelectorAll("[data-scope]").forEach((b) => b.onclick = async () => {
+    await fetch("/api/projects/" + encodeURIComponent(state.selected) + "/scopes/" + encodeURIComponent(b.dataset.scope), { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ status: b.dataset.sstatus }) });
+    loadDetail();
+  });
   renderChips();
   renderFindings();
   attachActivity(d);
@@ -443,7 +477,7 @@ function renderFindings() {
 }
 
 function projectFields(d) {
-  const cfg = (() => { try { return JSON.parse(d.project.config_json); } catch { return {}; } })();
+  const cfg = (() => { try { return JSON.parse(d.project.config_json) || {}; } catch { return {}; } })();
   const arr = (v) => { try { return JSON.parse(v) || []; } catch { return []; } };
   return { cfg, sourcePaths: arr(d.project.source_paths), buildRoot: d.project.build_root || "", corpusPaths: arr(d.project.corpus_paths) };
 }

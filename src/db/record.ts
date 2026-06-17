@@ -150,7 +150,7 @@ function toScopeRow(scope: AuditScope): ScopeRow {
     title: scope.obligation,
     location: scope.region,
     score: scope.score,
-    status: scope.status === "audited" ? "audited" : "pending",
+    status: scope.status === "audited" ? "audited" : scope.status === "deferred" ? "deferred" : "pending",
   };
 }
 

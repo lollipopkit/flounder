@@ -45,11 +45,11 @@ test("store: scope coverage tracks mapped vs audited", async () => {
     { scopeId: "s2", title: "settle", status: "pending" },
     { scopeId: "s3", title: "withdraw", status: "pending" },
   ]);
-  assert.deepEqual(db.scopeProgress(projectId), { total: 3, audited: 1, pending: 2 });
+  assert.deepEqual(db.scopeProgress(projectId), { total: 3, audited: 1, pending: 2, deferred: 0 });
 
   // re-mapping the same scope id updates it in place (one row per project+scope)
   db.upsertScopes(projectId, [{ scopeId: "s2", title: "settle", status: "audited" }]);
-  assert.deepEqual(db.scopeProgress(projectId), { total: 3, audited: 2, pending: 1 });
+  assert.deepEqual(db.scopeProgress(projectId), { total: 3, audited: 2, pending: 1, deferred: 0 });
   db.close();
 });
 
@@ -116,6 +116,31 @@ test("store: startup reconciles orphaned running runs (in-process runs don't sur
   assert.equal(db.reconcileOrphanedRuns(), 1); // only the still-running one
   assert.equal(db.listRuns(projectId).filter((r) => r.status === "running").length, 0);
   assert.equal(db.reconcileOrphanedRuns(), 0); // idempotent
+  db.close();
+});
+
+test("store: deleteRun removes run-scoped data but keeps the project's scopes", async () => {
+  const db = await tempDb();
+  const projectId = db.upsertProject({ name: "p" });
+  db.upsertScopes(projectId, [{ scopeId: "s1", status: "audited" }, { scopeId: "s2", status: "pending" }]);
+  const runId = db.startRun({ projectId, kind: "run", runDir: "/runs/p-1" });
+  db.upsertFindings(projectId, runId, [{ findingKey: "f1", title: "x", status: "suspected" }]);
+  db.finishRun(runId, "done");
+
+  assert.equal(db.deleteRun(runId), true);
+  assert.equal(db.listRuns(projectId).length, 0);
+  assert.equal(db.countFindings(projectId), 0); // run-scoped findings gone
+  assert.equal(db.scopeProgress(projectId).total, 2); // project scopes kept
+  assert.equal(db.deleteRun(runId), false); // already gone
+  db.close();
+});
+
+test("store: setScopeStatus marks a scope deferred (skipped) and counts it", async () => {
+  const db = await tempDb();
+  const projectId = db.upsertProject({ name: "p" });
+  db.upsertScopes(projectId, [{ scopeId: "s1", status: "pending" }, { scopeId: "s2", status: "pending" }]);
+  assert.equal(db.setScopeStatus(projectId, "s1", "deferred"), 1);
+  assert.deepEqual(db.scopeProgress(projectId), { total: 2, audited: 0, pending: 1, deferred: 1 });
   db.close();
 });
 

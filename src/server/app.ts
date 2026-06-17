@@ -9,8 +9,10 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { readFileSync, createReadStream, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { MetadataStore, type RunKind } from "../db/store.js";
+import { MetadataStore, type RunKind, type ScopeStatus } from "../db/store.js";
 import { RunManager, type LaunchSpec, type ActivityBus } from "./run-manager.js";
+import { projectHistoryDir } from "../trace/history.js";
+import { loadScopeInventory, saveScopeInventory } from "../agent/scope-store.js";
 
 const UI_HTML_PATH = fileURLToPath(new URL("./public/index.html", import.meta.url));
 function loadUiHtml(): string {
@@ -122,9 +124,16 @@ const ROUTES: Route[] = [
   }),
   route({
     method: "GET", path: "/api/projects/:name/scopes",
-    summary: "List the project's scope inventory (audited/pending) — the map output.",
+    summary: "List the project's scope inventory (audited / pending / deferred) — the map output.",
     params: { name: "project name" },
     handler: (c) => withProject(c, (id) => sendJson(c.res, 200, { scopes: c.store.listScopes(id), progress: c.store.scopeProgress(id) })),
+  }),
+  route({
+    method: "PATCH", path: "/api/projects/:name/scopes/:scopeId",
+    summary: "Set a scope's status — mark it `deferred` to skip it in auto-dig (or `pending` to resume). Updates the persisted inventory the audit reads, so the next run honors it.",
+    params: { name: "project name", scopeId: "scope id from the inventory" },
+    body: { status: "'deferred' (skip) | 'pending' (resume) | 'audited'" },
+    handler: scopeSetStatus,
   }),
   route({
     method: "GET", path: "/api/projects/:name/findings",
@@ -153,9 +162,15 @@ const ROUTES: Route[] = [
   }),
   route({
     method: "POST", path: "/api/runs/:id/stop",
-    summary: "Stop a running run (SIGTERM the process). The run is reconciled to 'killed'.",
+    summary: "Stop a running run (aborts the in-process session). The run is reconciled to 'killed'.",
     params: { id: "run id" },
     handler: runStop,
+  }),
+  route({
+    method: "DELETE", path: "/api/runs/:id",
+    summary: "Delete a run and its run-scoped data (findings + status events, confirm decisions). Scopes (the project inventory) and on-disk artifacts are left intact.",
+    params: { id: "run id" },
+    handler: (c) => { const ok = c.store.deleteRun(Number(c.params.id)); ok ? sendJson(c.res, 200, { ok: true, deleted: Number(c.params.id) }) : sendJson(c.res, 404, { error: "no such run" }); },
   }),
   route({
     method: "GET", path: "/api/runs/:id/log",
@@ -262,6 +277,27 @@ async function projectUpdate(c: Ctx): Promise<void> {
 function projectDelete(c: Ctx): void {
   const removed = c.store.deleteProject(c.params.name ?? "");
   removed ? sendJson(c.res, 200, { ok: true, deleted: c.params.name }) : sendJson(c.res, 404, { error: `no project named ${c.params.name}` });
+}
+
+async function scopeSetStatus(c: Ctx): Promise<void> {
+  const project = c.store.getProject(c.params.name ?? "");
+  if (!project) return sendJson(c.res, 404, { error: `no project named ${c.params.name}` });
+  const body = (await readBody(c.req)) as { status?: string };
+  const status = body.status;
+  if (status !== "pending" && status !== "audited" && status !== "deferred") {
+    return sendJson(c.res, 400, { error: "status must be one of pending | audited | deferred" });
+  }
+  const scopeId = c.params.scopeId ?? "";
+  // Update the persisted inventory the AUDIT reads (history-dir scopes.json), so the next
+  // dig honors the skip — then mirror it into the UI's SQLite projection.
+  const inventoryDir = projectHistoryDir({ outputDir: c.out, targetName: String(project.name) });
+  const inventory = await loadScopeInventory(inventoryDir);
+  const scope = inventory.find((s) => s.id === scopeId);
+  if (!scope) return sendJson(c.res, 404, { error: `no scope "${scopeId}" in the inventory` });
+  scope.status = status;
+  await saveScopeInventory(inventoryDir, inventory);
+  c.store.setScopeStatus(Number(project.id), scopeId, status);
+  sendJson(c.res, 200, { ok: true, scopeId, status });
 }
 
 async function runLaunch(c: Ctx): Promise<void> {

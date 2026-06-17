@@ -21,7 +21,7 @@ const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as typeof
 
 export type RunKind = "run" | "map" | "audit" | "verify" | "confirm";
 export type RunStatus = "running" | "done" | "error" | "killed";
-export type ScopeStatus = "pending" | "audited";
+export type ScopeStatus = "pending" | "audited" | "deferred";
 export type FindingStatus = "suspected" | "confirmed-executable" | "confirmed-differential" | "refuted";
 
 export interface ProjectInput {
@@ -73,6 +73,7 @@ export interface Coverage {
   total: number;
   audited: number;
   pending: number;
+  deferred: number;
 }
 
 export interface FindingFilter {
@@ -347,6 +348,20 @@ export class MetadataStore {
     return this.db.prepare("SELECT * FROM run WHERE id = ?").get(id) as Record<string, unknown> | undefined;
   }
 
+  /** Delete a run and its run-scoped children (findings + their status events, confirm
+   * decisions). Scopes are project-level (the persisted inventory) and are left intact.
+   * On-disk run artifacts are untouched. Returns true if a run was removed. */
+  deleteRun(id: number): boolean {
+    if (!this.getRun(id)) return false;
+    this.transaction(() => {
+      this.db.prepare("DELETE FROM finding_status_event WHERE finding_id IN (SELECT id FROM finding WHERE run_id = ?)").run(id);
+      this.db.prepare("DELETE FROM finding WHERE run_id = ?").run(id);
+      this.db.prepare("DELETE FROM confirm_decision WHERE run_id = ?").run(id);
+      this.db.prepare("DELETE FROM run WHERE id = ?").run(id);
+    });
+    return true;
+  }
+
   // --- scopes ---------------------------------------------------------------
 
   /** Upsert the project's scope inventory (id, title, location, score, status). */
@@ -373,12 +388,24 @@ export class MetadataStore {
   scopeProgress(projectId: number): Coverage {
     const row = this.db
       .prepare(
-        `SELECT COUNT(*) AS total, SUM(CASE WHEN status = 'audited' THEN 1 ELSE 0 END) AS audited FROM scope WHERE project_id = ?`,
+        `SELECT COUNT(*) AS total,
+                SUM(CASE WHEN status = 'audited' THEN 1 ELSE 0 END) AS audited,
+                SUM(CASE WHEN status = 'deferred' THEN 1 ELSE 0 END) AS deferred
+         FROM scope WHERE project_id = ?`,
       )
-      .get(projectId) as { total: number; audited: number | null };
+      .get(projectId) as { total: number; audited: number | null; deferred: number | null };
     const total = row.total ?? 0;
     const audited = row.audited ?? 0;
-    return { total, audited, pending: total - audited };
+    const deferred = row.deferred ?? 0;
+    return { total, audited, deferred, pending: total - audited - deferred };
+  }
+
+  /** Set a scope's status (e.g. mark "deferred" to skip it in auto-dig). Returns rows changed. */
+  setScopeStatus(projectId: number, scopeId: string, status: ScopeStatus): number {
+    const info = this.db
+      .prepare("UPDATE scope SET status = ?, updated_at = ? WHERE project_id = ? AND scope_id = ?")
+      .run(status, now(), projectId, scopeId);
+    return Number(info.changes);
   }
 
   // --- findings + status transitions ---------------------------------------

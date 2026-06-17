@@ -50,7 +50,7 @@ test("api: project CRUD round-trip over HTTP", async () => {
     const detail = await json(await fetch(base + "/api/projects/p"));
     assert.equal(detail.project.name, "p");
     assert.equal(detail.findingsTotal, 0);
-    assert.deepEqual(detail.progress, { total: 0, audited: 0, pending: 0 });
+    assert.deepEqual(detail.progress, { total: 0, audited: 0, pending: 0, deferred: 0 });
 
     await fetch(base + "/api/projects/p", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ config: { model: "opus" } }) });
     assert.equal(JSON.parse((await json(await fetch(base + "/api/projects/p"))).project.config_json).model, "opus");

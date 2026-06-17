@@ -188,6 +188,7 @@ function projectSnapshots(store: MetadataStore, manager: RunManager): Array<Reco
       progress: store.scopeProgress(id),
       findingCounts: store.findingStatusCounts(id),
       findingsTotal: store.countFindings(id),
+      confirmedBugs: store.countConfirmedBugs(id),
       runCount: store.countRuns(id),
       latestRun: store.latestRun(id) ?? null,
       activeRuns: activeByTarget.get(String(project.name)) ?? 0,

@@ -90,6 +90,12 @@
   .progress > .audited { background: var(--success-emphasis); }
   .progress > .pending { background: var(--neutral-emphasis); opacity: .4; }
 
+  .confirmed-box { border: 1px solid rgba(63,185,80,.4); background: rgba(63,185,80,.08); border-radius: 6px; padding: 2px 14px; }
+  .cbug { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border-muted); }
+  .cbug:last-child { border-bottom: 0; }
+  .cbug-name { font-weight: 500; color: var(--success-fg); }
+  .confirmed-tag { color: var(--success-fg); font-weight: 600; }
+
   .d-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   .d-head h2 { font-size: 20px; font-weight: 600; margin: 0; }
   .stats { display: flex; gap: 22px; margin: 16px 0; flex-wrap: wrap; }
@@ -222,7 +228,8 @@ function renderList() {
     const st = p.activeRuns > 0 ? "running" : (p.latestRun ? p.latestRun.status : "");
     return '<div class="box-row ' + (state.selected === p.name ? "sel" : "") + '" data-name="' + esc(p.name) + '">'
       + '<div class="top"><span class="name">' + esc(p.name) + '</span><span style="flex:1"></span>' + stateBadge(st) + '</div>'
-      + '<div class="muted" style="margin-top:6px">scopes ' + pr.audited + '/' + pr.total + ' audited · ' + pr.pending + ' pending · ' + p.runCount + ' run' + (p.runCount === 1 ? "" : "s") + '</div>'
+      + '<div class="muted" style="margin-top:6px">scopes ' + pr.audited + '/' + pr.total + ' audited · ' + pr.pending + ' pending · ' + p.runCount + ' run' + (p.runCount === 1 ? "" : "s")
+        + (p.confirmedBugs ? ' · <span class="confirmed-tag">✓ ' + p.confirmedBugs + ' confirmed</span>' : '') + '</div>'
       + '<div class="progress"><span class="audited" style="width:' + pct(pr.audited, pr.total) + '%"></span><span class="pending" style="width:' + pct(pr.pending, pr.total) + '%"></span></div>'
       + (labels ? '<div class="labels">' + labels + '</div>' : '<div class="muted" style="margin-top:10px">' + p.findingsTotal + ' findings</div>')
       + '</div>';
@@ -274,8 +281,26 @@ function renderDetail() {
   const pr = d.progress;
   const running = state.active.filter((a) => a.target === d.project.name);
   const st = running.length ? "running" : (d.runs[0] ? d.runs[0].status : "");
-  const runsRows = d.runs.map((r) => '<tr><td><span style="display:inline-flex;gap:7px;align-items:center">' + stateBadge(r.status) + ' ' + r.kind + '</span></td><td class="mono">' + (r.scopes_audited ?? "-") + "/" + (r.scopes_total ?? "-")
-    + '</td><td class="mono">' + (r.findings_total ?? "-") + '</td><td class="mono muted">' + esc((r.run_dir || "").split("/").pop()) + '</td><td class="mono muted">' + esc(r.started_at) + '</td></tr>').join("");
+  // Per-run progress is kind-aware: map/audit show scopes audited (live), confirm shows
+  // bugs reproduced / decided (live). Derived from the confirm_decision rows for each run.
+  const confByRun = {};
+  for (const c of d.confirmDecisions) { const k = c.run_id; (confByRun[k] = confByRun[k] || { total: 0, yes: 0 }); confByRun[k].total++; if (c.reproduced === "yes") confByRun[k].yes++; }
+  const runProgress = (r) => {
+    if (r.kind === "confirm") { const cc = confByRun[r.id]; return cc ? (cc.yes + "/" + cc.total + " reproduced") : "—"; }
+    if (r.scopes_total != null) return (r.scopes_audited ?? 0) + "/" + r.scopes_total + " scopes audited";
+    return r.findings_total != null ? r.findings_total + " findings" : "—";
+  };
+  const runsRows = d.runs.map((r) => '<tr><td><span style="display:inline-flex;gap:7px;align-items:center">' + stateBadge(r.status) + ' ' + r.kind + '</span></td><td class="mono muted">' + runProgress(r)
+    + '</td><td class="mono muted">' + esc((r.run_dir || "").split("/").pop()) + '</td><td class="mono muted">' + esc(r.started_at) + '</td></tr>').join("");
+  // Confirmed bugs = decisions that actually reproduced on the real target (the payoff).
+  const confirmed = d.confirmDecisions.filter((c) => c.reproduced === "yes");
+  const recBadge = (rec) => { const m = { "submit-candidate": "done", "needs-human": "running", "drop": "killed" }; return '<span class="state ' + (m[rec] || "none") + '">' + esc(rec || "—") + '</span>'; };
+  const confirmedSection = d.confirmDecisions.length
+    ? '<div class="section-title">' + icon("bug") + 'Confirmed bugs <span class="muted">(' + confirmed.length + ' reproduced of ' + d.confirmDecisions.length + ' decided)</span></div>'
+      + (confirmed.length
+          ? '<div class="confirmed-box">' + confirmed.map((c) => '<div class="cbug"><span class="cbug-name">✓ ' + esc(c.bug) + '</span>' + recBadge(c.recommendation) + '</div>').join("") + '</div>'
+          : '<div class="muted">No bugs reproduced on the real target yet.</div>')
+    : "";
   el.innerHTML =
     '<div class="d-head"><h2>' + esc(d.project.name) + '</h2>' + stateBadge(st) + '</div>'
     + '<div class="muted mono" style="margin-top:6px">' + esc(cfg.provider || "") + (cfg.model ? " · " + esc(cfg.model) : "") + (cfg.thinking ? " · " + esc(cfg.thinking) : "")
@@ -286,6 +311,7 @@ function renderDetail() {
       + '<div class="stat"><div class="n" style="color:var(--success-fg)">' + pr.audited + '</div><div class="k">audited</div></div>'
       + '<div class="stat"><div class="n">' + pr.pending + '</div><div class="k">pending</div></div>'
       + '<div class="stat"><div class="n">' + d.findingsTotal + '</div><div class="k">findings</div></div>'
+      + '<div class="stat"><div class="n" style="color:var(--success-fg)">' + confirmed.length + '</div><div class="k">confirmed bugs</div></div>'
       + '<div class="stat"><div class="n">' + d.runsTotal + '</div><div class="k">runs</div></div>'
     + '</div>'
     + '<div class="actions">'
@@ -295,12 +321,13 @@ function renderDetail() {
       + '<button class="btn" id="editBtn">' + icon("gear") + 'Edit config</button>'
       + running.map((a) => '<button class="btn danger" data-kill="' + a.pid + '">' + icon("x") + 'Stop ' + a.verb + ' · pid ' + a.pid + '</button>').join("")
     + '</div>'
+    + confirmedSection
     + '<div class="section-title">' + icon("play") + 'Runs <span class="muted">(' + d.runsTotal + (d.runsTotal > d.runs.length ? ", showing " + d.runs.length : "") + ')</span></div>'
-    + (d.runs.length ? '<table><thead><tr><th>kind</th><th>scopes</th><th>findings</th><th>dir</th><th>started</th></tr></thead><tbody>' + runsRows + '</tbody></table>' : '<div class="muted">none</div>')
+    + (d.runs.length ? '<table><thead><tr><th>kind</th><th>progress</th><th>dir</th><th>started</th></tr></thead><tbody>' + runsRows + '</tbody></table>' : '<div class="muted">none</div>')
     + '<div class="section-title">' + icon("bug") + 'Findings</div>'
     + '<div class="chips" id="chips"></div><div id="findings"></div>'
     + (d.confirmDecisions.length ? '<div class="section-title">Confirm decisions</div><table><thead><tr><th>bug</th><th>reproduced</th><th>recommendation</th></tr></thead><tbody>'
-        + d.confirmDecisions.map((c) => '<tr><td>' + esc(c.bug) + '</td><td class="mono">' + esc(c.reproduced) + '</td><td class="mono">' + esc(c.recommendation) + '</td></tr>').join("") + '</tbody></table>' : "");
+        + d.confirmDecisions.map((c) => '<tr><td>' + esc(c.bug) + '</td><td>' + (c.reproduced === "yes" ? statusBadge("confirmed-differential").replace("confirmed-differential", "reproduced") : '<span class="mono muted">' + esc(c.reproduced) + '</span>') + '</td><td class="mono">' + esc(c.recommendation) + '</td></tr>').join("") + '</tbody></table>' : "");
   $("#continueBtn").onclick = () => command("continue");
   const rb = $("#restartBtn"); if (rb) rb.onclick = () => command("restart");
   $("#runBtn").onclick = openRun;

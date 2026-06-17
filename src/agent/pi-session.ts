@@ -48,6 +48,9 @@ export async function runAuditSession(input: {
   verify?: string;
   /** Confirm mode: the open-world reproduce/consolidate/decide pass over a prior run's findings. */
   confirm?: string;
+  /** Called each turn in confirm mode with the decision rows written so far (raw), so a
+   * tracker can project live reproduction progress. Best-effort; must not throw. */
+  onConfirmCheckpoint?: (rows: unknown[]) => void;
 }): Promise<SessionDriverResult> {
   const model = getModelSafe(input.cfg.provider, input.cfg.auditModel);
   if (!model) throw new Error(`audit session: unknown provider/model ${input.cfg.provider}/${input.cfg.auditModel}`);
@@ -103,7 +106,14 @@ export async function runAuditSession(input: {
     if (raw === undefined) return;
     try {
       const parsed: unknown = JSON.parse(raw);
-      if (Array.isArray(parsed)) await input.logger.artifact("confirm_decision.json", parsed);
+      if (Array.isArray(parsed)) {
+        await input.logger.artifact("confirm_decision.json", parsed);
+        try {
+          input.onConfirmCheckpoint?.(parsed);
+        } catch {
+          // live projection is best-effort
+        }
+      }
     } catch {
       // partial / mid-write JSON — skip this checkpoint
     }

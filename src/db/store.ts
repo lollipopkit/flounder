@@ -438,6 +438,11 @@ export class MetadataStore {
     return this.db.prepare("SELECT * FROM confirm_decision WHERE project_id = ? ORDER BY created_at DESC").all(projectId) as Array<Record<string, unknown>>;
   }
 
+  /** Count bugs that actually reproduced on the real target (confirm's real output). */
+  countConfirmedBugs(projectId: number): number {
+    return Number((this.db.prepare("SELECT COUNT(*) AS n FROM confirm_decision WHERE project_id = ? AND reproduced = 'yes'").get(projectId) as { n: number }).n);
+  }
+
   // --- internals ------------------------------------------------------------
 
   private transaction(fn: () => void): void {

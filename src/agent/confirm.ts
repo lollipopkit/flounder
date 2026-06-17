@@ -120,6 +120,9 @@ export async function runConfirm(
     cwd: workspace.absolute,
     fileManifest: renderFileManifest(source, corpusManifest),
     confirm: seed,
+    // Project the decision rows to SQLite each turn so a UI shows live reproduction
+    // progress (reproduced X / N) during the run, not only at the end.
+    onConfirmCheckpoint: (raw) => recorder.confirmDecisions(toLiveConfirmRows(raw)),
   });
 
   // 5. Read the model's decision rows, then CONSOLIDATE by execution: run the
@@ -284,6 +287,23 @@ function renderFileManifest(source: Doc[], corpusEntries: string[]): string {
     out += `\n\nFrozen prior-run report + per-finding disclosures under corpus/:\n${corpusEntries.map((entry) => `- ${entry}`).join("\n")}`;
   }
   return out;
+}
+
+// Map the model's raw, mid-run decision rows to the minimal shape the tracker stores, for
+// LIVE reproduction progress. The end-of-run write replaces these with the consolidated set.
+function toLiveConfirmRows(raw: unknown[]): Array<{ bug: string; reproduced?: string; recommendation?: string; members?: string[] }> {
+  const rows: Array<{ bug: string; reproduced?: string; recommendation?: string; members?: string[] }> = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const obj = entry as Record<string, unknown>;
+    if (typeof obj.bug !== "string" || !obj.bug.trim()) continue;
+    const row: { bug: string; reproduced?: string; recommendation?: string; members?: string[] } = { bug: obj.bug };
+    if (typeof obj.reproduced === "string") row.reproduced = obj.reproduced;
+    if (typeof obj.recommendation === "string") row.recommendation = obj.recommendation;
+    if (Array.isArray(obj.members)) row.members = obj.members.filter((m): m is string => typeof m === "string");
+    rows.push(row);
+  }
+  return rows;
 }
 
 // --- decision sheet ----------------------------------------------------------

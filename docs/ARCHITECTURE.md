@@ -16,9 +16,11 @@ The main layers are:
 
 ## Audit Flow
 
+The diagram below is the **inner per-session loop** — one agent session. The default `fsa run` wraps it in a **map → dig** orchestration (and `fsa confirm` runs it open-world); that orchestration, plus the resumable scope inventory, is described under [Audit Modes](#audit-modes).
+
 ```mermaid
 flowchart TD
-  CLI["CLI: fsa run"] --> AUDIT["runAudit"]
+  CLI["CLI: fsa run / map / audit"] --> AUDIT["runAudit"]
   PI["pi tool: fsa_run"] --> AUDIT
   AUDIT --> INGEST["load source and corpus"]
   INGEST --> SESSION["logger, session, project memory"]

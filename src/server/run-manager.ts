@@ -15,25 +15,25 @@ export interface LaunchSpec {
   verb: RunKind; // run | map | audit | confirm (verify is an audit selector)
   target: string;
   sourcePaths: string[];
-  buildRoot?: string;
-  corpusPaths?: string[];
-  provider?: string;
-  model?: string;
-  thinking?: string;
-  maxScopes?: number;
-  mapSteps?: number;
-  digSteps?: number;
-  maxSteps?: number;
-  digSamples?: number;
-  digConcurrency?: number;
-  remap?: boolean; // run/map/audit: re-enumerate the scope inventory (restart)
-  fresh?: boolean; // confirm: ignore a prior interrupted confirm
-  inputRunDir?: string; // confirm: the finished run dir to reproduce (positional)
-  region?: string; // audit: a pinned region (positional)
-  scope?: string; // audit: --scope id[,id...]
-  quick?: boolean; // run: a single breadth pass instead of map -> audit
-  mockLlm?: boolean; // run with the deterministic offline model (no provider needed)
-  out?: string;
+  buildRoot?: string | undefined;
+  corpusPaths?: string[] | undefined;
+  provider?: string | undefined;
+  model?: string | undefined;
+  thinking?: string | undefined;
+  maxScopes?: number | undefined;
+  mapSteps?: number | undefined;
+  digSteps?: number | undefined;
+  maxSteps?: number | undefined;
+  digSamples?: number | undefined;
+  digConcurrency?: number | undefined;
+  remap?: boolean | undefined; // run/map/audit: re-enumerate the scope inventory (restart)
+  fresh?: boolean | undefined; // confirm: ignore a prior interrupted confirm
+  inputRunDir?: string | undefined; // confirm: the finished run dir to reproduce (positional)
+  region?: string | undefined; // audit: a pinned region (positional)
+  scope?: string | undefined; // audit: --scope id[,id...]
+  quick?: boolean | undefined; // run: a single breadth pass instead of map -> audit
+  mockLlm?: boolean | undefined; // run with the deterministic offline model (no provider needed)
+  out?: string | undefined;
 }
 
 export interface ActiveRun {

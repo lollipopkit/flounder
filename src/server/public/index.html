@@ -280,7 +280,8 @@ function renderDetail() {
   const cfg = (() => { try { return JSON.parse(d.project.config_json); } catch { return {}; } })();
   const pr = d.progress;
   const running = state.active.filter((a) => a.target === d.project.name);
-  const st = running.length ? "running" : (d.runs[0] ? d.runs[0].status : "");
+  const runningRuns = d.runs.filter((r) => r.status === "running"); // stoppable, carry run ids
+  const st = (running.length || runningRuns.length) ? "running" : (d.runs[0] ? d.runs[0].status : "");
   // Per-run progress is kind-aware: map/audit show scopes audited (live), confirm shows
   // bugs reproduced / decided (live). Derived from the confirm_decision rows for each run.
   const confByRun = {};
@@ -319,7 +320,7 @@ function renderDetail() {
       + (d.runsTotal > 0 ? '<button class="btn" id="restartBtn">' + icon("sync") + 'Restart (re-map)</button>' : "")
       + '<button class="btn" id="runBtn">' + icon("play") + 'Run…</button>'
       + '<button class="btn" id="editBtn">' + icon("gear") + 'Edit config</button>'
-      + running.map((a) => '<button class="btn danger" data-kill="' + a.pid + '">' + icon("x") + 'Stop ' + a.verb + ' · pid ' + a.pid + '</button>').join("")
+      + runningRuns.map((r) => '<button class="btn danger" data-runid="' + r.id + '">' + icon("x") + 'Stop ' + r.kind + ' · run ' + r.id + '</button>').join("")
     + '</div>'
     + confirmedSection
     + '<div class="section-title">' + icon("play") + 'Runs <span class="muted">(' + d.runsTotal + (d.runsTotal > d.runs.length ? ", showing " + d.runs.length : "") + ')</span></div>'
@@ -332,7 +333,7 @@ function renderDetail() {
   const rb = $("#restartBtn"); if (rb) rb.onclick = () => command("restart");
   $("#runBtn").onclick = openRun;
   $("#editBtn").onclick = openEdit;
-  el.querySelectorAll("[data-kill]").forEach((b) => b.onclick = () => fetch("/api/kill", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ pid: Number(b.dataset.kill) }) }));
+  el.querySelectorAll("[data-runid]").forEach((b) => b.onclick = () => fetch("/api/runs/" + b.dataset.runid + "/stop", { method: "POST" }));
   renderChips();
   renderFindings();
 }
@@ -367,14 +368,13 @@ function projectFields(d) {
   return { cfg, sourcePaths: arr(d.project.source_paths), buildRoot: d.project.build_root || "", corpusPaths: arr(d.project.corpus_paths) };
 }
 
+// Start/Continue = run (resume default); Restart = run + remap. The server launches using
+// the project's stored materials & config, so the UI just names the action.
 async function command(which) {
-  const d = state.detail; if (!d) return;
-  const f = projectFields(d);
-  const spec = { target: d.project.name, sourcePaths: f.sourcePaths, buildRoot: f.buildRoot || undefined, corpusPaths: f.corpusPaths,
-    provider: f.cfg.provider, model: f.cfg.model, thinking: f.cfg.thinking,
-    maxScopes: f.cfg.maxScopes ?? undefined, mapSteps: f.cfg.mapSteps ?? undefined, digSteps: f.cfg.digSteps ?? undefined,
-    digSamples: f.cfg.digSamples ?? undefined, digConcurrency: f.cfg.digConcurrency ?? undefined };
-  await fetch("/api/" + which, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(spec) });
+  if (!state.selected) return;
+  const body = which === "restart" ? { verb: "run", remap: true } : { verb: "run" };
+  await fetch("/api/projects/" + encodeURIComponent(state.selected) + "/runs", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  setTimeout(loadDetail, 400);
 }
 
 // --- edit config dialog ---
@@ -398,7 +398,7 @@ $("#cfgForm").onsubmit = async (e) => {
   const body = { sourcePaths: list("sourcePaths"), buildRoot: f.get("buildRoot") || undefined, corpusPaths: list("corpusPaths"),
     config: { provider: f.get("provider") || undefined, model: f.get("model") || undefined, thinking: f.get("thinking") || undefined,
       maxScopes: num("maxScopes"), mapSteps: num("mapSteps"), digSteps: num("digSteps"), digSamples: num("digSamples"), digConcurrency: num("digConcurrency") } };
-  await fetch("/api/projects/" + encodeURIComponent(state.selected) + "/config", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  await fetch("/api/projects/" + encodeURIComponent(state.selected), { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
   setTimeout(loadDetail, 200);
 };
 
@@ -430,17 +430,13 @@ $("#runForm").querySelector("[name=verb]").onchange = (e) => {
 };
 $("#runForm").onsubmit = async (e) => {
   if (e.submitter && e.submitter.id !== "launchBtn") return;
-  const d = state.detail; if (!d) return;
-  const pf = projectFields(d);
+  if (!state.selected) return;
   const f = new FormData($("#runForm"));
-  const spec = { verb: f.get("verb"), target: state.selected,
-    sourcePaths: pf.sourcePaths, buildRoot: pf.buildRoot || undefined, corpusPaths: pf.corpusPaths,
-    provider: pf.cfg.provider, model: pf.cfg.model, thinking: pf.cfg.thinking,
-    maxScopes: pf.cfg.maxScopes ?? undefined, mapSteps: pf.cfg.mapSteps ?? undefined, digSteps: pf.cfg.digSteps ?? undefined,
-    digSamples: pf.cfg.digSamples ?? undefined, digConcurrency: pf.cfg.digConcurrency ?? undefined,
+  // Run-shape only; the server launches with the project's stored source & config.
+  const body = { verb: f.get("verb"),
     region: f.get("region") || undefined, scope: f.get("scope") || undefined,
     inputRunDir: f.get("inputRunDir") || undefined, quick: f.get("quick") === "on", mockLlm: f.get("mockLlm") === "on" };
-  await fetch("/api/launch", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(spec) });
+  await fetch("/api/projects/" + encodeURIComponent(state.selected) + "/runs", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
   setTimeout(loadDetail, 400);
 };
 

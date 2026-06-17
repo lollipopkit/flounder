@@ -1,18 +1,16 @@
-// Local web app for tracking/driving audits across projects. Zero-dependency: Node's
-// built-in http server + a vanilla SPA (src/server/ui-html.ts). Reads the SQLite tracking
-// store and drives the RunManager (which shells out to `fsa`). Binds to localhost only —
-// it can spawn audit processes, so it must not be exposed on the network. This is the
-// backend a later formal API would grow from.
+// Local web app + REST API for tracking/driving audits across projects. Every workflow
+// resource (project, run, scope, finding, confirm decision) is a REST resource, and every
+// operation the UI performs is an API call — so an AI agent can drive the whole workflow
+// without the UI by fetching GET /api (a self-describing catalog of all endpoints) and
+// calling them. The UI is just one client of this API. Zero-dependency: Node's built-in
+// http + a vanilla SPA. Binds to localhost only (it can spawn audit processes).
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { MetadataStore } from "../db/store.js";
+import { MetadataStore, type RunKind } from "../db/store.js";
 import { RunManager, type LaunchSpec } from "./run-manager.js";
 
-// The SPA is a static asset copied to dist/server/public at build (scripts/copy-assets.mjs),
-// kept as a real .html file so its own backticks/${} do not fight a TS template literal.
-// Read per request (a tiny file) so a rebuilt asset shows on reload without a server restart.
 const UI_HTML_PATH = fileURLToPath(new URL("./public/index.html", import.meta.url));
 function loadUiHtml(): string {
   try {
@@ -28,160 +26,271 @@ export interface UiServerOptions {
   host?: string;
 }
 
+interface Ctx {
+  req: IncomingMessage;
+  res: ServerResponse;
+  params: Record<string, string>;
+  url: URL;
+  store: MetadataStore;
+  manager: RunManager;
+  out: string;
+}
+
+interface Route {
+  method: string;
+  path: string; // template, e.g. /api/projects/:name/runs
+  summary: string;
+  params?: Record<string, string>;
+  query?: Record<string, string>;
+  body?: Record<string, string>;
+  handler: (c: Ctx) => Promise<void> | void;
+  hidden?: boolean; // omit from the catalog (the UI page + the catalog itself)
+  regex: RegExp;
+  paramNames: string[];
+}
+
+function route(def: Omit<Route, "regex" | "paramNames">): Route {
+  const paramNames: string[] = [];
+  const regex = new RegExp(
+    "^" +
+      def.path.replace(/:[A-Za-z0-9_]+/g, (m) => {
+        paramNames.push(m.slice(1));
+        return "([^/]+)";
+      }) +
+      "$",
+  );
+  return { ...def, regex, paramNames };
+}
+
+// ---- the API surface (data-driven, so GET /api can describe it) -----------------------
+
+const ROUTES: Route[] = [
+  route({ method: "GET", path: "/", summary: "The web dashboard (HTML).", hidden: true, handler: (c) => { c.res.writeHead(200, { "content-type": "text/html; charset=utf-8" }); c.res.end(loadUiHtml()); } }),
+  route({ method: "GET", path: "/api", summary: "This catalog: every resource and operation, so an agent can self-learn and drive the workflow without the UI.", handler: (c) => sendJson(c.res, 200, catalog()) }),
+
+  route({
+    method: "GET", path: "/api/projects",
+    summary: "List all projects with a live snapshot (scope coverage, finding counts, confirmed-bug count, latest run, active runs).",
+    handler: (c) => sendJson(c.res, 200, { projects: projectSnapshots(c.store, c.manager) }),
+  }),
+  route({
+    method: "POST", path: "/api/projects",
+    summary: "Create a project (no run starts). Rejects a duplicate name.",
+    body: { name: "string (required, unique)", sourcePaths: "string[] — code to audit", buildRoot: "string? — buildable root", corpusPaths: "string[]? — specs/docs", config: "object? — { provider, model, thinking, maxScopes, mapSteps, digSteps, digSamples, digConcurrency }" },
+    handler: projectCreate,
+  }),
+  route({
+    method: "GET", path: "/api/projects/:name",
+    summary: "Project detail: config, scope coverage, finding/run/confirmed counts, recent runs, confirm decisions.",
+    params: { name: "project name" },
+    handler: projectGet,
+  }),
+  route({
+    method: "PATCH", path: "/api/projects/:name",
+    summary: "Update a project's materials and/or config (no run starts). Used by Continue/Restart/Run afterwards.",
+    params: { name: "project name" },
+    body: { sourcePaths: "string[]?", buildRoot: "string?", corpusPaths: "string[]?", config: "object?" },
+    handler: projectUpdate,
+  }),
+  route({
+    method: "DELETE", path: "/api/projects/:name",
+    summary: "Delete a project and everything under it (runs, scopes, findings, confirm decisions). On-disk run artifacts are left untouched.",
+    params: { name: "project name" },
+    handler: projectDelete,
+  }),
+
+  route({
+    method: "GET", path: "/api/projects/:name/runs",
+    summary: "List a project's runs (newest first).",
+    params: { name: "project name" }, query: { limit: "number? — cap rows" },
+    handler: (c) => withProject(c, (id) => sendJson(c.res, 200, { runs: c.store.listRuns(id, clampInt(c.url.searchParams.get("limit"), 200, 1, 1000)) })),
+  }),
+  route({
+    method: "POST", path: "/api/projects/:name/runs",
+    summary: "Launch a run on the project (start/continue an audit, restart, map, audit a region/scope, or confirm). Uses the project's stored materials + config unless overridden. This is the single action behind the UI's Start/Continue/Restart/Run buttons.",
+    params: { name: "project name" },
+    body: {
+      verb: "'run' | 'map' | 'audit' | 'confirm' (default 'run'; run = map→dig, resumes)",
+      remap: "boolean? — re-enumerate scopes (restart)", fresh: "boolean? — confirm: ignore a prior interrupted confirm",
+      quick: "boolean? — run: single breadth pass", mockLlm: "boolean? — offline mock model",
+      region: "string? — audit: pinned region e.g. src/Foo.sol:120-180", scope: "string? — audit: scope id(s)",
+      inputRunDir: "string? — confirm: the finished run dir to reproduce",
+      overrides: "object? — { sourcePaths, buildRoot, corpusPaths, config } one-off overrides of the stored project",
+    },
+    handler: runLaunch,
+  }),
+  route({
+    method: "GET", path: "/api/projects/:name/scopes",
+    summary: "List the project's scope inventory (audited/pending) — the map output.",
+    params: { name: "project name" },
+    handler: (c) => withProject(c, (id) => sendJson(c.res, 200, { scopes: c.store.listScopes(id), progress: c.store.scopeProgress(id) })),
+  }),
+  route({
+    method: "GET", path: "/api/projects/:name/findings",
+    summary: "List findings, paginated + filterable, each with its status timeline (suspect→confirm→refute).",
+    params: { name: "project name" },
+    query: { status: "string? — exact status filter", q: "string? — text search (title/location)", limit: "number? (default 50)", offset: "number? (default 0)" },
+    handler: findingsList,
+  }),
+  route({
+    method: "GET", path: "/api/projects/:name/confirm-decisions",
+    summary: "List confirm decisions (one per distinct bug). Filter ?reproduced=yes for the bugs actually reproduced on the real target (the audit's payoff).",
+    params: { name: "project name" }, query: { reproduced: "string? — e.g. 'yes' for confirmed bugs" },
+    handler: confirmDecisionsList,
+  }),
+
+  route({
+    method: "GET", path: "/api/runs/:id",
+    summary: "A single run (status, kind, coverage, finding count, pid, run dir, timestamps).",
+    params: { id: "run id" },
+    handler: (c) => { const run = c.store.getRun(Number(c.params.id)); run ? sendJson(c.res, 200, { run }) : sendJson(c.res, 404, { error: "no such run" }); },
+  }),
+  route({
+    method: "POST", path: "/api/runs/:id/stop",
+    summary: "Stop a running run (SIGTERM the process). The run is reconciled to 'killed'.",
+    params: { id: "run id" },
+    handler: runStop,
+  }),
+
+  route({ method: "GET", path: "/api/active", summary: "Currently-running processes the run-manager is supervising.", handler: (c) => sendJson(c.res, 200, { active: c.manager.active() }) }),
+  route({ method: "GET", path: "/api/stream", summary: "Server-sent events: the project snapshot + active list, pushed ~1/s for live updates.", handler: (c) => streamSnapshots(c.res, c.store, c.manager) }),
+];
+
+function catalog(): unknown {
+  return {
+    name: "full-stack-auditor",
+    description: "REST API for tracking and driving white-hat audits. Resources: project (CRUD), run (launch/stop/read), scope, finding, confirm-decision. Every UI operation is one of these calls.",
+    resources: ["project", "run", "scope", "finding", "confirm-decision"],
+    endpoints: ROUTES.filter((r) => !r.hidden).map((r) => ({
+      method: r.method,
+      path: r.path,
+      summary: r.summary,
+      ...(r.params ? { params: r.params } : {}),
+      ...(r.query ? { query: r.query } : {}),
+      ...(r.body ? { body: r.body } : {}),
+    })),
+  };
+}
+
 export function startUiServer(options: UiServerOptions = {}): ReturnType<typeof createServer> {
   const out = options.out ?? "runs";
   const port = options.port ?? 4500;
   const host = options.host ?? "127.0.0.1"; // localhost only — this endpoint can spawn processes
-  const store = MetadataStore.openForOutput(out); // long-lived reader; WAL sees committed writes
+  const store = MetadataStore.openForOutput(out);
   const manager = new RunManager();
 
   const server = createServer((req, res) => {
-    handle(req, res, store, manager, out).catch((error) => sendJson(res, 500, { error: String(error instanceof Error ? error.message : error) }));
+    const url = new URL(req.url ?? "/", "http://localhost");
+    const method = req.method ?? "GET";
+    for (const r of ROUTES) {
+      if (r.method !== method) continue;
+      const match = r.regex.exec(url.pathname);
+      if (!match) continue;
+      const params: Record<string, string> = {};
+      r.paramNames.forEach((name, i) => (params[name] = decodeURIComponent(match[i + 1] ?? "")));
+      Promise.resolve(r.handler({ req, res, params, url, store, manager, out })).catch((error) =>
+        sendJson(res, 500, { error: String(error instanceof Error ? error.message : error) }),
+      );
+      return;
+    }
+    sendJson(res, 404, { error: "not found", hint: "GET /api lists every endpoint" });
   });
   server.listen(port, host, () => {
-    console.log(`[fsa ui] http://${host}:${port}  (tracking store: ${out}/fsa.db)`);
+    console.log(`[fsa ui] http://${host}:${port}  (API catalog: http://${host}:${port}/api · store: ${out}/fsa.db)`);
   });
   return server;
 }
 
-async function handle(req: IncomingMessage, res: ServerResponse, store: MetadataStore, manager: RunManager, out: string): Promise<void> {
-  const url = new URL(req.url ?? "/", "http://localhost");
-  const path = url.pathname;
-  const method = req.method ?? "GET";
+// ---- handlers -------------------------------------------------------------------------
 
-  if (method === "GET" && path === "/") {
-    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-    res.end(loadUiHtml());
+function withProject(c: Ctx, fn: (projectId: number, project: Record<string, unknown>) => void): void {
+  const project = c.store.getProject(c.params.name ?? "");
+  if (!project) {
+    sendJson(c.res, 404, { error: `no project named ${c.params.name}` });
     return;
   }
-
-  if (method === "GET" && path === "/api/projects") {
-    sendJson(res, 200, { projects: projectSnapshots(store, manager) });
-    return;
-  }
-
-  // Create a project as its own step (GitHub "New repository" style): name + materials +
-  // config, no run yet. Rejects a duplicate name. Runs happen afterwards inside it.
-  if (method === "POST" && path === "/api/projects") {
-    const body = (await readBody(req)) as { name?: string; sourcePaths?: string[]; buildRoot?: string; corpusPaths?: string[]; config?: unknown };
-    const name = (body.name ?? "").trim();
-    if (!name) {
-      sendJson(res, 400, { error: "project name is required" });
-      return;
-    }
-    if (store.listProjects().some((row) => row.name === name)) {
-      sendJson(res, 409, { error: `a project named "${name}" already exists` });
-      return;
-    }
-    store.upsertProject({ name, sourcePaths: body.sourcePaths, buildRoot: body.buildRoot, corpusPaths: body.corpusPaths, config: body.config });
-    sendJson(res, 200, { ok: true, name });
-    return;
-  }
-
-  if (path.startsWith("/api/projects/")) {
-    const tail = path.slice("/api/projects/".length);
-    const slash = tail.indexOf("/");
-    const name = decodeURIComponent(slash === -1 ? tail : tail.slice(0, slash));
-    const sub = slash === -1 ? "" : tail.slice(slash + 1);
-    const project = store.listProjects().find((row) => row.name === name);
-    if (!project) {
-      sendJson(res, 404, { error: `no project named ${name}` });
-      return;
-    }
-    const id = Number(project.id);
-
-    // Project detail: meta + counts + a bounded slice of runs (NOT every finding row, so
-    // it stays fast with many findings — findings are paged via the endpoint below).
-    if (method === "GET" && sub === "") {
-      sendJson(res, 200, {
-        project,
-        progress: store.scopeProgress(id),
-        statusCounts: store.findingStatusCounts(id),
-        findingsTotal: store.countFindings(id),
-        runs: store.listRuns(id, 50),
-        runsTotal: store.countRuns(id),
-        confirmDecisions: store.listConfirmDecisions(id),
-      });
-      return;
-    }
-
-    // Paginated + filtered findings (status / text search) with their status timeline.
-    if (method === "GET" && sub === "findings") {
-      const status = url.searchParams.get("status") ?? undefined;
-      const search = url.searchParams.get("q") ?? undefined;
-      const limit = clampInt(url.searchParams.get("limit"), 50, 1, 500);
-      const offset = clampInt(url.searchParams.get("offset"), 0, 0, 1_000_000);
-      const findings = store.queryFindings(id, { status, search, limit, offset }).map((finding) => ({
-        ...finding,
-        timeline: store.findingTimeline(Number(finding.id)),
-      }));
-      sendJson(res, 200, { findings, total: store.countFindings(id, { status, search }), limit, offset });
-      return;
-    }
-
-    // Edit per-project config (model/thinking/budgets) + materials, without a run.
-    if (method === "POST" && sub === "config") {
-      const body = (await readBody(req)) as { sourcePaths?: string[]; buildRoot?: string; corpusPaths?: string[]; config?: unknown };
-      store.upsertProject({ name, sourcePaths: body.sourcePaths, buildRoot: body.buildRoot, corpusPaths: body.corpusPaths, config: body.config });
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-
-    sendJson(res, 404, { error: "not found" });
-    return;
-  }
-
-  if (method === "GET" && path === "/api/active") {
-    sendJson(res, 200, { active: manager.active() });
-    return;
-  }
-
-  if (method === "GET" && path === "/api/stream") {
-    streamSnapshots(res, store, manager);
-    return;
-  }
-
-  if (method === "POST" && path === "/api/launch") {
-    const spec = (await readBody(req)) as LaunchSpec;
-    const result = manager.launch({ ...spec, out });
-    sendJson(res, 200, result);
-    return;
-  }
-
-  if (method === "POST" && path === "/api/continue") {
-    const spec = (await readBody(req)) as Omit<LaunchSpec, "verb" | "remap">;
-    sendJson(res, 200, manager.continueAudit({ ...spec, out }));
-    return;
-  }
-
-  if (method === "POST" && path === "/api/restart") {
-    const spec = (await readBody(req)) as Omit<LaunchSpec, "verb" | "remap">;
-    sendJson(res, 200, manager.restartAudit({ ...spec, out }));
-    return;
-  }
-
-  if (method === "POST" && path === "/api/kill") {
-    const body = (await readBody(req)) as { pid?: number };
-    if (typeof body.pid !== "number") {
-      sendJson(res, 400, { error: "pid (number) required" });
-      return;
-    }
-    sendJson(res, 200, { killed: manager.kill(body.pid) });
-    return;
-  }
-
-  sendJson(res, 404, { error: "not found" });
+  fn(Number(project.id), project);
 }
 
-// One row per project for the dashboard: coverage, finding counts by status, latest run,
-// and whether a process is currently active for it.
+async function projectCreate(c: Ctx): Promise<void> {
+  const body = (await readBody(c.req)) as { name?: string; sourcePaths?: string[]; buildRoot?: string; corpusPaths?: string[]; config?: unknown };
+  const name = (body.name ?? "").trim();
+  if (!name) return sendJson(c.res, 400, { error: "project name is required" });
+  if (c.store.getProject(name)) return sendJson(c.res, 409, { error: `a project named "${name}" already exists` });
+  c.store.upsertProject({ name, sourcePaths: body.sourcePaths, buildRoot: body.buildRoot, corpusPaths: body.corpusPaths, config: body.config });
+  sendJson(c.res, 200, { ok: true, name });
+}
+
+function projectGet(c: Ctx): void {
+  withProject(c, (id, project) => {
+    sendJson(c.res, 200, {
+      project,
+      progress: c.store.scopeProgress(id),
+      statusCounts: c.store.findingStatusCounts(id),
+      findingsTotal: c.store.countFindings(id),
+      confirmedBugs: c.store.countConfirmedBugs(id),
+      runs: c.store.listRuns(id, 50),
+      runsTotal: c.store.countRuns(id),
+      confirmDecisions: c.store.listConfirmDecisions(id),
+    });
+  });
+}
+
+async function projectUpdate(c: Ctx): Promise<void> {
+  const project = c.store.getProject(c.params.name ?? "");
+  if (!project) return sendJson(c.res, 404, { error: `no project named ${c.params.name}` });
+  const body = (await readBody(c.req)) as { sourcePaths?: string[]; buildRoot?: string; corpusPaths?: string[]; config?: unknown };
+  c.store.upsertProject({ name: String(project.name), sourcePaths: body.sourcePaths, buildRoot: body.buildRoot, corpusPaths: body.corpusPaths, config: body.config });
+  sendJson(c.res, 200, { ok: true });
+}
+
+function projectDelete(c: Ctx): void {
+  const removed = c.store.deleteProject(c.params.name ?? "");
+  removed ? sendJson(c.res, 200, { ok: true, deleted: c.params.name }) : sendJson(c.res, 404, { error: `no project named ${c.params.name}` });
+}
+
+async function runLaunch(c: Ctx): Promise<void> {
+  const project = c.store.getProject(c.params.name ?? "");
+  if (!project) return sendJson(c.res, 404, { error: `no project named ${c.params.name}` });
+  const body = (await readBody(c.req)) as Record<string, unknown>;
+  const result = c.manager.launch(launchSpec(project, body, c.out));
+  sendJson(c.res, 200, result);
+}
+
+function findingsList(c: Ctx): void {
+  withProject(c, (id) => {
+    const status = c.url.searchParams.get("status") ?? undefined;
+    const search = c.url.searchParams.get("q") ?? undefined;
+    const limit = clampInt(c.url.searchParams.get("limit"), 50, 1, 500);
+    const offset = clampInt(c.url.searchParams.get("offset"), 0, 0, 1_000_000);
+    const findings = c.store.queryFindings(id, { status, search, limit, offset }).map((finding) => ({ ...finding, timeline: c.store.findingTimeline(Number(finding.id)) }));
+    sendJson(c.res, 200, { findings, total: c.store.countFindings(id, { status, search }), limit, offset });
+  });
+}
+
+function confirmDecisionsList(c: Ctx): void {
+  withProject(c, (id) => {
+    const reproduced = c.url.searchParams.get("reproduced");
+    let rows = c.store.listConfirmDecisions(id);
+    if (reproduced) rows = rows.filter((row) => row.reproduced === reproduced);
+    sendJson(c.res, 200, { confirmDecisions: rows });
+  });
+}
+
+function runStop(c: Ctx): void {
+  const run = c.store.getRun(Number(c.params.id));
+  if (!run) return sendJson(c.res, 404, { error: "no such run" });
+  if (typeof run.pid !== "number") return sendJson(c.res, 409, { error: "run has no live process to stop" });
+  sendJson(c.res, 200, { stopped: c.manager.kill(run.pid) });
+}
+
+// ---- shared -----------------------------------------------------------------
+
 function projectSnapshots(store: MetadataStore, manager: RunManager): Array<Record<string, unknown>> {
   const activeByTarget = new Map<string, number>();
   for (const run of manager.active()) activeByTarget.set(run.target, (activeByTarget.get(run.target) ?? 0) + 1);
   return store.listProjects().map((project) => {
     const id = Number(project.id);
-    // Aggregates only (GROUP BY / COUNT / latest) — O(1)-ish per project, so the SSE tick
-    // does not reload every finding/run row each second when there are many.
     return {
       name: project.name,
       config: safeParse(project.config_json),
@@ -196,8 +305,6 @@ function projectSnapshots(store: MetadataStore, manager: RunManager): Array<Reco
   });
 }
 
-// Server-sent events: push the project snapshot + active list ~1/s so the dashboard shows
-// live progress (a polling read-model is plenty for a local single-user tool).
 function streamSnapshots(res: ServerResponse, store: MetadataStore, manager: RunManager): void {
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
   const tick = (): void => {
@@ -206,6 +313,45 @@ function streamSnapshots(res: ServerResponse, store: MetadataStore, manager: Run
   tick();
   const timer = setInterval(tick, 1200);
   res.on("close", () => clearInterval(timer));
+}
+
+// Build a launch spec from the project's stored materials/config + the request body
+// (verb + run-shape flags + optional one-off overrides). Unbounded (null) budgets stay
+// undefined so the kernel's unbounded default applies.
+function launchSpec(project: Record<string, unknown>, body: Record<string, unknown>, out: string): LaunchSpec {
+  const cfg = (safeParse(project.config_json) as Record<string, unknown>) ?? {};
+  const overrides = (body.overrides as Record<string, unknown>) ?? {};
+  const merged = { ...cfg, ...((overrides.config as Record<string, unknown>) ?? {}) };
+  const num = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+  const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
+  const list = (v: unknown, fallback: unknown): string[] => {
+    const arr = Array.isArray(v) ? v : (safeParse(fallback) as unknown[]) ?? [];
+    return arr.filter((x): x is string => typeof x === "string");
+  };
+  return {
+    verb: (typeof body.verb === "string" ? body.verb : "run") as RunKind,
+    target: String(project.name),
+    sourcePaths: list(overrides.sourcePaths, project.source_paths),
+    buildRoot: str(overrides.buildRoot) ?? str(project.build_root),
+    corpusPaths: list(overrides.corpusPaths, project.corpus_paths),
+    provider: str(merged.provider),
+    model: str(merged.model),
+    thinking: str(merged.thinking),
+    maxScopes: num(merged.maxScopes),
+    mapSteps: num(merged.mapSteps),
+    digSteps: num(merged.digSteps),
+    maxSteps: num(merged.maxSteps),
+    digSamples: num(merged.digSamples),
+    digConcurrency: num(merged.digConcurrency),
+    remap: Boolean(body.remap),
+    fresh: Boolean(body.fresh),
+    quick: Boolean(body.quick),
+    mockLlm: Boolean(body.mockLlm),
+    region: str(body.region),
+    scope: str(body.scope),
+    inputRunDir: str(body.inputRunDir),
+    out,
+  };
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {

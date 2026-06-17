@@ -237,6 +237,27 @@ export class MetadataStore {
     return this.db.prepare("SELECT * FROM project ORDER BY updated_at DESC").all() as Array<Record<string, unknown>>;
   }
 
+  getProject(name: string): Record<string, unknown> | undefined {
+    return this.db.prepare("SELECT * FROM project WHERE name = ?").get(name) as Record<string, unknown> | undefined;
+  }
+
+  /** Delete a project and everything under it (runs, scopes, findings + their status
+   * events, confirm decisions). Returns true if a project was removed. */
+  deleteProject(name: string): boolean {
+    const project = this.getProject(name);
+    if (!project) return false;
+    const id = Number(project.id);
+    this.transaction(() => {
+      this.db.prepare("DELETE FROM finding_status_event WHERE finding_id IN (SELECT id FROM finding WHERE project_id = ?)").run(id);
+      this.db.prepare("DELETE FROM finding WHERE project_id = ?").run(id);
+      this.db.prepare("DELETE FROM scope WHERE project_id = ?").run(id);
+      this.db.prepare("DELETE FROM confirm_decision WHERE project_id = ?").run(id);
+      this.db.prepare("DELETE FROM run WHERE project_id = ?").run(id);
+      this.db.prepare("DELETE FROM project WHERE id = ?").run(id);
+    });
+    return true;
+  }
+
   // --- runs -----------------------------------------------------------------
 
   /** Record the start of a run (status=running). Returns the run id. */
@@ -314,6 +335,10 @@ export class MetadataStore {
     return this.db.prepare("SELECT * FROM run WHERE project_id = ? ORDER BY started_at DESC LIMIT 1").get(projectId) as Record<string, unknown> | undefined;
   }
 
+  getRun(id: number): Record<string, unknown> | undefined {
+    return this.db.prepare("SELECT * FROM run WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+  }
+
   // --- scopes ---------------------------------------------------------------
 
   /** Upsert the project's scope inventory (id, title, location, score, status). */
@@ -331,6 +356,10 @@ export class MetadataStore {
         stmt.run(projectId, s.scopeId, s.title ?? null, s.location ?? null, s.score ?? null, s.status, ts);
       }
     });
+  }
+
+  listScopes(projectId: number): Array<Record<string, unknown>> {
+    return this.db.prepare("SELECT * FROM scope WHERE project_id = ? ORDER BY status, score DESC").all(projectId) as Array<Record<string, unknown>>;
   }
 
   scopeProgress(projectId: number): Coverage {

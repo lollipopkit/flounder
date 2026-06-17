@@ -264,7 +264,22 @@ This is the backend the UI reads from; it is written live by each run (not rebui
 fsa ui                 # local dashboard at http://127.0.0.1:4500 (--port, --out to change)
 ```
 
-A localhost-only web dashboard to track and drive audits across projects: per-project scope coverage (mapped vs audited, live), findings with their status timeline, and confirm decisions, updating in real time via SSE. Launch a new run, **Continue** (resume — audits the next batch of scopes) or **Restart** (re-map), and stop a running one — all from the UI, which shells out to the same `fsa` commands. It binds to localhost only (it can spawn audit processes).
+A localhost-only web dashboard to track and drive audits across projects: per-project scope coverage (mapped vs audited, live), findings with their status timeline, and the bugs actually **confirmed** on the real target, updating in real time via SSE. Create a project, **Start/Continue** an audit (resume — next batch of scopes), **Restart** (re-map), **Run…** (map / audit a region / confirm), **Edit config**, or stop a running run — all from the UI. It binds to localhost only (it can spawn audit processes).
+
+### HTTP API (agent-drivable)
+
+The UI is just one client of a REST API the `fsa ui` server exposes. **Every** operation the UI performs is an API call, so an agent can drive the whole workflow without the UI. The API is **self-describing**: `GET /api` returns a catalog of every resource and endpoint (method, path, params, body) — an agent fetches it once to learn the surface, then calls it.
+
+```bash
+curl localhost:4500/api                                   # catalog of every endpoint
+curl -X POST localhost:4500/api/projects -d '{"name":"p","sourcePaths":["./contracts"]}'
+curl -X POST localhost:4500/api/projects/p/runs -d '{"verb":"run"}'   # start/continue (resume)
+curl localhost:4500/api/projects/p                        # progress, counts, runs, confirm decisions
+curl 'localhost:4500/api/projects/p/findings?status=confirmed-differential'
+curl 'localhost:4500/api/projects/p/confirm-decisions?reproduced=yes'  # the confirmed bugs
+```
+
+Resources: **project** (CRUD: `GET/POST /api/projects`, `GET/PATCH/DELETE /api/projects/:name`), **run** (`POST /api/projects/:name/runs` to launch — `verb` run/map/audit/confirm with `remap`/`fresh`/`quick`/`region`/`scope`/`inputRunDir`; `GET /api/runs/:id`; `POST /api/runs/:id/stop`), **scope** / **finding** / **confirm-decision** (read, paginated + filterable). `GET /api/stream` is an SSE feed for live updates. The server launches the same `fsa` CLI under the hood. A formal/published API can grow from this surface; for now it is localhost-only.
 
 ## Library API
 

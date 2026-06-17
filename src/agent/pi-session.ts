@@ -51,6 +51,8 @@ export async function runAuditSession(input: {
   /** Called each turn in confirm mode with the decision rows written so far (raw), so a
    * tracker can project live reproduction progress. Best-effort; must not throw. */
   onConfirmCheckpoint?: (rows: unknown[]) => void;
+  /** Abort the run cooperatively (e.g. a UI "stop"): aborts the underlying agent session. */
+  signal?: AbortSignal;
 }): Promise<SessionDriverResult> {
   const model = getModelSafe(input.cfg.provider, input.cfg.auditModel);
   if (!model) throw new Error(`audit session: unknown provider/model ${input.cfg.provider}/${input.cfg.auditModel}`);
@@ -71,6 +73,12 @@ export async function runAuditSession(input: {
     cwd: input.cwd,
     sessionManager: SessionManager.inMemory(),
   });
+
+  // Cooperative stop (e.g. a UI "stop" on an in-process run): abort the agent session.
+  if (input.signal) {
+    if (input.signal.aborted) void session.abort();
+    else input.signal.addEventListener("abort", () => void session.abort(), { once: true });
+  }
 
   // Budget: the continuous session runs until the model stops on its own. A finite
   // auditMaxSteps caps the number of model turns so a run cannot grow unbounded in

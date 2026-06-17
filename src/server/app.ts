@@ -142,9 +142,14 @@ const ROUTES: Route[] = [
 
   route({
     method: "GET", path: "/api/runs/:id",
-    summary: "A single run (status, kind, coverage, finding count, pid, run dir, timestamps).",
+    summary: "A single run (status, kind, coverage, finding count, run dir, timestamps). Includes the rich library `result` (AuditRunResult / ConfirmRunResult — full findings, summary, coverage) for a run launched in the current server session.",
     params: { id: "run id" },
-    handler: (c) => { const run = c.store.getRun(Number(c.params.id)); run ? sendJson(c.res, 200, { run }) : sendJson(c.res, 404, { error: "no such run" }); },
+    handler: (c) => {
+      const run = c.store.getRun(Number(c.params.id));
+      if (!run) return sendJson(c.res, 404, { error: "no such run" });
+      const result = c.manager.resultFor(Number(c.params.id));
+      sendJson(c.res, 200, { run, ...(result ? { result } : {}) });
+    },
   }),
   route({
     method: "POST", path: "/api/runs/:id/stop",
@@ -184,7 +189,7 @@ export function startUiServer(options: UiServerOptions = {}): ReturnType<typeof 
   const port = options.port ?? 4500;
   const host = options.host ?? "127.0.0.1"; // localhost only — this endpoint can spawn processes
   const store = MetadataStore.openForOutput(out);
-  const manager = new RunManager();
+  const manager = new RunManager(store, out); // runs the library in-process (not the CLI)
 
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");
@@ -285,10 +290,9 @@ function confirmDecisionsList(c: Ctx): void {
 }
 
 function runStop(c: Ctx): void {
-  const run = c.store.getRun(Number(c.params.id));
-  if (!run) return sendJson(c.res, 404, { error: "no such run" });
-  if (typeof run.pid !== "number") return sendJson(c.res, 409, { error: "run has no live process to stop" });
-  sendJson(c.res, 200, { stopped: c.manager.kill(run.pid) });
+  const id = Number(c.params.id);
+  if (!c.store.getRun(id)) return sendJson(c.res, 404, { error: "no such run" });
+  sendJson(c.res, 200, { stopped: c.manager.stop(id) });
 }
 
 function runLog(c: Ctx): void {

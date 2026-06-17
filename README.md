@@ -264,7 +264,7 @@ This is the backend the UI reads from; it is written live by each run (not rebui
 fsa ui                 # local dashboard at http://127.0.0.1:4500 (--port, --out to change)
 ```
 
-A localhost-only web dashboard to track and drive audits across projects: per-project scope coverage (mapped vs audited, live), findings with their status timeline, and the bugs actually **confirmed** on the real target, updating in real time via SSE. Create a project, **Start/Continue** an audit (resume — next batch of scopes), **Restart** (re-map), **Run…** (map / audit a region / confirm), **Edit config**, or stop a running run — all from the UI. It binds to localhost only (it can spawn audit processes).
+A localhost-only web dashboard to track and drive audits across projects: per-project scope coverage (mapped vs audited, live), findings with their status timeline, and the bugs actually **confirmed** on the real target, updating in real time via SSE. Create a project, **Start/Continue** an audit (resume — next batch of scopes), **Restart** (re-map), **Run…** (map / audit a region / confirm), **Edit config**, or stop a running run — all from the UI. It binds to localhost only (it runs audits in-process and reads local code).
 
 ### HTTP API (agent-drivable)
 
@@ -279,7 +279,7 @@ curl 'localhost:4500/api/projects/p/findings?status=confirmed-differential'
 curl 'localhost:4500/api/projects/p/confirm-decisions?reproduced=yes'  # the confirmed bugs
 ```
 
-Resources: **project** (CRUD: `GET/POST /api/projects`, `GET/PATCH/DELETE /api/projects/:name`), **run** (`POST /api/projects/:name/runs` to launch — `verb` run/map/audit/confirm with `remap`/`fresh`/`quick`/`region`/`scope`/`inputRunDir`; `GET /api/runs/:id`; `POST /api/runs/:id/stop`), **scope** / **finding** / **confirm-decision** (read, paginated + filterable). `GET /api/stream` is an SSE feed for live updates. The server launches the same `fsa` CLI under the hood. A formal/published API can grow from this surface; for now it is localhost-only.
+Resources: **project** (CRUD: `GET/POST /api/projects`, `GET/PATCH/DELETE /api/projects/:name`), **run** (`POST /api/projects/:name/runs` to launch — `verb` run/map/audit/confirm with `remap`/`fresh`/`quick`/`region`/`scope`/`inputRunDir`; `GET /api/runs/:id`; `POST /api/runs/:id/stop`), **scope** / **finding** / **confirm-decision** (read, paginated + filterable). `GET /api/stream` is an SSE feed for live updates, and `GET /api/runs/:id/log` streams a run's live activity (the model's thinking/output + tool calls). The server runs the library (`runAudit`/`runConfirm`) **in-process** — not the CLI — so `GET /api/runs/:id` returns the rich `AuditRunResult`/`ConfirmRunResult` (full findings, summary, coverage) for runs it launched. A formal/published API can grow from this surface; for now it is localhost-only.
 
 ## Library API
 

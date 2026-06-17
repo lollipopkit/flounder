@@ -37,7 +37,7 @@ interface ConfirmProvenance {
 
 export async function runConfirm(
   cfg: AuditorConfig,
-  options: { inputRunDir: string; maxSteps?: number; fresh?: boolean; streamEvents?: boolean },
+  options: { inputRunDir: string; maxSteps?: number; fresh?: boolean; streamEvents?: boolean; signal?: AbortSignal; onRun?: (runId: number) => void },
 ): Promise<ConfirmRunResult> {
   // Confirm needs a real agent that can fork a live network and run real nodes; the
   // mock/CLI fallbacks cannot, so this mode requires a pi-session provider.
@@ -73,6 +73,7 @@ export async function runConfirm(
   }
   // SQLite tracking: record a `confirm` run under the same project (failure-isolated).
   const recorder = RunRecorder.start(confirmCfg, logger.runDir, "confirm", logger);
+  if (recorder.runDbId !== undefined) options.onRun?.(recorder.runDbId);
   // RESUME (auto, unless --fresh): an interrupted prior confirm of THIS input run left a
   // decision sheet; carry its already-SETTLED rows (reproduced yes/no) forward and tell
   // the model to skip them, so a re-run continues instead of re-reproducing from scratch.
@@ -123,6 +124,7 @@ export async function runConfirm(
     // Project the decision rows to SQLite each turn so a UI shows live reproduction
     // progress (reproduced X / N) during the run, not only at the end.
     onConfirmCheckpoint: (raw) => recorder.confirmDecisions(toLiveConfirmRows(raw)),
+    ...(options.signal ? { signal: options.signal } : {}),
   });
 
   // 5. Read the model's decision rows, then CONSOLIDATE by execution: run the
@@ -178,7 +180,7 @@ export async function runConfirm(
     rows.map((row) => ({ bug: row.bug, reproduced: row.reproduced, recommendation: row.recommendation, members: row.members })),
     path.join(logger.runDir, "confirm_report.md"),
   );
-  recorder.finish("done");
+  recorder.finish(options.signal?.aborted ? "killed" : "done");
 
   return { runDir: logger.runDir, decisionRows: rows.length };
 }

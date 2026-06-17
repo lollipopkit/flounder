@@ -1,15 +1,18 @@
-// Run-manager: spawns and supervises `fsa` processes so a UI can launch/continue/restart
-// audits across multiple projects concurrently. Each spawned fsa records its own SQLite
-// run row (tagged with its OS pid); the manager correlates by pid and reconciles status
-// if a process dies before the run reaches `done`. It does not reimplement any audit
-// logic — it shells out to the same CLI, and "continue vs restart" map to the kernel's
-// existing resume (default) / --remap behavior.
+// Run-manager: launches and supervises audits so a UI/agent can run them across projects
+// concurrently. It calls the LIBRARY in-process (runAudit / runConfirm) rather than shelling
+// out to the CLI — the CLI is just a thin wrapper over the same functions, so calling them
+// directly yields the rich result objects (AuditRunResult / ConfirmRunResult) and finer
+// hooks (an AbortSignal for stop, an onRun callback for the DB run id). The audit's heavy
+// work (builds, tests) still runs in sandboxed subprocesses spawned by the bash tool.
 
-import { spawn, type ChildProcess } from "node:child_process";
-import { fileURLToPath } from "node:url";
-import { MetadataStore, type RunKind, type RunStatus } from "../db/store.js";
+import { runAudit, type AuditRunResult } from "../agent/audit.js";
+import { runConfirm, type ConfirmRunResult } from "../agent/confirm.js";
+import { defaultConfig, type AuditorConfig } from "../config.js";
+import { MockAuditLlmClient } from "../llm/mock.js";
+import type { MetadataStore, RunKind, RunStatus } from "../db/store.js";
 
 const DEFAULT_OUT = "runs";
+const THINKING = new Set(["minimal", "low", "medium", "high", "xhigh"]);
 
 export interface LaunchSpec {
   verb: RunKind; // run | map | audit | confirm (verify is an audit selector)
@@ -28,22 +31,160 @@ export interface LaunchSpec {
   digConcurrency?: number | undefined;
   remap?: boolean | undefined; // run/map/audit: re-enumerate the scope inventory (restart)
   fresh?: boolean | undefined; // confirm: ignore a prior interrupted confirm
-  inputRunDir?: string | undefined; // confirm: the finished run dir to reproduce (positional)
-  region?: string | undefined; // audit: a pinned region (positional)
-  scope?: string | undefined; // audit: --scope id[,id...]
+  inputRunDir?: string | undefined; // confirm: the finished run dir to reproduce
+  region?: string | undefined; // audit: a pinned region
+  scope?: string | undefined; // audit: scope id[,id...]
   quick?: boolean | undefined; // run: a single breadth pass instead of map -> audit
   mockLlm?: boolean | undefined; // run with the deterministic offline model (no provider needed)
   out?: string | undefined;
 }
 
 export interface ActiveRun {
-  pid: number;
+  runId: number | undefined; // the DB run id (once runAudit has recorded it)
   target: string;
   verb: RunKind;
   startedAt: string;
 }
 
-/** Translate a launch spec into `fsa` CLI argv. Pure — the unit-tested core of launching. */
+interface RunHandle {
+  spec: LaunchSpec;
+  abort: AbortController;
+  startedAt: string;
+  status: "running" | "done" | "error" | "killed";
+  runId?: number;
+  result?: AuditRunResult | ConfirmRunResult;
+  error?: string;
+}
+
+// Translate a launch spec into an AuditorConfig — the in-process equivalent of the CLI's
+// parseConfig + applyAuditPosture. Budgets are UNBOUNDED unless the spec caps them.
+export function specToConfig(spec: LaunchSpec, out: string): AuditorConfig {
+  const cfg = defaultConfig();
+  cfg.targetName = spec.target;
+  cfg.sourcePaths = spec.sourcePaths;
+  cfg.corpusPaths = spec.corpusPaths ?? [];
+  if (spec.buildRoot) cfg.buildRoot = spec.buildRoot;
+  if (spec.provider) cfg.provider = spec.provider;
+  if (spec.model) cfg.auditModel = spec.model;
+  if (spec.thinking && THINKING.has(spec.thinking)) cfg.thinkingLevel = spec.thinking as AuditorConfig["thinkingLevel"];
+  cfg.outputDir = out;
+  cfg.auditMaxSteps = spec.maxSteps ?? Number.POSITIVE_INFINITY;
+  cfg.auditMapSteps = spec.mapSteps ?? Number.POSITIVE_INFINITY;
+  cfg.auditDigSteps = spec.digSteps ?? Number.POSITIVE_INFINITY;
+  if (spec.maxScopes !== undefined) cfg.auditMaxScopes = spec.maxScopes;
+  if (spec.digSamples !== undefined) cfg.auditDigSamples = spec.digSamples;
+  if (spec.digConcurrency !== undefined) cfg.auditDigConcurrency = spec.digConcurrency;
+  if (spec.remap) cfg.auditRemap = true; // re-enumerate scopes from scratch (restart)
+  if (spec.verb === "confirm") return cfg; // confirm derives its own posture from the prior run
+  if (spec.verb === "map") {
+    cfg.auditDeep = true;
+    cfg.auditMapOnly = true;
+  } else if (spec.verb === "audit") {
+    cfg.auditDeep = true;
+    if (spec.region) {
+      cfg.auditDeepFocus = spec.region;
+    } else {
+      cfg.auditRequireInventory = true; // dig the existing inventory; never auto-map here
+      const ids = (spec.scope ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+      if (ids.length > 0) cfg.auditScopeIds = ids;
+    }
+  } else if (!spec.quick) {
+    cfg.auditDeep = true; // run = map -> dig, unless --quick (breadth)
+  }
+  return cfg;
+}
+
+export class RunManager {
+  private readonly runs = new Map<number, RunHandle>();
+  private nextLaunchId = 1;
+
+  constructor(
+    private readonly store: MetadataStore,
+    private readonly out: string = DEFAULT_OUT,
+  ) {}
+
+  /** Launch a run in-process. Returns a launch id; the DB run id appears once runAudit
+   * records it (poll GET /api/projects/:name or /api/runs). */
+  launch(spec: LaunchSpec): { launchId: number; verb: RunKind } {
+    const launchId = this.nextLaunchId++;
+    const abort = new AbortController();
+    const handle: RunHandle = { spec, abort, startedAt: new Date().toISOString(), status: "running" };
+    this.runs.set(launchId, handle);
+    const onRun = (runId: number): void => {
+      handle.runId = runId;
+    };
+    // Promise.resolve().then(...) so a synchronous build error becomes a rejection, not a throw.
+    void Promise.resolve()
+      .then(() => this.execute(spec, abort.signal, onRun))
+      .then(
+        (result) => {
+          handle.result = result;
+          handle.status = abort.signal.aborted ? "killed" : "done";
+        },
+        (error) => {
+          handle.status = abort.signal.aborted ? "killed" : "error";
+          handle.error = error instanceof Error ? error.message : String(error);
+          // A crash before runAudit's own finalize leaves the DB row "running"; reconcile it.
+          if (handle.runId !== undefined) this.reconcile(handle.runId, handle.status === "killed" ? "killed" : "error");
+        },
+      );
+    return { launchId, verb: spec.verb };
+  }
+
+  private execute(spec: LaunchSpec, signal: AbortSignal, onRun: (runId: number) => void): Promise<AuditRunResult | ConfirmRunResult> {
+    const cfg = specToConfig(spec, spec.out ?? this.out);
+    if (spec.verb === "confirm") {
+      if (!spec.inputRunDir) throw new Error("confirm requires inputRunDir (the finished run directory)");
+      return runConfirm(cfg, {
+        inputRunDir: spec.inputRunDir,
+        signal,
+        onRun,
+        ...(spec.maxSteps !== undefined ? { maxSteps: spec.maxSteps } : {}),
+        ...(spec.fresh ? { fresh: true } : {}),
+      });
+    }
+    return runAudit(cfg, {
+      kind: spec.verb,
+      signal,
+      onRun,
+      ...(spec.mockLlm ? { llm: new MockAuditLlmClient() } : {}),
+    });
+  }
+
+  /** Request a cooperative stop of a running run (by its DB run id). */
+  stop(runId: number): boolean {
+    for (const handle of this.runs.values()) {
+      if (handle.runId === runId && handle.status === "running") {
+        handle.abort.abort();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** The rich library result for a run launched this session (AuditRunResult / ConfirmRunResult). */
+  resultFor(runId: number): AuditRunResult | ConfirmRunResult | undefined {
+    for (const handle of this.runs.values()) if (handle.runId === runId) return handle.result;
+    return undefined;
+  }
+
+  active(): ActiveRun[] {
+    return [...this.runs.values()]
+      .filter((handle) => handle.status === "running")
+      .map((handle) => ({ runId: handle.runId, target: handle.spec.target, verb: handle.spec.verb, startedAt: handle.startedAt }));
+  }
+
+  private reconcile(runId: number, status: RunStatus): void {
+    try {
+      this.store.finishRun(runId, status);
+    } catch {
+      // best-effort
+    }
+  }
+}
+
+// Translate a launch spec into `fsa` CLI argv — NOT used to run (the manager runs in-process),
+// but handy for showing the equivalent terminal command. Pure and unit-tested.
 export function buildArgs(spec: LaunchSpec): string[] {
   const args: string[] = [spec.verb];
   if (spec.verb === "confirm") {
@@ -72,84 +213,4 @@ export function buildArgs(spec: LaunchSpec): string[] {
   if (spec.mockLlm) args.push("--mock-llm");
   args.push("--out", spec.out ?? DEFAULT_OUT);
   return args;
-}
-
-interface ChildEntry {
-  spec: LaunchSpec;
-  child: ChildProcess;
-  killedByUs: boolean;
-  startedAt: string;
-  stderr: string[];
-}
-
-export class RunManager {
-  private readonly cliPath: string;
-  private readonly children = new Map<number, ChildEntry>();
-
-  constructor(cliPath?: string) {
-    // Resolve the sibling CLI (dist/cli.js) so the manager does not depend on a global install.
-    this.cliPath = cliPath ?? fileURLToPath(new URL("../cli.js", import.meta.url));
-  }
-
-  /** Spawn an fsa process for the spec. The fsa process records its own DB run row. */
-  launch(spec: LaunchSpec): { pid: number; args: string[] } {
-    const args = buildArgs(spec);
-    const child = spawn(process.execPath, [this.cliPath, ...args], { stdio: ["ignore", "ignore", "pipe"] });
-    const pid = child.pid;
-    if (pid === undefined) throw new Error("failed to spawn fsa process");
-    const entry: ChildEntry = { spec, child, killedByUs: false, startedAt: new Date().toISOString(), stderr: [] };
-    this.children.set(pid, entry);
-    child.stderr?.on("data", (chunk: Buffer) => {
-      entry.stderr.push(chunk.toString());
-      if (entry.stderr.length > 50) entry.stderr.splice(0, entry.stderr.length - 50);
-    });
-    child.on("exit", (code, signal) => {
-      this.children.delete(pid);
-      // fsa marks a clean run `done` itself; only reconcile an abnormal exit so a UI does
-      // not show a dead process as still running.
-      const status: RunStatus = entry.killedByUs || signal === "SIGTERM" ? "killed" : code === 0 ? "done" : "error";
-      if (status === "done") return;
-      try {
-        const store = MetadataStore.openForOutput(spec.out ?? DEFAULT_OUT);
-        store.reconcileRunByPid(pid, status);
-        store.close();
-      } catch {
-        // reconciliation is best-effort; the run row simply stays `running` if it fails
-      }
-    });
-    return { pid, args };
-  }
-
-  /** Continue a project's audit. Resume is the kernel default, so this is just `run` again
-   * (it skips MAP and the already-audited scopes, auditing the next batch). */
-  continueAudit(spec: Omit<LaunchSpec, "verb" | "remap">): { pid: number; args: string[] } {
-    return this.launch({ ...spec, verb: "run" });
-  }
-
-  /** Restart a project's audit from scratch (re-enumerate the scope inventory). */
-  restartAudit(spec: Omit<LaunchSpec, "verb" | "remap">): { pid: number; args: string[] } {
-    return this.launch({ ...spec, verb: "run", remap: true });
-  }
-
-  /** Request a graceful stop of a tracked process. Returns false if the pid is not tracked. */
-  kill(pid: number): boolean {
-    const entry = this.children.get(pid);
-    if (!entry) return false;
-    entry.killedByUs = true;
-    return entry.child.kill("SIGTERM");
-  }
-
-  /** Last stderr lines from a tracked process (for surfacing a launch that failed fast). */
-  stderrTail(pid: number): string {
-    return (this.children.get(pid)?.stderr ?? []).join("");
-  }
-
-  active(): ActiveRun[] {
-    return [...this.children.entries()].map(([pid, entry]) => ({
-      pid,
-      target: entry.spec.target,
-      verb: entry.spec.verb,
-      startedAt: entry.startedAt,
-    }));
-  }
 }

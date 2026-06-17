@@ -35,7 +35,7 @@ export interface AuditRunResult {
 
 export async function runAudit(
   cfg: AuditorConfig,
-  options: { llm?: LlmClient; streamEvents?: boolean; kind?: RunKind } = {},
+  options: { llm?: LlmClient; streamEvents?: boolean; kind?: RunKind; signal?: AbortSignal; onRun?: (runId: number) => void } = {},
 ): Promise<AuditRunResult> {
   const startedAt = new Date();
   const logger = new RunLogger(cfg.outputDir, cfg.targetName, startedAt, { streamEvents: options.streamEvents ?? false });
@@ -126,6 +126,7 @@ export async function runAudit(
         fileManifest,
         ...(scopeNote ? { scopeNote } : {}),
         ...(memoryHint ? { memoryHint } : {}),
+        ...(options.signal ? { signal: options.signal } : {}),
         ...flags,
       });
     }
@@ -154,6 +155,7 @@ export async function runAudit(
   // SQLite tracking: record the project + a running run, then update scope coverage,
   // findings, and final status as the run progresses. Failure-isolated (never throws).
   const recorder = RunRecorder.start(cfg, logger.runDir, options.kind ?? "run", logger);
+  if (recorder.runDbId !== undefined) options.onRun?.(recorder.runDbId); // let an in-process caller learn the DB run id
   // Set when concurrent digs already ran differential confirmation in their own
   // isolated workspaces, so the shared post-loop differential stage skips them.
   let digDifferentialDone = false;
@@ -553,7 +555,7 @@ export async function runAudit(
   const finalCoverage = scopeInventory.length > 0 ? scopeProgress(scopeInventory) : undefined;
   recorder.scopes(scopeInventory);
   recorder.findings(session.findings, logger.runDir, "run finalize");
-  recorder.finish("done", finalCoverage, confirmed.length);
+  recorder.finish(options.signal?.aborted ? "killed" : "done", finalCoverage, confirmed.length);
 
   return {
     runDir: logger.runDir,

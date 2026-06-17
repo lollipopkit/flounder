@@ -3,7 +3,7 @@ import test from "node:test";
 import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { buildArgs } from "../dist/server/run-manager.js";
+import { buildArgs, specToConfig } from "../dist/server/run-manager.js";
 import { MetadataStore } from "../dist/db/store.js";
 
 // buildArgs is the pure core of launching: spec -> fsa CLI argv. The run-manager shells out
@@ -58,6 +58,40 @@ test("buildArgs: restart adds --remap; confirm takes the run dir positionally + 
 
 test("buildArgs: confirm without a run dir is rejected", () => {
   assert.throws(() => buildArgs({ verb: "confirm", target: "p", sourcePaths: ["./s"] }), /inputRunDir/);
+});
+
+// The manager runs the library in-process; specToConfig is the spec -> AuditorConfig
+// translation (the in-process equivalent of the CLI's parseConfig + applyAuditPosture).
+test("specToConfig: posture per verb + unbounded budgets by default", () => {
+  const base = { target: "p", sourcePaths: ["./s"] };
+
+  const run = specToConfig({ ...base, verb: "run" }, "runs");
+  assert.equal(run.auditDeep, true); // run = map -> dig
+  assert.equal(run.outputDir, "runs");
+  assert.equal(Number.isFinite(run.auditMaxSteps), false); // unbounded by default
+  assert.equal(Number.isFinite(run.auditMapSteps), false);
+  assert.equal(Number.isFinite(run.auditDigSteps), false);
+
+  assert.equal(specToConfig({ ...base, verb: "run", quick: true }, "runs").auditDeep, false); // --quick = breadth
+
+  const map = specToConfig({ ...base, verb: "map" }, "runs");
+  assert.equal(map.auditMapOnly, true);
+
+  const region = specToConfig({ ...base, verb: "audit", region: "src/F.sol:10-40" }, "runs");
+  assert.equal(region.auditDeepFocus, "src/F.sol:10-40");
+
+  const scoped = specToConfig({ ...base, verb: "audit", scope: "s1, s2" }, "runs");
+  assert.equal(scoped.auditRequireInventory, true);
+  assert.deepEqual(scoped.auditScopeIds, ["s1", "s2"]);
+
+  // explicit caps + materials + remap are carried
+  const capped = specToConfig({ ...base, verb: "run", buildRoot: ".", model: "gpt-5.5", thinking: "xhigh", maxScopes: 8, mapSteps: 50, remap: true }, "out");
+  assert.equal(capped.buildRoot, ".");
+  assert.equal(capped.auditModel, "gpt-5.5");
+  assert.equal(capped.thinkingLevel, "xhigh");
+  assert.equal(capped.auditMaxScopes, 8);
+  assert.equal(capped.auditMapSteps, 50);
+  assert.equal(capped.auditRemap, true);
 });
 
 test("store: a supervisor reconciles a dead process's still-running row", async () => {

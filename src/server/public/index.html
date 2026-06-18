@@ -64,7 +64,7 @@
   main { display: grid; grid-template-columns: 360px 1fr; height: calc(100vh - 57px); }
   main[hidden], #bugsView[hidden] { display: none; } /* element/id selectors beat the [hidden] UA rule, so restate it */
   #bugsView { height: calc(100vh - 57px); overflow-y: auto; padding: 32px 36px; background: var(--canvas-subtle); }
-  #bugsView .card { max-width: 1100px; }
+  #bugsView .card { max-width: 1180px; margin-left: auto; margin-right: auto; }
   #list { overflow-y: auto; border-right: 1px solid var(--border); padding: 18px; background: var(--canvas); }
   #detail { overflow-y: auto; padding: 32px 36px; background: var(--canvas-subtle); }
   /* multica-style: a calm gray page with white cards. Major detail sections sit in .card. */
@@ -216,12 +216,15 @@
   :root[data-theme="dark"] dialog { box-shadow: 0 16px 32px rgba(1,4,9,.85); }
   dialog::backdrop { background: rgba(31,35,40,.4); }
   .dlg-head { padding: 16px; border-bottom: 1px solid var(--border); font-size: 16px; font-weight: 600; }
-  .md-body { padding: 4px 18px 18px; font-size: 13.5px; line-height: 1.6; color: var(--fg); }
+  .report-dlg { width: min(900px, 94vw); }
+  #reportDialog .dlg-head { padding: 16px 26px; }
+  .md-body { padding: 14px 30px 28px; max-height: 76vh; overflow-y: auto; font-size: 13.5px; line-height: 1.62; color: var(--fg); }
   .md-body h1, .md-body h2, .md-body h3, .md-body h4 { margin: 18px 0 8px; line-height: 1.3; }
   .md-body h1 { font-size: 20px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
   .md-body h2 { font-size: 16px; padding-bottom: 5px; border-bottom: 1px solid var(--border-muted); }
   .md-body h3 { font-size: 14px; } .md-body h4 { font-size: 13px; color: var(--fg-muted); }
-  .md-body p { margin: 8px 0; } .md-body ul { margin: 8px 0; padding-left: 22px; } .md-body li { margin: 3px 0; }
+  .md-body p { margin: 8px 0; } .md-body ul, .md-body ol { margin: 8px 0; padding-left: 22px; } .md-body li { margin: 3px 0; }
+  .md-body blockquote { margin: 10px 0; padding: 4px 0 4px 14px; border-left: 3px solid var(--border); color: var(--fg-muted); }
   .md-body code { background: var(--canvas-subtle); border: 1px solid var(--border-muted); border-radius: 5px; padding: 1px 5px; font: 12px/1.5 var(--mono); }
   .md-body pre { background: var(--canvas-subtle); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; overflow-x: auto; margin: 10px 0; }
   .md-body pre code { background: none; border: 0; padding: 0; font-size: 12px; }
@@ -324,9 +327,9 @@
   <div class="dlg-foot"><button type="button" class="btn" id="cfgCancelBtn">Cancel</button><button class="btn primary" id="cfgSaveBtn" value="save">Save config</button></div>
 </form></dialog>
 
-<dialog id="reportDialog" class="wide"><div>
-  <div class="dlg-head" style="display:flex;align-items:center;gap:10px"><span id="reportTitle">Report</span><button type="button" class="btn sm" id="reportClose" style="margin-left:auto">Close</button></div>
-  <div id="reportBody" class="md-body" style="max-height:74vh;overflow-y:auto;padding:4px 2px"></div>
+<dialog id="reportDialog" class="report-dlg"><div>
+  <div class="dlg-head" style="display:flex;align-items:center;gap:10px"><span id="reportTitle" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Report</span><button type="button" class="btn sm" id="reportCopy" style="margin-left:auto">Copy</button><button type="button" class="btn sm" id="reportClose">Close</button></div>
+  <div id="reportBody" class="md-body"></div>
 </div></dialog>
 
 <dialog id="settingsDialog" class="wide"><div>
@@ -482,32 +485,45 @@ function mdToHtml(md) {
     .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
     .replace(/\[([^\]]+)\]\((https?:[^)\s"'<>]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
   const lines = esc(String(md || "")).split("\n");
-  let html = "", para = [], inList = false, inCode = false, code = [];
+  let html = "", para = [], list = "", inCode = false, code = [], inQuote = false;
   const flushPara = () => { if (para.length) { html += "<p>" + inline(para.join(" ")) + "</p>"; para = []; } };
-  const flushList = () => { if (inList) { html += "</ul>"; inList = false; } };
+  const flushList = () => { if (list) { html += "</" + list + ">"; list = ""; } };
+  const flushQuote = () => { if (inQuote) { html += "</blockquote>"; inQuote = false; } };
+  const flushAll = () => { flushPara(); flushList(); flushQuote(); };
   for (const line of lines) {
     if (/^```/.test(line.trim())) {
       if (inCode) { html += "<pre><code>" + code.join("\n") + "</code></pre>"; code = []; inCode = false; }
-      else { flushPara(); flushList(); inCode = true; }
+      else { flushAll(); inCode = true; }
       continue;
     }
     if (inCode) { code.push(line); continue; }
     const h = line.match(/^(#{1,6})\s+(.*)$/);
-    if (h) { flushPara(); flushList(); html += "<h" + h[1].length + ">" + inline(h[2]) + "</h" + h[1].length + ">"; continue; }
-    if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) { flushPara(); flushList(); html += "<hr>"; continue; }
-    const li = line.match(/^\s*[-*]\s+(.*)$/);
-    if (li) { flushPara(); if (!inList) { html += "<ul>"; inList = true; } html += "<li>" + inline(li[1]) + "</li>"; continue; }
-    if (line.trim() === "") { flushPara(); flushList(); continue; }
+    if (h) { flushAll(); html += "<h" + h[1].length + ">" + inline(h[2]) + "</h" + h[1].length + ">"; continue; }
+    if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) { flushAll(); html += "<hr>"; continue; }
+    const ul = line.match(/^\s*[-*]\s+(.*)$/), ol = line.match(/^\s*\d+\.\s+(.*)$/);
+    if (ul || ol) {
+      flushPara(); flushQuote();
+      const want = ul ? "ul" : "ol";
+      if (list !== want) { flushList(); html += "<" + want + ">"; list = want; }
+      html += "<li>" + inline(ul ? ul[1] : ol[1]) + "</li>";
+      continue;
+    }
+    const q = line.match(/^\s*>\s?(.*)$/);
+    if (q) { flushPara(); flushList(); if (!inQuote) { html += "<blockquote>"; inQuote = true; } html += inline(q[1]) + "<br>"; continue; }
+    if (line.trim() === "") { flushAll(); continue; }
     para.push(line.trim());
   }
   if (inCode) html += "<pre><code>" + code.join("\n") + "</code></pre>";
-  flushPara(); flushList();
+  flushAll();
   return html || '<div class="muted">(empty report)</div>';
 }
 function prettyJson(t) { try { return JSON.stringify(JSON.parse(t), null, 2); } catch { return t; } }
+let reportRaw = ""; // the raw report source, for the Copy button (markdown, or pretty-printed JSON)
 async function openReport(runId, name, title) {
   const body = $("#reportBody"), dlg = $("#reportDialog");
   $("#reportTitle").textContent = title || name;
+  $("#reportCopy").textContent = "Copy";
+  reportRaw = "";
   body.innerHTML = '<div class="muted">Loading ' + esc(name) + '…</div>';
   if (!dlg.open) dlg.showModal();
   try {
@@ -519,7 +535,10 @@ async function openReport(runId, name, title) {
       return;
     }
     const text = await res.text();
-    body.innerHTML = name.endsWith(".json") ? '<pre><code>' + esc(prettyJson(text)) + '</code></pre>' : mdToHtml(text);
+    const isJson = name.endsWith(".json");
+    reportRaw = isJson ? prettyJson(text) : text;
+    body.innerHTML = isJson ? '<pre><code>' + esc(prettyJson(text)) + '</code></pre>' : mdToHtml(text);
+    body.scrollTop = 0;
   } catch (err) {
     body.innerHTML = '<div class="muted">Failed to fetch report: ' + esc(String(err)) + '</div>';
   }
@@ -924,6 +943,11 @@ $("#settingsBtn").innerHTML = icon("gear");
 $("#settingsBtn").onclick = () => openSettings("providers");
 $("#settingsCloseBtn").onclick = () => settingsDialog.close();
 $("#reportClose").onclick = () => $("#reportDialog").close();
+$("#reportCopy").onclick = async () => {
+  if (!reportRaw) return;
+  try { await navigator.clipboard.writeText(reportRaw); $("#reportCopy").textContent = "Copied"; setTimeout(() => { $("#reportCopy").textContent = "Copy"; }, 1500); }
+  catch { $("#reportCopy").textContent = "Copy failed"; }
+};
 document.querySelectorAll(".settings-nav button").forEach((b) => (b.onclick = () => showPane(b.dataset.pane)));
 function showPane(name) {
   document.querySelectorAll(".settings-nav button").forEach((b) => b.classList.toggle("sel", b.dataset.pane === name));

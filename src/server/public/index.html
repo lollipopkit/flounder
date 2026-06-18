@@ -6,47 +6,48 @@
 <title>Flounder — audit tracker</title>
 <link rel="icon" type="image/png" href="data:image/png;base64,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" />
 <style>
-  /* GitHub Primer — LIGHT is the default; [data-theme="dark"] overrides. */
+  /* Clean minimal palette — neutral ink + one restrained indigo accent (multica-inspired, re-implemented).
+     LIGHT is :root; [data-theme="dark"] overrides. Dark is the first-load default (see theme init). */
   :root {
-    --canvas: #ffffff; --canvas-subtle: #f6f8fa; --canvas-inset: #f6f8fa;
-    --border: #d0d7de; --border-muted: #d8dee4;
-    --fg: #1f2328; --fg-muted: #636c76; --fg-subtle: #6e7781;
-    --accent: #0969da; --accent-emphasis: #0969da;
-    --success-fg: #1a7f37; --success-emphasis: #1f883d; --success-hover: #1a7f37;
-    --teal-fg: #117f8a; --attention-fg: #9a6700; --danger-fg: #cf222e; --danger-emphasis: #cf222e; --done-fg: #8250df;
-    --neutral-emphasis: #6e7781;
-    --btn-bg: #f6f8fa; --btn-border: rgba(31,35,40,.15); --btn-hover: #eef0f2; --btn-fg: #24292f;
-    --sel-bg: #ddf4ff; --focus: rgba(9,105,218,.3);
+    --canvas: #ffffff; --canvas-subtle: #fafafa; --canvas-inset: #f4f4f5;
+    --border: #e7e7ea; --border-muted: #efeff0;
+    --fg: #18181b; --fg-muted: #6a6a72; --fg-subtle: #8a8a90;
+    --accent: #5b54d6; --accent-emphasis: #5b54d6; --accent-hover: #4e47c4;
+    --success-fg: #1f9d57; --success-emphasis: #1f9d57; --success-hover: #18834a;
+    --teal-fg: #0f8a8a; --attention-fg: #b07a14; --danger-fg: #d6453c; --danger-emphasis: #d6453c; --done-fg: #6c5ce0;
+    --neutral-emphasis: #8a8a90;
+    --btn-bg: #fafafa; --btn-border: rgba(0,0,0,.12); --btn-hover: #f1f1f2; --btn-fg: #18181b;
+    --sel-bg: #ececfb; --focus: rgba(91,84,214,.3);
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
     --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
   }
   :root[data-theme="dark"] {
-    --canvas: #0d1117; --canvas-subtle: #161b22; --canvas-inset: #010409;
-    --border: #30363d; --border-muted: #21262d;
-    --fg: #e6edf3; --fg-muted: #7d8590; --fg-subtle: #6e7681;
-    --accent: #2f81f7; --accent-emphasis: #1f6feb;
-    --success-fg: #3fb950; --success-emphasis: #238636; --success-hover: #2ea043;
-    --teal-fg: #56d4dd; --attention-fg: #d29922; --danger-fg: #f85149; --danger-emphasis: #da3633; --done-fg: #a371f7;
-    --neutral-emphasis: #6e7681;
-    --btn-bg: #21262d; --btn-border: rgba(240,246,252,.1); --btn-hover: #30363d; --btn-fg: #e6edf3;
-    --sel-bg: #122033; --focus: rgba(47,129,247,.3);
+    --canvas: #0d0d0f; --canvas-subtle: #161619; --canvas-inset: #09090b;
+    --border: #27272b; --border-muted: #1d1d21;
+    --fg: #ededee; --fg-muted: #9a9aa1; --fg-subtle: #6a6a71;
+    --accent: #a6a4f6; --accent-emphasis: #6c63e8; --accent-hover: #7c73f0;
+    --success-fg: #5cc08b; --success-emphasis: #2f9e6a; --success-hover: #36a873;
+    --teal-fg: #5cc7c2; --attention-fg: #d6a44e; --danger-fg: #e8746b; --danger-emphasis: #d85b51; --done-fg: #a78bf0;
+    --neutral-emphasis: #6a6a71;
+    --btn-bg: #1b1b1f; --btn-border: rgba(255,255,255,.1); --btn-hover: #232329; --btn-fg: #ededee;
+    --sel-bg: #1b1b2e; --focus: rgba(108,99,232,.4);
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--canvas); color: var(--fg); font: 14px/1.5 var(--sans); }
   a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
 
   /* Global header — always dark (github.com style) */
-  header { display: flex; align-items: center; gap: 12px; padding: 12px 16px; background: #24292f; color: #e6edf3; border-bottom: 1px solid #1b1f24; position: sticky; top: 0; z-index: 5; }
-  header h1 { font-size: 15px; margin: 0; font-weight: 600; color: #fff; }
-  header .sub { color: #9da7b1; font-size: 13px; }
+  header { display: flex; align-items: center; gap: 12px; padding: 12px 16px; background: #141417; color: #ededee; border-bottom: 1px solid #1d1d21; position: sticky; top: 0; z-index: 5; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 500; color: #fff; }
+  header .sub { color: #9a9aa1; font-size: 13px; }
   header .spacer { flex: 1; }
-  .icon-btn { background: transparent; border: 1px solid transparent; color: #9da7b1; border-radius: 6px; padding: 5px; cursor: pointer; display: inline-flex; }
+  .icon-btn { background: transparent; border: 1px solid transparent; color: #9a9aa1; border-radius: 6px; padding: 5px; cursor: pointer; display: inline-flex; }
   .icon-btn:hover { color: #fff; border-color: rgba(255,255,255,.2); }
 
   .btn { font: 500 14px/20px var(--sans); cursor: pointer; background: var(--btn-bg); color: var(--btn-fg); border: 1px solid var(--btn-border); border-radius: 6px; padding: 5px 16px; display: inline-flex; align-items: center; gap: 6px; }
   .btn:hover { background: var(--btn-hover); }
-  .btn.primary { background: var(--success-emphasis); color: #fff; border-color: rgba(27,31,36,.15); }
-  .btn.primary:hover { background: var(--success-hover); }
+  .btn.primary { background: var(--accent-emphasis); color: #fff; border-color: transparent; }
+  .btn.primary:hover { background: var(--accent-hover); }
   .btn.danger { color: var(--danger-fg); }
   .btn.danger:hover { background: var(--danger-emphasis); color: #fff; border-color: var(--danger-emphasis); }
   .btn.sm { padding: 3px 12px; font-size: 12px; }
@@ -372,7 +373,7 @@ function pct(a, t) { return t > 0 ? Math.round((a / t) * 100) : 0; }
 // --- theme ---
 function applyTheme(t) { document.documentElement.dataset.theme = t === "dark" ? "dark" : ""; localStorage.setItem("flounder-theme", t); $("#themeBtn").innerHTML = icon(t === "dark" ? "sun" : "moon"); }
 $("#themeBtn").onclick = () => applyTheme((localStorage.getItem("flounder-theme") === "dark") ? "light" : "dark");
-applyTheme(localStorage.getItem("flounder-theme") || "light");
+applyTheme(localStorage.getItem("flounder-theme") || "dark");
 
 // --- project list ---
 function renderList() {

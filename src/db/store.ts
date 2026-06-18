@@ -590,6 +590,10 @@ export class MetadataStore {
     return this.db.prepare("SELECT * FROM job WHERE id = ?").get(jobId) as Record<string, unknown> | undefined;
   }
 
+  getJobByRun(runId: number): Record<string, unknown> | undefined {
+    return this.db.prepare("SELECT * FROM job WHERE run_id = ?").get(runId) as Record<string, unknown> | undefined;
+  }
+
   /** Job ids flagged for cancel that a daemon is still working — daemons poll this to abort. */
   canceledJobIds(): number[] {
     return (this.db.prepare("SELECT id FROM job WHERE cancel = 1 AND status IN ('dispatched','running')").all() as Array<{ id: number }>).map((row) => row.id);

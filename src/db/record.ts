@@ -151,7 +151,7 @@ function isConfirmedLike(status: string): boolean {
   return status === "confirmed-source" || status === "confirmed-executable" || status === "confirmed-differential";
 }
 
-function toFindingRow(finding: AgentFinding, runDir: string): FindingRow {
+export function toFindingRow(finding: AgentFinding, runDir: string): FindingRow {
   return {
     findingKey: finding.id,
     title: finding.title,
@@ -164,7 +164,7 @@ function toFindingRow(finding: AgentFinding, runDir: string): FindingRow {
   };
 }
 
-function toScopeRow(scope: AuditScope): ScopeRow {
+export function toScopeRow(scope: AuditScope): ScopeRow {
   return {
     scopeId: scope.id,
     title: scope.obligation,
@@ -176,7 +176,7 @@ function toScopeRow(scope: AuditScope): ScopeRow {
 
 // A readable snapshot of the per-project settings a UI can display/edit. Unbounded
 // (non-finite) budgets are stored as null so the UI reads null = "no cap".
-function configSnapshot(cfg: AuditorConfig): Record<string, unknown> {
+export function configSnapshot(cfg: AuditorConfig): Record<string, unknown> {
   const finite = (n: number): number | null => (Number.isFinite(n) ? n : null);
   return {
     provider: cfg.provider,

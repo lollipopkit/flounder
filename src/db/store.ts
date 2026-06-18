@@ -20,7 +20,7 @@ import path from "node:path";
 // module evaluation (after the static sqlite-quiet import has run) lets the filter catch it.
 const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite");
 
-export type RunKind = "run" | "map" | "audit" | "verify" | "confirm";
+export type RunKind = "run" | "map" | "audit" | "verify" | "confirm" | "prepare";
 export type RunStatus = "running" | "done" | "error" | "killed";
 export type ScopeStatus = "pending" | "audited" | "deferred";
 export type FindingStatus = "suspected" | "confirmed-executable" | "confirmed-differential" | "refuted";

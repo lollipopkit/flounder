@@ -8,6 +8,7 @@ import { publicPath } from "../util/paths.js";
 import { ProjectMemory } from "./memory.js";
 import { isPiSessionProvider, runAuditSession } from "./pi-session.js";
 import { buildTools, newSession, type AgentSession, type ToolContext } from "./tools.js";
+import { RunRecorder, type RunTrackerFactory } from "../db/record.js";
 
 // `flounder prepare` — the open-world ACQUISITION phase that runs BEFORE map. Given a clue
 // (a tx, an address, a project, a package, a repo, a link), it resolves the complete dependency
@@ -49,6 +50,8 @@ export async function runPrepare(
     maxSteps?: number;
     streamEvents?: boolean;
     signal?: AbortSignal;
+    onRun?: (runId: number) => void;
+    makeTracker?: RunTrackerFactory;
   },
 ): Promise<PrepareRunResult> {
   // Prepare fetches source and reads live chains, so it needs a real network-capable agent.
@@ -81,6 +84,13 @@ export async function runPrepare(
   const memory = new ProjectMemory(path.join(projectHistoryDir(historyLocation(stagedCfg)), "memory.jsonl"));
   const ctx: ToolContext = { cfg: stagedCfg, source: [], corpus: [], memory, logger, session };
   const tools = buildTools();
+
+  // SQLite tracking: record this prepare under the SAME project store the UI reads, so a
+  // CLI-run prepare shows up in the UI exactly like run/map/audit/confirm. makeTracker lets a
+  // UI-dispatched daemon supply its own tracker; the default opens <outputDir>/flounder.db.
+  // Failure-isolated: a disabled recorder is a no-op, the prepare still runs.
+  const recorder = (options.makeTracker ?? RunRecorder.start)(stagedCfg, logger.runDir, "prepare", logger);
+  if (recorder.runDbId !== undefined) options.onRun?.(recorder.runDbId);
 
   const matchLine = options.matchDeployed
     ? "REQUIRED where a live deployed/published instance exists — prove the staged source is the code actually running there (use whatever the platform offers); mark any deployed component you cannot match as \"unverified\". If there is NO live instance, match is \"n/a\" — pin the exact source origin (repo+revision / package+version / path+digest) instead. Either way, never present unmatched source as the target."
@@ -124,6 +134,8 @@ export async function runPrepare(
     sourcePinned: validation.sourcePinned,
     issues: validation.issues.length,
   });
+
+  recorder.finish(manifest !== undefined ? "done" : "error");
 
   return { runDir: logger.runDir, workspaceDir: workspace.absolute, manifest: manifest ?? null, validation };
 }

@@ -248,6 +248,26 @@ const ROUTES: Route[] = [
   }),
 
   route({
+    method: "POST", path: "/api/launch",
+    summary: "Queue an ad-hoc run from a full launch spec (absolute materials, no project staging) — the entry point the CLI drives. Upserts a project row keyed by `target` so the run is grouped + visible, enqueues the job, and nudges daemons. Use POST /api/projects/:name/runs instead to launch a UI-configured project.",
+    body: {
+      verb: "'run' | 'map' | 'audit' | 'confirm' | 'prepare' (required)", target: "string (required) — run/project name",
+      sourcePaths: "string[] — ABSOLUTE code paths the daemon reads", corpusPaths: "string[]? — ABSOLUTE design/reference paths", buildRoot: "string? — ABSOLUTE buildable root",
+      provider: "string?", model: "string?", thinking: "string?",
+      maxScopes: "number?", mapSteps: "number?", digSteps: "number?", maxSteps: "number?", digSamples: "number?", digConcurrency: "number?",
+      remap: "boolean?", quick: "boolean?", mockLlm: "boolean?", region: "string?", scope: "string?",
+      inputRunDir: "string? — confirm", fresh: "boolean? — confirm",
+      clue: "string? — prepare", posture: "string? — prepare", matchDeployed: "boolean? — prepare", endpoint: "string? — prepare",
+    },
+    handler: launch,
+  }),
+  route({
+    method: "GET", path: "/api/jobs/:id",
+    summary: "A queued/dispatched/running job (status, run_id once a daemon starts it, error). Poll after POST /api/launch to follow a CLI-launched run to its run id, then stream GET /api/runs/:id/log.",
+    params: { id: "job id" },
+    handler: (c) => { const job = c.store.getJob(Number(c.params.id)); job ? sendJson(c.res, 200, { job }) : sendJson(c.res, 404, { error: "no such job" }); },
+  }),
+  route({
     method: "GET", path: "/api/runs/:id",
     summary: "A single run (status, kind, coverage, finding count, run dir, timestamps).",
     params: { id: "run id" },
@@ -450,6 +470,73 @@ async function runLaunch(c: Ctx): Promise<void> {
   const jobId = c.store.enqueueJob(spec.target, spec);
   c.plane.nudge();
   sendJson(c.res, 200, { jobId, verb: spec.verb, queued: true, daemons: c.plane.daemonCount() });
+}
+
+// Queue an ad-hoc run from a full launch spec — the CLI's enqueue entry point. Unlike
+// runLaunch (which resolves a configured project's staged materials under a daemon workspace),
+// this takes the spec as-is: ABSOLUTE materials, no `dir`, so the (co-located) daemon resolves
+// them verbatim. A project row is upserted purely so the run is grouped + visible in the UI.
+async function launch(c: Ctx): Promise<void> {
+  const body = (await readBody(c.req)) as Record<string, unknown>;
+  const target = String(body.target ?? "").trim();
+  const verb = String(body.verb ?? "").trim();
+  if (!target) return sendJson(c.res, 400, { error: "target is required" });
+  if (!["run", "map", "audit", "confirm", "prepare"].includes(verb)) {
+    return sendJson(c.res, 400, { error: "verb must be one of run | map | audit | confirm | prepare" });
+  }
+  const spec = normalizeLaunchSpec(body, target, verb as RunKind, c.out);
+  if (!c.store.getProject(target)) {
+    c.store.upsertProject({ name: target, sourcePaths: spec.sourcePaths, ...(spec.buildRoot ? { buildRoot: spec.buildRoot } : {}), corpusPaths: spec.corpusPaths ?? [], config: launchDisplayConfig(spec) });
+  }
+  const jobId = c.store.enqueueJob(target, spec);
+  c.plane.nudge();
+  sendJson(c.res, 200, { jobId, verb: spec.verb, queued: true, daemons: c.plane.daemonCount() });
+}
+
+// Coerce a /api/launch body into a clean LaunchSpec (drop non-finite/wrong-typed values; no
+// `dir` — the CLI sends absolute paths). Mirrors the CLI's own spec build on the receiving end.
+function normalizeLaunchSpec(body: Record<string, unknown>, target: string, verb: RunKind, out: string): LaunchSpec {
+  const str = (v: unknown): string | undefined => (typeof v === "string" && v.trim() ? v.trim() : undefined);
+  const num = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+  const bool = (v: unknown): boolean | undefined => (typeof v === "boolean" ? v : undefined);
+  const list = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
+  return {
+    verb,
+    target,
+    sourcePaths: list(body.sourcePaths),
+    corpusPaths: list(body.corpusPaths),
+    buildRoot: str(body.buildRoot),
+    provider: str(body.provider),
+    model: str(body.model),
+    thinking: str(body.thinking),
+    maxScopes: num(body.maxScopes),
+    mapSteps: num(body.mapSteps),
+    digSteps: num(body.digSteps),
+    maxSteps: num(body.maxSteps),
+    digSamples: num(body.digSamples),
+    digConcurrency: num(body.digConcurrency),
+    remap: bool(body.remap),
+    fresh: bool(body.fresh),
+    quick: bool(body.quick),
+    mockLlm: bool(body.mockLlm),
+    region: str(body.region),
+    scope: str(body.scope),
+    inputRunDir: str(body.inputRunDir),
+    clue: str(body.clue),
+    posture: str(body.posture),
+    matchDeployed: bool(body.matchDeployed),
+    endpoint: str(body.endpoint),
+    out,
+  };
+}
+
+// The project-row config_json for a launched ad-hoc run (display only; the daemon runs the spec).
+function launchDisplayConfig(spec: LaunchSpec): Record<string, unknown> {
+  const cfg: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries({ provider: spec.provider, model: spec.model, thinking: spec.thinking, maxScopes: spec.maxScopes, mapSteps: spec.mapSteps, digSteps: spec.digSteps, digSamples: spec.digSamples, digConcurrency: spec.digConcurrency })) {
+    if (v !== undefined) cfg[k] = v;
+  }
+  return cfg;
 }
 
 function findingsList(c: Ctx): void {

@@ -15,7 +15,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { MetadataStore, type RunKind, type Coverage, type ProviderInput, type ProviderProfile, type ProjectInput } from "../db/store.js";
+import { MetadataStore, type RunKind, type Coverage, type ProviderInput, type ProviderProfile, type ProjectInput, type ProviderRoles, type RoleOverride } from "../db/store.js";
 import { getProviders, getModels } from "@earendil-works/pi-ai";
 import { type LaunchSpec, ActivityBus } from "./run-manager.js";
 import { projectHistoryDir } from "../trace/history.js";
@@ -897,20 +897,40 @@ function launchSpec(project: Record<string, unknown>, body: Record<string, unkno
     const arr = Array.isArray(v) ? v : (safeParse(fallback) as unknown[]) ?? [];
     return arr.filter((x): x is string => typeof x === "string");
   };
-  // Provider/model/thinking + per-phase overrides come from the selected profile; fall back
-  // to inline config for legacy projects with no profile. Materials are RELATIVE to the
-  // project dir (resolved on the daemon against its workspace); dir defaults to the name.
+  // The VENDOR comes from the selected profile; MODEL + THINKING come from the project's
+  // per-phase config (cfg.phases). Each verb has a "primary" phase that drives the run's
+  // top-level model/thinking; an audit run (run/audit/map) additionally maps map/dig into
+  // roles (refute follows dig). Legacy projects with profile-baked model/thinking/roles still
+  // resolve via the profile fallback. Materials are RELATIVE to the project dir (resolved on
+  // the daemon against its workspace); dir defaults to the name.
+  const verb = (typeof body.verb === "string" ? body.verb : "run") as RunKind;
+  const phases = (merged.phases && typeof merged.phases === "object" ? merged.phases : {}) as Record<string, { model?: unknown; thinking?: unknown }>;
+  const primaryPhase = verb === "prepare" ? "prepare" : verb === "map" ? "map" : verb === "confirm" ? "confirm" : "dig";
+  const phaseModel = (ph: string): string | undefined => str(phases[ph]?.model);
+  const phaseThinking = (ph: string): string | undefined => str(phases[ph]?.thinking);
+  const roleEntry = (ph: string): RoleOverride | undefined => {
+    const model = phaseModel(ph), thinking = phaseThinking(ph);
+    return model || thinking ? { ...(model ? { model } : {}), ...(thinking ? { thinking } : {}) } : undefined;
+  };
+  const roles: ProviderRoles = {};
+  if (verb === "run" || verb === "audit" || verb === "map") {
+    for (const [role, ph] of [["map", "map"], ["dig", "dig"], ["refute", "dig"]] as const) {
+      const e = roleEntry(ph);
+      if (e) roles[role] = e;
+    }
+  }
+  const legacyRoles = profile && Object.keys(profile.roles).length > 0 ? profile.roles : undefined;
   return {
-    verb: (typeof body.verb === "string" ? body.verb : "run") as RunKind,
+    verb,
     target: String(project.name),
     dir: str(project.dir) ?? String(project.name),
     sourcePaths: list(overrides.sourcePaths, project.source_paths),
     buildRoot: str(overrides.buildRoot) ?? str(project.build_root),
     corpusPaths: list(overrides.corpusPaths, project.corpus_paths),
     provider: profile?.provider ?? str(merged.provider),
-    model: profile?.model ?? str(merged.model),
-    thinking: profile?.thinking ?? str(merged.thinking),
-    models: profile && Object.keys(profile.roles).length > 0 ? profile.roles : undefined,
+    model: phaseModel(primaryPhase) ?? str(profile?.model) ?? str(merged.model),
+    thinking: phaseThinking(primaryPhase) ?? str(profile?.thinking) ?? str(merged.thinking),
+    models: Object.keys(roles).length > 0 ? roles : legacyRoles,
     maxScopes: num(merged.maxScopes),
     mapSteps: num(merged.mapSteps),
     digSteps: num(merged.digSteps),

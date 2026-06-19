@@ -5,7 +5,7 @@
 // and calling them. The UI is just one client of this API.
 //
 // Execution is DECOUPLED: this server owns the SQLite DB and a job queue but never runs an
-// audit itself. One or more `fsa daemon` processes (possibly on other machines) connect,
+// audit itself. One or more `flounder daemon` processes (possibly on other machines) connect,
 // claim queued jobs, run runAudit/runConfirm locally (code + provider keys stay on the
 // daemon), and report progress back over HTTP. Server→daemon nudges (poll/cancel) ride an
 // SSE stream; daemon→server updates are POSTs. Zero-dependency: Node's built-in http + a
@@ -13,8 +13,10 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { readFileSync } from "node:fs";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { MetadataStore, type RunKind, type Coverage } from "../db/store.js";
+import { MetadataStore, type RunKind, type Coverage, type ProviderInput, type ProviderProfile, type ProjectInput, type ProviderRoles, type RoleOverride } from "../db/store.js";
+import { getProviders, getModels } from "@earendil-works/pi-ai";
 import { type LaunchSpec, ActivityBus } from "./run-manager.js";
 import { projectHistoryDir } from "../trace/history.js";
 import { loadScopeInventory, saveScopeInventory } from "../agent/scope-store.js";
@@ -24,7 +26,7 @@ function loadUiHtml(): string {
   try {
     return readFileSync(UI_HTML_PATH, "utf8");
   } catch {
-    return "<!doctype html><meta charset=utf-8><body style='font-family:sans-serif;padding:2rem'>fsa UI asset missing — run <code>npm run build</code>.</body>";
+    return "<!doctype html><meta charset=utf-8><body style='font-family:sans-serif;padding:2rem'>flounder UI asset missing — run <code>npm run build</code>.</body>";
   }
 }
 
@@ -163,14 +165,16 @@ const ROUTES: Route[] = [
   }),
   route({
     method: "POST", path: "/api/projects/:name/runs",
-    summary: "Queue a run on the project (start/continue an audit, restart, map, audit a region/scope, or confirm). The job is dispatched to a connected daemon, which executes it and reports back. Uses the project's stored materials + config unless overridden. This is the single action behind the UI's Start/Continue/Restart/Run buttons.",
+    summary: "Queue a run on the project (start/continue an audit, restart, map, audit a region/scope, confirm, or prepare). The job is dispatched to a connected daemon, which executes it and reports back. Uses the project's stored materials + config unless overridden. This is the single action behind the UI's Start/Continue/Restart/Run buttons.",
     params: { name: "project name" },
     body: {
-      verb: "'run' | 'map' | 'audit' | 'confirm' (default 'run'; run = map→dig, resumes)",
+      verb: "'run' | 'map' | 'audit' | 'confirm' | 'prepare' (default 'run'; run = map→dig, resumes)",
       remap: "boolean? — re-enumerate scopes (restart)", fresh: "boolean? — confirm: ignore a prior interrupted confirm",
       quick: "boolean? — run: single breadth pass", mockLlm: "boolean? — offline mock model",
-      region: "string? — audit: pinned region e.g. src/Foo.sol:120-180", scope: "string? — audit: scope id(s)",
+      region: "string? — audit: pinned region e.g. src/Foo.sol:120-180", scope: "string? — audit: scope id(s)", verifyFindings: "object|array? — audit: inline suspected finding(s) to confirm-or-refute by execution",
       inputRunDir: "string? — confirm: the finished run dir to reproduce",
+      clue: "string? — prepare: the tx / address / project / link to acquire from",
+      posture: "string? — prepare: 'blind' | 'informed'", matchDeployed: "boolean? — prepare: prove staged source matches the live deployment (default true)", endpoint: "string? — prepare: read-only access hint (e.g. RPC URL)",
       overrides: "object? — { sourcePaths, buildRoot, corpusPaths, config } one-off overrides of the stored project",
     },
     handler: runLaunch,
@@ -203,6 +207,112 @@ const ROUTES: Route[] = [
   }),
 
   route({
+    method: "GET", path: "/api/providers",
+    summary: "List saved provider profiles — a reusable model strategy (provider + model + thinking, with optional per-phase map/dig/refute overrides) that a project selects.",
+    handler: (c) => sendJson(c.res, 200, { providers: c.store.listProviders() }),
+  }),
+  route({
+    method: "POST", path: "/api/providers",
+    summary: "Create a provider profile.",
+    body: { name: "string (unique)", provider: "pi-ai provider id, or claude-code / codex-cli / mock", model: "string? — default model", thinking: "minimal|low|medium|high|xhigh?", roles: "object? — per-phase overrides { map|dig|refute: { provider?, model?, thinking? } }" },
+    handler: providerCreate,
+  }),
+  route({
+    method: "GET", path: "/api/pi/providers",
+    summary: "Providers pi-ai can drive (for the profile editor), plus the CLI fallbacks. Discovery, not the saved resource.",
+    handler: (c) => sendJson(c.res, 200, { providers: availableProviders() }),
+  }),
+  route({
+    method: "GET", path: "/api/pi/models/:provider",
+    summary: "Models pi-ai exposes for a provider (id, name, reasoning) — for the model dropdown.",
+    params: { provider: "provider id" },
+    handler: (c) => sendJson(c.res, 200, { models: availableModels(c.params.provider ?? "") }),
+  }),
+  route({
+    method: "GET", path: "/api/providers/:id",
+    summary: "A single provider profile.",
+    params: { id: "provider id" },
+    handler: (c) => { const p = c.store.getProvider(Number(c.params.id)); p ? sendJson(c.res, 200, { provider: p }) : sendJson(c.res, 404, { error: "no such provider" }); },
+  }),
+  route({
+    method: "PATCH", path: "/api/providers/:id",
+    summary: "Update a provider profile.",
+    params: { id: "provider id" },
+    body: { name: "string?", provider: "string?", model: "string?", thinking: "string?", roles: "object?" },
+    handler: providerUpdate,
+  }),
+  route({
+    method: "DELETE", path: "/api/providers/:id",
+    summary: "Delete a provider profile.",
+    params: { id: "provider id" },
+    handler: (c) => { const ok = c.store.deleteProvider(Number(c.params.id)); ok ? sendJson(c.res, 200, { ok: true, deleted: Number(c.params.id) }) : sendJson(c.res, 404, { error: "no such provider" }); },
+  }),
+
+  route({
+    method: "GET", path: "/api/daemons",
+    summary: "Registered execution-plane daemons (id, name, workspace, last_seen_at) — no tokens.",
+    handler: (c) => sendJson(c.res, 200, { daemons: c.store.listDaemons() }),
+  }),
+  route({
+    method: "POST", path: "/api/daemons",
+    summary: "Register a daemon and mint its bearer token (shown ONCE). Configure it on the daemon: flounder daemon --server <url> --token <token>.",
+    body: { name: "string (required) — a label for this executor" },
+    handler: daemonCreate,
+  }),
+  route({
+    method: "PATCH", path: "/api/daemons/:id",
+    summary: "Rename a daemon (the token is unchanged).",
+    params: { id: "daemon id" },
+    body: { name: "string (required)" },
+    handler: daemonRename,
+  }),
+  route({
+    method: "DELETE", path: "/api/daemons/:id",
+    summary: "Revoke a daemon registration (its token stops working; past jobs keep their history).",
+    params: { id: "daemon id" },
+    handler: (c) => { const ok = c.store.deleteDaemon(Number(c.params.id)); ok ? sendJson(c.res, 200, { ok: true, deleted: Number(c.params.id) }) : sendJson(c.res, 404, { error: "no such daemon" }); },
+  }),
+
+  route({
+    method: "GET", path: "/api/bugs",
+    summary: "Every finding across ALL projects (joined with project name) plus aggregate stats — the cross-project Bugs dashboard. Optional ?status= and ?tracking= filters; ?limit/&offset paginate.",
+    handler: (c) => {
+      const status = c.url.searchParams.get("status") || undefined;
+      const tracking = c.url.searchParams.get("tracking") || undefined;
+      const limit = Number(c.url.searchParams.get("limit")) || undefined;
+      const offset = Number(c.url.searchParams.get("offset")) || undefined;
+      sendJson(c.res, 200, { findings: c.store.listGlobalFindings({ status, tracking, limit, offset }), stats: c.store.globalFindingStats() });
+    },
+  }),
+  route({
+    method: "PATCH", path: "/api/findings/:id/tracking",
+    summary: "Set a finding's submission-tracking state (open|triaging|submitted|accepted|fixed|duplicate|rejected) — for following a bug from discovery to vendor disclosure.",
+    params: { id: "finding id" },
+    body: { status: "open|triaging|submitted|accepted|fixed|duplicate|rejected" },
+    handler: findingTracking,
+  }),
+
+  route({
+    method: "POST", path: "/api/launch",
+    summary: "Queue an ad-hoc run from a full launch spec (absolute materials, no project staging) — the entry point the CLI drives. Upserts a project row keyed by `target` so the run is grouped + visible, enqueues the job, and nudges daemons. Use POST /api/projects/:name/runs instead to launch a UI-configured project.",
+    body: {
+      verb: "'run' | 'map' | 'audit' | 'confirm' | 'prepare' (required)", target: "string (required) — run/project name",
+      sourcePaths: "string[] — ABSOLUTE code paths the daemon reads", corpusPaths: "string[]? — ABSOLUTE design/reference paths", buildRoot: "string? — ABSOLUTE buildable root",
+      provider: "string?", model: "string?", thinking: "string?",
+      maxScopes: "number?", mapSteps: "number?", digSteps: "number?", maxSteps: "number?", digSamples: "number?", digConcurrency: "number?",
+      remap: "boolean?", quick: "boolean?", mockLlm: "boolean?", region: "string?", scope: "string?", scopeNote: "string? — map/audit: 'authorized scope note' that focuses map on the in-scope target (the pipeline auto-derives it from prepare's manifest)", verifyFindings: "object|array? — audit: inline suspected finding(s) to confirm-or-refute by execution",
+      inputRunDir: "string? — confirm", fresh: "boolean? — confirm",
+      clue: "string? — prepare", posture: "string? — prepare", matchDeployed: "boolean? — prepare", endpoint: "string? — prepare",
+    },
+    handler: launch,
+  }),
+  route({
+    method: "GET", path: "/api/jobs/:id",
+    summary: "A queued/dispatched/running job (status, run_id once a daemon starts it, error). Poll after POST /api/launch to follow a CLI-launched run to its run id, then stream GET /api/runs/:id/log.",
+    params: { id: "job id" },
+    handler: (c) => { const job = c.store.getJob(Number(c.params.id)); job ? sendJson(c.res, 200, { job }) : sendJson(c.res, 404, { error: "no such job" }); },
+  }),
+  route({
     method: "GET", path: "/api/runs/:id",
     summary: "A single run (status, kind, coverage, finding count, run dir, timestamps).",
     params: { id: "run id" },
@@ -222,6 +332,12 @@ const ROUTES: Route[] = [
     summary: "Delete a run and its run-scoped data (findings + status events, confirm decisions). Scopes (the project inventory) and on-disk artifacts are left intact.",
     params: { id: "run id" },
     handler: (c) => { const ok = c.store.deleteRun(Number(c.params.id)); ok ? sendJson(c.res, 200, { ok: true, deleted: Number(c.params.id) }) : sendJson(c.res, 404, { error: "no such run" }); },
+  }),
+  route({
+    method: "GET", path: "/api/runs/:id/artifact",
+    summary: "Read a run's report artifact (text) from its run dir — the detailed report behind a run/decision. Allowlisted names only.",
+    params: { id: "run id" }, query: { name: "artifact filename (audit_report.md | confirm_report.md | report_f<N>.md | prepare_manifest.json | confirm_decision.json | confirm_provenance.json)" },
+    handler: runArtifact,
   }),
   route({
     method: "GET", path: "/api/runs/:id/log",
@@ -245,9 +361,9 @@ const ROUTES: Route[] = [
 
 function catalog(): unknown {
   return {
-    name: "full-stack-auditor",
+    name: "flounder",
     description: "REST API for tracking and driving white-hat audits. Resources: project (CRUD), run (launch/stop/read), scope, finding, confirm-decision. Runs execute on connected daemons; every UI operation is one of these calls.",
-    resources: ["project", "run", "scope", "finding", "confirm-decision"],
+    resources: ["project", "provider", "run", "scope", "finding", "confirm-decision"],
     endpoints: ROUTES.filter((r) => !r.hidden).map((r) => ({
       method: r.method,
       path: r.path,
@@ -264,6 +380,11 @@ export function startUiServer(options: UiServerOptions = {}): ReturnType<typeof 
   const port = options.port ?? 4500;
   const host = options.host ?? "127.0.0.1"; // localhost by default; expose only with daemon tokens set
   const store = MetadataStore.openForOutput(out);
+  // Seed a couple of starter profiles so a fresh install has something to select (no-op if any exist).
+  store.seedProviders([
+    { name: "openai-codex · gpt-5.5 · xhigh", provider: "openai-codex", model: "gpt-5.5", thinking: "xhigh" },
+    { name: "claude-code · opus · high", provider: "claude-code", model: "claude-opus-4-8", thinking: "high" },
+  ]);
   const plane = new ControlPlane();
   // NOTE: we do NOT reconcile `running` rows on startup — runs execute on daemons, which
   // survive a server restart. Blind-killing them here would be wrong. (A future daemon
@@ -291,7 +412,7 @@ export function startUiServer(options: UiServerOptions = {}): ReturnType<typeof 
     sendJson(res, 404, { error: "not found", hint: "GET /api lists every endpoint" });
   });
   server.listen(port, host, () => {
-    console.log(`[fsa ui] http://${host}:${port}  (API catalog: http://${host}:${port}/api · store: ${out}/fsa.db)`);
+    console.log(`[flounder ui] http://${host}:${port}  (API catalog: http://${host}:${port}/api · store: ${out}/flounder.db)`);
   });
   return server;
 }
@@ -307,12 +428,33 @@ function withProject(c: Ctx, fn: (projectId: number, project: Record<string, unk
   fn(Number(project.id), project);
 }
 
+// The editable project fields shared by create + update (materials are relative paths now;
+// providerId selects a profile; dir is the subdir under the daemon workspace).
+interface ProjectBody {
+  sourcePaths?: string[];
+  buildRoot?: string;
+  corpusPaths?: string[];
+  config?: unknown;
+  providerId?: number | null;
+  dir?: string;
+}
+function projectFields(body: ProjectBody): Omit<ProjectInput, "name"> {
+  return {
+    sourcePaths: body.sourcePaths,
+    buildRoot: body.buildRoot,
+    corpusPaths: body.corpusPaths,
+    config: body.config,
+    providerId: typeof body.providerId === "number" ? body.providerId : undefined,
+    dir: typeof body.dir === "string" && body.dir.trim() ? body.dir.trim() : undefined,
+  };
+}
+
 async function projectCreate(c: Ctx): Promise<void> {
-  const body = (await readBody(c.req)) as { name?: string; sourcePaths?: string[]; buildRoot?: string; corpusPaths?: string[]; config?: unknown };
+  const body = (await readBody(c.req)) as ProjectBody & { name?: string };
   const name = (body.name ?? "").trim();
   if (!name) return sendJson(c.res, 400, { error: "project name is required" });
   if (c.store.getProject(name)) return sendJson(c.res, 409, { error: `a project named "${name}" already exists` });
-  c.store.upsertProject({ name, sourcePaths: body.sourcePaths, buildRoot: body.buildRoot, corpusPaths: body.corpusPaths, config: body.config });
+  c.store.upsertProject({ name, ...projectFields(body) });
   sendJson(c.res, 200, { ok: true, name });
 }
 
@@ -334,8 +476,8 @@ function projectGet(c: Ctx): void {
 async function projectUpdate(c: Ctx): Promise<void> {
   const project = c.store.getProject(c.params.name ?? "");
   if (!project) return sendJson(c.res, 404, { error: `no project named ${c.params.name}` });
-  const body = (await readBody(c.req)) as { sourcePaths?: string[]; buildRoot?: string; corpusPaths?: string[]; config?: unknown };
-  c.store.upsertProject({ name: String(project.name), sourcePaths: body.sourcePaths, buildRoot: body.buildRoot, corpusPaths: body.corpusPaths, config: body.config });
+  const body = (await readBody(c.req)) as ProjectBody;
+  c.store.upsertProject({ name: String(project.name), ...projectFields(body) });
   sendJson(c.res, 200, { ok: true });
 }
 
@@ -347,19 +489,29 @@ function projectDelete(c: Ctx): void {
 async function scopeSetStatus(c: Ctx): Promise<void> {
   const project = c.store.getProject(c.params.name ?? "");
   if (!project) return sendJson(c.res, 404, { error: `no project named ${c.params.name}` });
-  const body = (await readBody(c.req)) as { status?: string };
-  const status = body.status;
-  if (status !== "pending" && status !== "audited" && status !== "deferred") {
-    return sendJson(c.res, 400, { error: "status must be one of pending | audited | deferred" });
-  }
+  const body = (await readBody(c.req)) as { status?: string; prioritize?: boolean };
   const scopeId = c.params.scopeId ?? "";
-  // Update the persisted inventory the AUDIT reads (history-dir scopes.json), so the next
-  // dig honors the skip — then mirror it into the UI's SQLite projection. (If the daemon
-  // executes from its own checkout, it re-reads the inventory there via resume/--remap; this
-  // server-side copy is the one a co-located daemon shares.)
+  // Both branches must write the persisted inventory the AUDIT reads (history-dir scopes.json) AND
+  // the UI's SQLite projection — the dig (resume/--remap) re-reads the inventory file, so a DB-only
+  // change wouldn't reach it.
   const inventoryDir = projectHistoryDir({ outputDir: c.out, targetName: String(project.name) });
   const inventory = await loadScopeInventory(inventoryDir);
   const scope = inventory.find((s) => s.id === scopeId);
+
+  // Prioritize: bump this scope's score above all others so the dig — which audits the highest-
+  // scored un-audited scopes first — picks it next. Lets the operator hand-order the dig queue
+  // (e.g. push the escape-hatch scope to the front) without touching its status.
+  if (body.prioritize) {
+    const top = inventory.reduce((m, s) => Math.max(m, Number(s.priority) || 0), 0);
+    if (scope) { scope.priority = top + 1; await saveScopeInventory(inventoryDir, inventory); } // bump priority, leave score
+    const ok = c.store.prioritizeScope(Number(project.id), scopeId);
+    return sendJson(c.res, ok || scope ? 200 : 404, ok || scope ? { ok: true, scopeId, prioritized: true, priority: top + 1 } : { error: "no such scope" });
+  }
+
+  const status = body.status;
+  if (status !== "pending" && status !== "audited" && status !== "deferred") {
+    return sendJson(c.res, 400, { error: "status must be one of pending | audited | deferred, or pass prioritize:true" });
+  }
   if (scope) {
     scope.status = status;
     await saveScopeInventory(inventoryDir, inventory);
@@ -374,10 +526,98 @@ async function runLaunch(c: Ctx): Promise<void> {
   const project = c.store.getProject(c.params.name ?? "");
   if (!project) return sendJson(c.res, 404, { error: `no project named ${c.params.name}` });
   const body = (await readBody(c.req)) as Record<string, unknown>;
-  const spec = launchSpec(project, body, c.out);
+  const profile = project.provider_id != null ? c.store.getProvider(Number(project.provider_id)) : undefined;
+  const spec = launchSpec(project, body, c.out, profile);
+  // Confirm is FINDING-grained + resumable: when no explicit run dir is given, resolve the work set
+  // from finding STATUS — a specific finding (body.findingId) or all pending-confirmable findings
+  // (confirmed by the audit, not yet decided on the real target). The confirm then updates each
+  // finding's confirm_status, so a re-run only picks up what's still pending.
+  if (spec.verb === "confirm" && !spec.inputRunDir && !(spec.inputRunDirs && spec.inputRunDirs.length > 0)) {
+    if (body.findingId != null) {
+      const f = c.store.getConfirmable(Number(body.findingId));
+      if (!f || !f.run_dir) return sendJson(c.res, 400, { error: "that finding has no source run dir to confirm from" });
+      spec.inputRunDir = String(f.run_dir);
+      spec.confirmKeys = [f.finding_key];
+    } else {
+      const pending = c.store.pendingConfirmable(Number(project.id)).filter((p) => p.run_dir);
+      if (pending.length === 0) return sendJson(c.res, 400, { error: "nothing to confirm — every audit-confirmed finding already has a real-target decision (use --fresh to redo)" });
+      spec.inputRunDirs = [...new Set(pending.map((p) => String(p.run_dir)))];
+      spec.inputRunDir = spec.inputRunDirs[0];
+      spec.confirmKeys = pending.map((p) => p.finding_key);
+    }
+  }
   const jobId = c.store.enqueueJob(spec.target, spec);
   c.plane.nudge();
   sendJson(c.res, 200, { jobId, verb: spec.verb, queued: true, daemons: c.plane.daemonCount() });
+}
+
+// Queue an ad-hoc run from a full launch spec — the CLI's enqueue entry point. Unlike
+// runLaunch (which resolves a configured project's staged materials under a daemon workspace),
+// this takes the spec as-is: ABSOLUTE materials, no `dir`, so the (co-located) daemon resolves
+// them verbatim. A project row is upserted purely so the run is grouped + visible in the UI.
+async function launch(c: Ctx): Promise<void> {
+  const body = (await readBody(c.req)) as Record<string, unknown>;
+  const target = String(body.target ?? "").trim();
+  const verb = String(body.verb ?? "").trim();
+  if (!target) return sendJson(c.res, 400, { error: "target is required" });
+  if (!["run", "map", "audit", "confirm", "prepare"].includes(verb)) {
+    return sendJson(c.res, 400, { error: "verb must be one of run | map | audit | confirm | prepare" });
+  }
+  const spec = normalizeLaunchSpec(body, target, verb as RunKind, c.out);
+  if (!c.store.getProject(target)) {
+    c.store.upsertProject({ name: target, sourcePaths: spec.sourcePaths, ...(spec.buildRoot ? { buildRoot: spec.buildRoot } : {}), corpusPaths: spec.corpusPaths ?? [], config: launchDisplayConfig(spec) });
+  }
+  const jobId = c.store.enqueueJob(target, spec);
+  c.plane.nudge();
+  sendJson(c.res, 200, { jobId, verb: spec.verb, queued: true, daemons: c.plane.daemonCount() });
+}
+
+// Coerce a /api/launch body into a clean LaunchSpec (drop non-finite/wrong-typed values; no
+// `dir` — the CLI sends absolute paths). Mirrors the CLI's own spec build on the receiving end.
+function normalizeLaunchSpec(body: Record<string, unknown>, target: string, verb: RunKind, out: string): LaunchSpec {
+  const str = (v: unknown): string | undefined => (typeof v === "string" && v.trim() ? v.trim() : undefined);
+  const num = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+  const bool = (v: unknown): boolean | undefined => (typeof v === "boolean" ? v : undefined);
+  const list = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
+  return {
+    verb,
+    target,
+    sourcePaths: list(body.sourcePaths),
+    corpusPaths: list(body.corpusPaths),
+    buildRoot: str(body.buildRoot),
+    provider: str(body.provider),
+    model: str(body.model),
+    thinking: str(body.thinking),
+    maxScopes: num(body.maxScopes),
+    mapSteps: num(body.mapSteps),
+    digSteps: num(body.digSteps),
+    maxSteps: num(body.maxSteps),
+    digSamples: num(body.digSamples),
+    digConcurrency: num(body.digConcurrency),
+    remap: bool(body.remap),
+    fresh: bool(body.fresh),
+    quick: bool(body.quick),
+    mockLlm: bool(body.mockLlm),
+    region: str(body.region),
+    scope: str(body.scope),
+    scopeNote: str(body.scopeNote),
+    ...(body.verifyFindings !== undefined ? { verifyFindings: body.verifyFindings } : {}),
+    inputRunDir: str(body.inputRunDir),
+    clue: str(body.clue),
+    posture: str(body.posture),
+    matchDeployed: bool(body.matchDeployed),
+    endpoint: str(body.endpoint),
+    out,
+  };
+}
+
+// The project-row config_json for a launched ad-hoc run (display only; the daemon runs the spec).
+function launchDisplayConfig(spec: LaunchSpec): Record<string, unknown> {
+  const cfg: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries({ provider: spec.provider, model: spec.model, thinking: spec.thinking, maxScopes: spec.maxScopes, mapSteps: spec.mapSteps, digSteps: spec.digSteps, digSamples: spec.digSamples, digConcurrency: spec.digConcurrency })) {
+    if (v !== undefined) cfg[k] = v;
+  }
+  return cfg;
 }
 
 function findingsList(c: Ctx): void {
@@ -398,6 +638,109 @@ function confirmDecisionsList(c: Ctx): void {
     if (reproduced) rows = rows.filter((row) => row.reproduced === reproduced);
     sendJson(c.res, 200, { confirmDecisions: rows });
   });
+}
+
+// ---- providers (model-strategy profiles) ----------------------------------
+
+const THINKING = new Set(["minimal", "low", "medium", "high", "xhigh"]);
+const CLI_FALLBACK_PROVIDERS = ["claude-code", "codex-cli", "mock"];
+
+// The providers pi-ai can drive (discovered at runtime) + our CLI fallbacks, for the editor.
+function availableProviders(): string[] {
+  let pi: string[] = [];
+  try {
+    pi = getProviders() as unknown as string[];
+  } catch {
+    pi = [];
+  }
+  return [...new Set([...pi, ...CLI_FALLBACK_PROVIDERS])].sort();
+}
+
+function availableModels(provider: string): Array<{ id: string; name: string; reasoning: boolean }> {
+  try {
+    const models = getModels(provider as never) as unknown as Array<Record<string, unknown>>;
+    return (models ?? []).map((m) => ({ id: String(m.id), name: String(m.name ?? m.id), reasoning: Boolean(m.reasoning) }));
+  } catch {
+    return [];
+  }
+}
+
+// Coerce a request body into a ProviderInput (drop unknown thinking levels; pass roles through).
+function readProviderInput(body: Record<string, unknown>): Partial<ProviderInput> {
+  const str = (v: unknown): string | undefined => (typeof v === "string" && v.trim() ? v.trim() : undefined);
+  const out: Partial<ProviderInput> = {};
+  const name = str(body.name); if (name) out.name = name;
+  const provider = str(body.provider); if (provider) out.provider = provider;
+  if ("model" in body) out.model = str(body.model);
+  if ("thinking" in body) { const t = str(body.thinking); out.thinking = t && THINKING.has(t) ? t : undefined; }
+  if ("roles" in body && body.roles && typeof body.roles === "object") out.roles = body.roles as ProviderInput["roles"];
+  return out;
+}
+
+async function providerCreate(c: Ctx): Promise<void> {
+  const input = readProviderInput((await readBody(c.req)) as Record<string, unknown>);
+  if (!input.name || !input.provider) return sendJson(c.res, 400, { error: "name and provider are required" });
+  if (c.store.getProviderByName(input.name)) return sendJson(c.res, 409, { error: `a provider named "${input.name}" already exists` });
+  const id = c.store.createProvider({ name: input.name, provider: input.provider, model: input.model, thinking: input.thinking, roles: input.roles });
+  sendJson(c.res, 200, { ok: true, id });
+}
+
+async function providerUpdate(c: Ctx): Promise<void> {
+  const id = Number(c.params.id);
+  if (!c.store.getProvider(id)) return sendJson(c.res, 404, { error: "no such provider" });
+  const input = readProviderInput((await readBody(c.req)) as Record<string, unknown>);
+  if (input.name) {
+    const clash = c.store.getProviderByName(input.name);
+    if (clash && clash.id !== id) return sendJson(c.res, 409, { error: `a provider named "${input.name}" already exists` });
+  }
+  c.store.updateProvider(id, input);
+  sendJson(c.res, 200, { ok: true });
+}
+
+async function daemonCreate(c: Ctx): Promise<void> {
+  const body = (await readBody(c.req)) as Record<string, unknown>;
+  const name = typeof body.name === "string" ? body.name.trim() : "";
+  if (!name) return sendJson(c.res, 400, { error: "name is required" });
+  const { id, token } = c.store.createDaemonToken(name); // token is returned ONCE — the UI must surface it now
+  sendJson(c.res, 200, { ok: true, id, name, token });
+}
+
+async function daemonRename(c: Ctx): Promise<void> {
+  const body = (await readBody(c.req)) as Record<string, unknown>;
+  const name = typeof body.name === "string" ? body.name.trim() : "";
+  if (!name) return sendJson(c.res, 400, { error: "name is required" });
+  const ok = c.store.renameDaemon(Number(c.params.id), name);
+  ok ? sendJson(c.res, 200, { ok: true }) : sendJson(c.res, 404, { error: "no such daemon" });
+}
+
+const TRACKING_STATES = new Set(["open", "triaging", "submitted", "accepted", "fixed", "duplicate", "rejected"]);
+async function findingTracking(c: Ctx): Promise<void> {
+  const body = (await readBody(c.req)) as Record<string, unknown>;
+  const status = typeof body.status === "string" ? body.status : "";
+  if (!TRACKING_STATES.has(status)) return sendJson(c.res, 400, { error: "invalid tracking status", allowed: [...TRACKING_STATES] });
+  const ok = c.store.setFindingTracking(Number(c.params.id), status);
+  ok ? sendJson(c.res, 200, { ok: true }) : sendJson(c.res, 404, { error: "no such finding" });
+}
+
+// Serve a run's report artifact (text) from its run dir. Allowlisted filenames only (no slashes,
+// so no path traversal); the file must resolve directly inside the run dir.
+const ALLOWED_ARTIFACT = /^(audit_report\.md|confirm_report\.md|report_f\d+\.md|prepare_manifest\.json|confirm_decision\.json|confirm_provenance\.json|audit_findings\.json)$/;
+function runArtifact(c: Ctx): void {
+  const run = c.store.getRun(Number(c.params.id));
+  if (!run || !run.run_dir) return sendJson(c.res, 404, { error: "no such run, or it has no run dir" });
+  const name = c.url.searchParams.get("name") || "audit_report.md";
+  if (!ALLOWED_ARTIFACT.test(name)) return sendJson(c.res, 400, { error: "artifact not allowed", name });
+  const runDir = path.resolve(String(run.run_dir));
+  const file = path.join(runDir, name);
+  if (path.dirname(file) !== runDir) return sendJson(c.res, 400, { error: "bad path" });
+  let text: string;
+  try {
+    text = readFileSync(file, "utf8"); // read BEFORE committing a status, so a missing file is a clean 404
+  } catch {
+    return sendJson(c.res, 404, { error: "artifact not found", name });
+  }
+  c.res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+  c.res.end(text);
 }
 
 function runStop(c: Ctx): void {
@@ -444,8 +787,8 @@ function daemonAuth(c: Ctx): Record<string, unknown> | null {
 async function daemonRegister(c: Ctx): Promise<void> {
   const daemon = daemonAuth(c);
   if (!daemon) return;
-  const body = (await readBody(c.req)) as { name?: string; capabilities?: unknown };
-  c.store.touchDaemon(Number(daemon.id), body.capabilities);
+  const body = (await readBody(c.req)) as { name?: string; capabilities?: unknown; workspace?: string };
+  c.store.touchDaemon(Number(daemon.id), body.capabilities, body.workspace);
   sendJson(c.res, 200, { ok: true, daemonId: Number(daemon.id), name: daemon.name });
 }
 
@@ -459,6 +802,7 @@ function daemonStream(c: Ctx): void {
   const keepalive = setInterval(() => {
     try {
       c.res.write(`: keepalive\n\n`);
+      c.store.touchDaemon(Number(daemon.id)); // refresh last_seen while the stream is connected → accurate "online"
     } catch {
       /* closed */
     }
@@ -510,12 +854,14 @@ async function daemonRunUpdate(c: Ctx): Promise<void> {
     reason?: string;
     confirmDecisions?: Parameters<MetadataStore["upsertConfirmDecisions"]>[2];
     decisionPath?: string;
+    runScopes?: { done: number; target: number };
     finish?: { status: Parameters<MetadataStore["finishRun"]>[1]; coverage?: Coverage; findingsTotal?: number };
   };
   if (body.scopes) {
     c.store.upsertScopes(projectId, body.scopes);
     c.store.updateRunCoverage(runId, c.store.scopeProgress(projectId));
   }
+  if (body.runScopes) c.store.updateRunScopes(runId, body.runScopes.done, body.runScopes.target);
   if (body.findings) c.store.upsertFindings(projectId, runId, body.findings, body.reason);
   if (body.confirmDecisions) c.store.upsertConfirmDecisions(projectId, runId, body.confirmDecisions, body.decisionPath);
   if (body.finish) c.store.finishRun(runId, body.finish.status, body.finish.coverage, body.finish.findingsTotal);
@@ -598,7 +944,7 @@ function streamSnapshots(res: ServerResponse, store: MetadataStore): void {
 // Build a launch spec from the project's stored materials/config + the request body
 // (verb + run-shape flags + optional one-off overrides). Unbounded (null) budgets stay
 // undefined so the kernel's unbounded default applies.
-function launchSpec(project: Record<string, unknown>, body: Record<string, unknown>, out: string): LaunchSpec {
+function launchSpec(project: Record<string, unknown>, body: Record<string, unknown>, out: string, profile?: ProviderProfile): LaunchSpec {
   const cfg = (safeParse(project.config_json) as Record<string, unknown>) ?? {};
   const overrides = (body.overrides as Record<string, unknown>) ?? {};
   const merged = { ...cfg, ...((overrides.config as Record<string, unknown>) ?? {}) };
@@ -608,15 +954,40 @@ function launchSpec(project: Record<string, unknown>, body: Record<string, unkno
     const arr = Array.isArray(v) ? v : (safeParse(fallback) as unknown[]) ?? [];
     return arr.filter((x): x is string => typeof x === "string");
   };
+  // The VENDOR comes from the selected profile; MODEL + THINKING come from the project's
+  // per-phase config (cfg.phases). Each verb has a "primary" phase that drives the run's
+  // top-level model/thinking; an audit run (run/audit/map) additionally maps map/dig into
+  // roles (refute follows dig). Legacy projects with profile-baked model/thinking/roles still
+  // resolve via the profile fallback. Materials are RELATIVE to the project dir (resolved on
+  // the daemon against its workspace); dir defaults to the name.
+  const verb = (typeof body.verb === "string" ? body.verb : "run") as RunKind;
+  const phases = (merged.phases && typeof merged.phases === "object" ? merged.phases : {}) as Record<string, { model?: unknown; thinking?: unknown }>;
+  const primaryPhase = verb === "prepare" ? "prepare" : verb === "map" ? "map" : verb === "confirm" ? "confirm" : "dig";
+  const phaseModel = (ph: string): string | undefined => str(phases[ph]?.model);
+  const phaseThinking = (ph: string): string | undefined => str(phases[ph]?.thinking);
+  const roleEntry = (ph: string): RoleOverride | undefined => {
+    const model = phaseModel(ph), thinking = phaseThinking(ph);
+    return model || thinking ? { ...(model ? { model } : {}), ...(thinking ? { thinking } : {}) } : undefined;
+  };
+  const roles: ProviderRoles = {};
+  if (verb === "run" || verb === "audit" || verb === "map") {
+    for (const [role, ph] of [["map", "map"], ["dig", "dig"], ["refute", "dig"]] as const) {
+      const e = roleEntry(ph);
+      if (e) roles[role] = e;
+    }
+  }
+  const legacyRoles = profile && Object.keys(profile.roles).length > 0 ? profile.roles : undefined;
   return {
-    verb: (typeof body.verb === "string" ? body.verb : "run") as RunKind,
+    verb,
     target: String(project.name),
+    dir: str(project.dir) ?? String(project.name),
     sourcePaths: list(overrides.sourcePaths, project.source_paths),
     buildRoot: str(overrides.buildRoot) ?? str(project.build_root),
     corpusPaths: list(overrides.corpusPaths, project.corpus_paths),
-    provider: str(merged.provider),
-    model: str(merged.model),
-    thinking: str(merged.thinking),
+    provider: profile?.provider ?? str(merged.provider),
+    model: phaseModel(primaryPhase) ?? str(profile?.model) ?? str(merged.model),
+    thinking: phaseThinking(primaryPhase) ?? str(profile?.thinking) ?? str(merged.thinking),
+    models: Object.keys(roles).length > 0 ? roles : legacyRoles,
     maxScopes: num(merged.maxScopes),
     mapSteps: num(merged.mapSteps),
     digSteps: num(merged.digSteps),
@@ -629,7 +1000,13 @@ function launchSpec(project: Record<string, unknown>, body: Record<string, unkno
     mockLlm: Boolean(body.mockLlm),
     region: str(body.region),
     scope: str(body.scope),
+    scopeNote: str(merged.scopeNote), // a project may store a default focus note in its config
+    ...(body.verifyFindings !== undefined ? { verifyFindings: body.verifyFindings } : {}),
     inputRunDir: str(body.inputRunDir),
+    clue: str(body.clue),
+    posture: str(body.posture),
+    matchDeployed: typeof body.matchDeployed === "boolean" ? body.matchDeployed : undefined,
+    endpoint: str(body.endpoint),
     out,
   };
 }

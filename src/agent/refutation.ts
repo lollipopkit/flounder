@@ -40,9 +40,13 @@ export async function runRefutation(input: {
   // confirmation's trust assumptions (e.g. an out-of-spec mocked verifier), not
   // just the invariant. Keyed by path; passed verbatim.
   pocFiles?: Array<{ path: string; content: string }>;
+  // Reports which finding is being refuted, so the caller can surface progress in the live UI
+  // (the refutation runs after the dig's scope batch, where the activity stream otherwise goes quiet).
+  onProgress?: (findingId: string) => void;
 }): Promise<RefutationVerdict[]> {
   const out: RefutationVerdict[] = [];
   for (const finding of input.findings.slice(0, Math.max(0, input.max))) {
+    input.onProgress?.(finding.id);
     const user = buildRefutationPrompt(finding, sourceForLocation(input.source, finding.location), input.pocFiles ?? []);
     try {
       const raw = await input.llm.complete({

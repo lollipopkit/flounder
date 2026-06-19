@@ -1,11 +1,15 @@
-// fsa daemon — the EXECUTION plane. Connects to a control-plane server, claims queued
+// flounder daemon — the EXECUTION plane. Connects to a control-plane server, claims queued
 // jobs, runs runAudit/runConfirm LOCALLY (code, provider keys, and the sandbox stay on
 // this machine), and reports progress to the server over HTTP: SSE for dispatch + cancel
 // nudges, POST for run start / updates / activity. It can run on a different machine than
 // the server — the server owns the DB; the daemon never touches it.
 
+import path from "node:path";
+import os from "node:os";
+import { writeFile } from "node:fs/promises";
 import { runAudit } from "../agent/audit.js";
 import { runConfirm } from "../agent/confirm.js";
+import { runPrepare } from "../agent/acquire.js";
 import { MockAuditLlmClient } from "../llm/mock.js";
 import { specToConfig, type LaunchSpec } from "./run-manager.js";
 import { toScopeRow, toFindingRow, configSnapshot, type RunTracker, type ConfirmDecisionInput } from "../db/record.js";
@@ -19,6 +23,7 @@ export interface DaemonOptions {
   out?: string;
   name?: string;
   concurrency?: number;
+  workspace?: string; // root under which project dirs live; materials resolve here (default ./workspace)
 }
 
 type Activity = { kind: string; delta?: string; tool?: string; step?: number };
@@ -27,12 +32,13 @@ export async function runDaemon(opts: DaemonOptions): Promise<void> {
   const base = opts.server.replace(/\/$/, "");
   const headers = { authorization: `Bearer ${opts.token}`, "content-type": "application/json" };
   const out = opts.out ?? "runs";
+  const workspace = path.resolve(opts.workspace ?? "workspace"); // where project dirs (and their relative materials) live
   const maxConcurrent = Math.max(1, opts.concurrency ?? 2);
   const inflight = new Map<number, AbortController>(); // jobId -> abort
 
-  const reg = await fetch(base + "/api/daemon/register", { method: "POST", headers, body: JSON.stringify({ name: opts.name ?? "daemon", capabilities: {} }) }).catch(() => null);
+  const reg = await fetch(base + "/api/daemon/register", { method: "POST", headers, body: JSON.stringify({ name: opts.name ?? "daemon", capabilities: {}, workspace }) }).catch(() => null);
   if (!reg || !reg.ok) throw new Error(`daemon: could not register with ${base} (status ${reg ? reg.status : "no response"}) — check --server and --token`);
-  console.log(`[fsa daemon] connected to ${base}  (out=${out}, concurrency=${maxConcurrent})`);
+  console.log(`[flounder daemon] connected to ${base}  (out=${out}, workspace=${workspace}, concurrency=${maxConcurrent})`);
 
   const claimLoop = async (): Promise<void> => {
     while (inflight.size < maxConcurrent) {
@@ -55,11 +61,29 @@ export async function runDaemon(opts: DaemonOptions): Promise<void> {
       return tracker;
     };
     try {
-      const cfg = specToConfig(spec, out);
+      const cfg = specToConfig(spec, out, workspace);
       if (spec.verb === "confirm") {
         if (!spec.inputRunDir) throw new Error("confirm requires inputRunDir");
-        await runConfirm(cfg, { inputRunDir: spec.inputRunDir, signal: abort.signal, makeTracker, onActivity: sink.push, ...(spec.maxSteps !== undefined ? { maxSteps: spec.maxSteps } : {}), ...(spec.fresh ? { fresh: true } : {}) });
+        await runConfirm(cfg, { inputRunDir: spec.inputRunDir, signal: abort.signal, makeTracker, onActivity: sink.push, ...(spec.inputRunDirs ? { inputRunDirs: spec.inputRunDirs } : {}), ...(spec.confirmKeys ? { confirmKeys: spec.confirmKeys } : {}), ...(spec.maxSteps !== undefined ? { maxSteps: spec.maxSteps } : {}), ...(spec.fresh ? { fresh: true } : {}) });
+      } else if (spec.verb === "prepare") {
+        if (!spec.clue) throw new Error("prepare requires a clue (tx / address / project / link)");
+        await runPrepare(cfg, {
+          clue: spec.clue,
+          posture: spec.posture === "informed" ? "informed" : "blind",
+          matchDeployed: spec.matchDeployed !== false,
+          signal: abort.signal,
+          makeTracker,
+          onActivity: sink.push,
+          ...(spec.endpoint !== undefined ? { endpoint: spec.endpoint } : {}),
+          ...(spec.maxSteps !== undefined ? { maxSteps: spec.maxSteps } : {}),
+        });
       } else {
+        if (spec.verb === "audit" && spec.verifyFindings !== undefined) {
+          // verify posture: write the inline findings to a temp file the kernel's verify path reads.
+          const vf = path.join(os.tmpdir(), `flounder-verify-${job.id}.json`);
+          await writeFile(vf, JSON.stringify(spec.verifyFindings), "utf8");
+          cfg.auditVerify = vf;
+        }
         await runAudit(cfg, { kind: spec.verb, signal: abort.signal, makeTracker, onActivity: sink.push, ...(spec.mockLlm ? { llm: new MockAuditLlmClient() } : {}) });
       }
       sink.flush();
@@ -139,6 +163,10 @@ class RemoteTracker implements RunTracker {
 
   scopes(scopes: AuditScope[]): void {
     this.enqueue(() => (this.runId ? this.req("PATCH", `/api/daemon/runs/${this.runId}`, { scopes: scopes.map(toScopeRow) }) : Promise.resolve()));
+  }
+
+  runScopes(done: number, target: number): void {
+    this.enqueue(() => (this.runId ? this.req("PATCH", `/api/daemon/runs/${this.runId}`, { runScopes: { done, target } }) : Promise.resolve()));
   }
 
   findings(findings: AgentFinding[], runDir: string, reason?: string): void {

@@ -293,8 +293,8 @@ const bashTool: AgentTool = {
     const normalized = normalizeBashCommand(args, ctx.cfg);
     if ("error" in normalized) return { observation: normalized.error };
     // CONFIRM mode swaps to the network-enabled policy (fork/read live networks, fetch,
-    // search — never broadcast); `fsa run` keeps the network-sealed local-only policy.
-    const blocked = ctx.cfg.confirmMode
+    // search — never broadcast); `flounder run` keeps the network-sealed local-only policy.
+    const blocked = (ctx.cfg.confirmMode || ctx.cfg.prepareMode)
       ? analyzeConfirmBashCommandSafety(normalized.command)
       : analyzeAgentBashCommandSafety(normalized.command);
     if (blocked.blocked) return { observation: `blocked: ${blocked.reason ?? "command blocked by policy"}` };
@@ -472,7 +472,9 @@ export interface AuditScope {
   difficulty: string;
   score: number;
   why: string;
-  status?: "pending" | "audited" | "deferred";
+  status?: "pending" | "audited" | "deferred" | "auditing";
+  digSeconds?: number; // how long this scope's deep-audit took (set when it completes)
+  priority?: number; // manual dig-queue ordering (operator "↑ Top"); ordered above score, doesn't change score
 }
 
 /** Non-mutating check: did the session write a non-empty findings.json to scratch?

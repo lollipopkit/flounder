@@ -1,5 +1,7 @@
 import path from "node:path";
+import { readFileSync } from "node:fs";
 import { withRole, type AuditorConfig } from "../config.js";
+import { deriveScopeNote } from "../scope-note.js";
 import { loadCorpus, loadSource } from "../ingest/source.js";
 import { createLlmClient } from "../llm/client.js";
 import { renderDisclosure, reportArtifactName } from "../reports/disclosure.js";
@@ -89,7 +91,18 @@ export async function runAudit(
     corpusManifest.push(...(await copyCorpusIntoWorkspace(workspace, corpus)));
   }
 
-  const scopeNote = resolveScopeNote(cfg);
+  let scopeNote = resolveScopeNote(cfg);
+  // No explicit scope note (the `run <clue>` pipeline supplies one; a UI-launched map on a prepare
+  // workspace does not) — fall back to deriving the focus from a prepare_manifest.json staged in the
+  // source. So map/dig concentrate on the in-scope target however the run was started, not only via
+  // the pipeline. Silent when no manifest is present (map then treats all source as in scope).
+  if (!scopeNote.trim()) {
+    const derived = deriveScopeNoteFromSource(cfg.sourcePaths);
+    if (derived) {
+      scopeNote = derived;
+      await logger.event("audit_scope_focus", { source: "prepare_manifest", components: derived.split("\n").filter((l) => l.startsWith("- ")).length });
+    }
+  }
   // Surface prior-run lessons at kickoff: the most relevant notes for this scope,
   // falling back to the most recent ones so memory is always visible.
   let memoryNotes = await memory.recall([cfg.targetName, scopeNote].filter(Boolean).join(" "), 8);
@@ -190,8 +203,8 @@ export async function runAudit(
     steps = aggregatedSteps;
     stoppedReason = "finished";
   } else if (cfg.auditMapOnly) {
-    // MAP only (`fsa map`): enumerate and persist the scope inventory, then stop — no
-    // dig. The resumable `fsa audit` digs from this inventory afterwards.
+    // MAP only (`flounder map`): enumerate and persist the scope inventory, then stop — no
+    // dig. The resumable `flounder audit` digs from this inventory afterwards.
     const inventoryDir = projectHistoryDir(historyLocation(cfg));
     const mapPhase = await runPhase(withRole(cfg, "map"), { mode: "map", maxSteps: cfg.auditMapSteps });
     scopeInventory = readScratchScopes(session);
@@ -219,7 +232,7 @@ export async function runAudit(
     scopeInventory = cfg.auditRemap ? [] : await loadScopeInventory(inventoryDir);
     const resuming = scopeInventory.length > 0;
     if (!resuming && (picked.length > 0 || cfg.auditRequireInventory)) {
-      throw new Error("`fsa audit` needs an existing scope inventory; run `fsa map` first to enumerate scopes (then pick with `--scope` from audit_scopes.json), or `fsa run` to map and audit in one pass.");
+      throw new Error("`flounder audit` needs an existing scope inventory; run `flounder map` first to enumerate scopes (then pick with `--scope` from audit_scopes.json), or `flounder run` to map and audit in one pass.");
     }
     if (!resuming) {
       const mapPhase = await runPhase(withRole(cfg, "map"), { mode: "map", maxSteps: cfg.auditMapSteps });
@@ -254,9 +267,13 @@ export async function runAudit(
       // operator chose to skip, so auto-selection excludes it (an explicit --scope still digs it).
       toDig = scopeInventory
         .filter((scope) => scope.status !== "audited" && scope.status !== "deferred")
-        .sort((a, b) => b.score - a.score)
+        .sort((a, b) => ((b.priority ?? 0) - (a.priority ?? 0)) || (b.score - a.score)) // manual "↑ Top" priority first, then score
         .slice(0, Math.max(1, cfg.auditMaxScopes));
     }
+    // This run's dig batch: toDig is the set of scopes THIS run audits (capped by --max-scopes),
+    // distinct from the project-cumulative coverage. Report it so the UI can show "M / N this run".
+    recorder.runScopes(0, toDig.length);
+    let digDone = 0;
     const aggregated: AgentFinding[] = [];
     // Checkpoint the run's confirmed findings so far to the run dir after each dig, so a
     // killed run keeps the completed digs' findings (raw confirmed-executable; the
@@ -264,6 +281,7 @@ export async function runAudit(
     const checkpointFindings = async (): Promise<void> => {
       const confirmedSoFar = aggregated.filter((finding) => isConfirmed(finding.confirmationStatus)).map((finding, idx) => ({ ...finding, id: `f${idx + 1}` }));
       await logger.artifact("audit_findings.json", confirmedSoFar);
+      recorder.findings(aggregated, logger.runDir, "dig checkpoint"); // persist live so the UI shows findings as each scope lands (content-keyed, so statuses update in place later)
     };
     const samples = Math.max(1, Math.floor(cfg.auditDigSamples));
     const concurrency = Math.max(1, Math.floor(cfg.auditDigConcurrency));
@@ -300,6 +318,9 @@ export async function runAudit(
       // test files, build output, or findings. A bounded pool caps simultaneous digs.
       const workspaceRoots = cfg.buildRoot ? [cfg.buildRoot] : cfg.sourcePaths;
       const digScope = async (scope: AuditScope): Promise<{ findings: AgentFinding[]; steps: TranscriptStep[]; commandRuns: typeof session.commandRuns }> => {
+        scope.status = "auditing"; // mark in-progress so the live UI shows which scope is being dug
+        recorder.scopes(scopeInventory);
+        const digT0 = Date.now();
         const ws = await prepareSandboxWorkspace(workspaceRoots, logger.runDir, `audit/dig-${safeScopeDir(scope.id)}`);
         const digSession = newSession();
         digSession.workspace = ws;
@@ -325,11 +346,14 @@ export async function runAudit(
           if (finding.commandRunId) finding.commandRunId = `${scope.id}:${finding.commandRunId}`;
         }
         scope.status = "audited";
-        await logger.event("audit_dig_done", { scope: scope.id, samples, findings: unioned.length, concurrent: true });
+        scope.digSeconds = Math.max(1, Math.round((Date.now() - digT0) / 1000));
+        await logger.event("audit_dig_done", { scope: scope.id, samples, findings: unioned.length, concurrent: true, digSeconds: scope.digSeconds });
         // Resume checkpoint: persist the audited status so a kill mid-run skips this scope
         // on the next run (concurrent digs' findings live in their isolated workspaces).
         await saveScopeInventory(inventoryDir, scopeInventory);
         recorder.scopes(scopeInventory);
+        recorder.findings(unioned, logger.runDir, "dig checkpoint"); // persist this scope's findings live (content-keyed upsert)
+        recorder.runScopes(++digDone, toDig.length);
         return { findings: unioned, steps: digSteps, commandRuns: scopedRuns };
       };
       await logger.event("audit_dig_concurrent_start", { scopes: toDig.length, concurrency });
@@ -347,16 +371,21 @@ export async function runAudit(
       // Sequential: reuse the shared map workspace (one warm-up) and let the
       // post-loop differential stage confirm.
       for (const scope of toDig) {
+        scope.status = "auditing"; // mark in-progress so the live UI shows which scope is being dug
+        recorder.scopes(scopeInventory);
+        const digT0 = Date.now();
         const { findings: unioned, steps: digSteps } = await digSamples(scope, session);
         aggregatedSteps.push(...digSteps);
         aggregated.push(...unioned);
         scope.status = "audited";
-        await logger.event("audit_dig_done", { scope: scope.id, samples, findings: unioned.length });
+        scope.digSeconds = Math.max(1, Math.round((Date.now() - digT0) / 1000));
+        await logger.event("audit_dig_done", { scope: scope.id, samples, findings: unioned.length, digSeconds: scope.digSeconds });
         // Resume checkpoint: persist the audited status + findings-so-far after each dig,
         // so a kill mid-run resumes at the next pending scope and keeps completed work.
         await saveScopeInventory(inventoryDir, scopeInventory);
         await checkpointFindings();
         recorder.scopes(scopeInventory);
+        recorder.runScopes(++digDone, toDig.length);
       }
     }
     // Each scope/dig session numbered its findings independently (f1, f2, …), so
@@ -401,11 +430,13 @@ export async function runAudit(
       if (finding.confirmationStatus !== "confirmed-executable" || !finding.fixPatch || !finding.commandRunId) continue;
       const exploitRun = session.commandRuns.find((run) => run.id === finding.commandRunId);
       if (!exploitRun) continue;
+      options.onActivity?.({ kind: "step", tool: `differential ${finding.id}` }); // surface the post-dig stage in Live Activity
       const result = await runDifferentialConfirmation({ workspace: session.workspace, finding, exploitRun, baselineFiles: session.baselineFiles, cfg, logger, ...(session.buildCacheDir ? { cacheDir: session.buildCacheDir } : {}) });
       differentials.push(result);
       if (result.confirmed) finding.confirmationStatus = "confirmed-differential";
     }
     if (differentials.length > 0) await logger.artifact("audit_differential.json", differentials);
+    recorder.findings(session.findings, logger.runDir, "differential"); // push status upgrades (confirmed-differential) to the UI live
   }
 
   // Independent refutation: a fresh-context skeptic re-derives the invariant and
@@ -426,7 +457,7 @@ export async function runAudit(
       const pocFiles = [...session.scratchFiles.entries()]
         .filter(([scratchPath]) => /\.t\.(sol|rs|ts|js)$/i.test(scratchPath) || /(^|\/)tests?\//i.test(scratchPath) || /(poc|exploit)/i.test(scratchPath))
         .map(([scratchPath, content]) => ({ path: scratchPath, content }));
-      const verdicts = await runRefutation({ findings: candidates, source, cfg: refuteCfg, llm: refuteLlm, logger, max: 8, ...(pocFiles.length > 0 ? { pocFiles } : {}) });
+      const verdicts = await runRefutation({ findings: candidates, source, cfg: refuteCfg, llm: refuteLlm, logger, max: 8, onProgress: (id) => options.onActivity?.({ kind: "step", tool: `refute ${id}` }), ...(pocFiles.length > 0 ? { pocFiles } : {}) });
       for (const finding of candidates) {
         if (!finding.refutation?.refuted) continue;
         if (finding.refutation.unrealistic) {
@@ -489,10 +520,12 @@ export async function runAudit(
               : reConfirmed?.refutation?.reason ?? "no faithful PoC produced on appeal",
           };
           await logger.event("audit_appeal", { findingId: finding.id, upheld });
+          recorder.findings(session.findings, logger.runDir, "appeal"); // reflect this finding's appeal outcome live
         }
         clearScratchFindings(session);
       }
     }
+    recorder.findings(session.findings, logger.runDir, "refutation"); // push refutation downgrades (suspected/refuted) to the UI
   }
 
   // Hard artifact semantics: only an execution-confirmed candidate is a finding.
@@ -775,11 +808,36 @@ function toRankedFinding(finding: AgentFinding): RankedFinding {
 
 function resolveScopeNote(cfg: AuditorConfig): string {
   const parts: string[] = [];
+  const pc = cfg.projectContext;
   if (cfg.auditScopeNote) parts.push(cfg.auditScopeNote);
-  if (cfg.projectContext.summary) parts.push(cfg.projectContext.summary);
-  if (cfg.projectContext.focusAreas?.length) parts.push(`Focus areas: ${cfg.projectContext.focusAreas.join("; ")}`);
-  if (cfg.projectContext.outOfScope?.length) parts.push(`Out of scope: ${cfg.projectContext.outOfScope.join("; ")}`);
+  if (pc.summary) parts.push(pc.summary);
+  // The richer projectContext fields are scaffold-only no longer: an opted-in `--config`
+  // profile (off by default) gets its whole threat model — assets, attacker model, and
+  // especially TRUST BOUNDARIES — woven into the scope note, not just summary/focus/scope.
+  if (pc.criticalAssets?.length) parts.push(`Critical assets: ${pc.criticalAssets.join("; ")}`);
+  if (pc.attackerCapabilities?.length) parts.push(`Attacker capabilities: ${pc.attackerCapabilities.join("; ")}`);
+  if (pc.trustBoundaries?.length) parts.push(`Trust boundaries: ${pc.trustBoundaries.join("; ")}`);
+  if (pc.securityInvariants?.length) parts.push(`Security invariants: ${pc.securityInvariants.join("; ")}`);
+  if (pc.focusAreas?.length) parts.push(`Focus areas: ${pc.focusAreas.join("; ")}`);
+  if (pc.scenarioGuidance?.length) parts.push(`Scenario guidance: ${pc.scenarioGuidance.join("; ")}`);
+  if (pc.outOfScope?.length) parts.push(`Out of scope: ${pc.outOfScope.join("; ")}`);
   return parts.join("\n");
+}
+
+// Fallback focus: when no explicit scope note is set, look for a prepare_manifest.json at a source
+// root (prepare writes it at the staged workspace root) and derive the in-scope-target focus from
+// it — the same note the `run <clue>` pipeline builds, so any map on a prepare workspace focuses.
+function deriveScopeNoteFromSource(sourcePaths: string[]): string | undefined {
+  for (const sp of sourcePaths) {
+    const candidate = sp.endsWith("prepare_manifest.json") ? sp : path.join(sp, "prepare_manifest.json");
+    try {
+      const note = deriveScopeNote(JSON.parse(readFileSync(candidate, "utf8")));
+      if (note) return note;
+    } catch {
+      /* no manifest at this source root — try the next */
+    }
+  }
+  return undefined;
 }
 
 function renderMemoryHint(notes: { kind: string; note: string; sourceRef?: string }[]): string {

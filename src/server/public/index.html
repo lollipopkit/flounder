@@ -652,7 +652,14 @@ function phaseState(d, pr) {
   const digStarted = !!audit && audit.run_scopes_target != null;
   const mapRunning = !!audit && audit.kind !== "audit" && !digStarted;
   const digRunning = !!audit && (audit.kind === "audit" || digStarted);
-  const thisRun = audit && audit.run_scopes_target != null ? " · this run " + (audit.run_scopes_done ?? 0) + "/" + audit.run_scopes_target : "";
+  // Once the scope batch is done but the run is still going, it's in the post-dig stage
+  // (differential confirmation + refutation + finalize) — surface that so it doesn't look stuck,
+  // and so "0 findings" reads as "not written yet" rather than "found nothing".
+  const batchDone = !!audit && audit.run_scopes_target != null && (audit.run_scopes_done ?? 0) >= audit.run_scopes_target;
+  const postDig = batchDone; // scopes finished, run still running => confirming/refuting/finalizing
+  const thisRun = audit && audit.run_scopes_target != null
+    ? (batchDone ? " · scopes done · confirming + refuting findings…" : " · this run " + (audit.run_scopes_done ?? 0) + "/" + audit.run_scopes_target)
+    : "";
   // map and dig share ONE run, so split its elapsed at the map->dig boundary recorded on the run
   // as dig_started_at (stamped once when the dig loop begins — a STABLE timestamp, unlike scope
   // updated_at which the dig re-stamps per scope). map = run start -> boundary; dig = boundary ->

@@ -428,6 +428,7 @@ export async function runAudit(
       if (finding.confirmationStatus !== "confirmed-executable" || !finding.fixPatch || !finding.commandRunId) continue;
       const exploitRun = session.commandRuns.find((run) => run.id === finding.commandRunId);
       if (!exploitRun) continue;
+      options.onActivity?.({ kind: "step", tool: `differential ${finding.id}` }); // surface the post-dig stage in Live Activity
       const result = await runDifferentialConfirmation({ workspace: session.workspace, finding, exploitRun, baselineFiles: session.baselineFiles, cfg, logger, ...(session.buildCacheDir ? { cacheDir: session.buildCacheDir } : {}) });
       differentials.push(result);
       if (result.confirmed) finding.confirmationStatus = "confirmed-differential";
@@ -453,7 +454,7 @@ export async function runAudit(
       const pocFiles = [...session.scratchFiles.entries()]
         .filter(([scratchPath]) => /\.t\.(sol|rs|ts|js)$/i.test(scratchPath) || /(^|\/)tests?\//i.test(scratchPath) || /(poc|exploit)/i.test(scratchPath))
         .map(([scratchPath, content]) => ({ path: scratchPath, content }));
-      const verdicts = await runRefutation({ findings: candidates, source, cfg: refuteCfg, llm: refuteLlm, logger, max: 8, ...(pocFiles.length > 0 ? { pocFiles } : {}) });
+      const verdicts = await runRefutation({ findings: candidates, source, cfg: refuteCfg, llm: refuteLlm, logger, max: 8, onProgress: (id) => options.onActivity?.({ kind: "step", tool: `refute ${id}` }), ...(pocFiles.length > 0 ? { pocFiles } : {}) });
       for (const finding of candidates) {
         if (!finding.refutation?.refuted) continue;
         if (finding.refutation.unrealistic) {

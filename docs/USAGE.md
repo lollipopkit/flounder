@@ -132,6 +132,8 @@ npm run verify        # full local verification gate
 
 `flounder confirm <run-dir> --source <paths...>` takes a finished `flounder run` to a real-world standard of certainty and writes a submit/no-submit decision sheet. It is the open-world counterpart to the sealed `run`, and the only capability difference is that the network is available.
 
+Confirm is **finding-grained and resumable**: each finding gets a real-target outcome (`reproduced` / `not-reproduced`), and a re-run skips the ones already decided. The CLI form confirms a whole run dir; from the dashboard you can **Confirm** a single finding or all pending findings of a project (it reproduces only what's still undecided — including findings added by a later `Continue audit`).
+
 ```bash
 flounder confirm ./runs/protocol-<timestamp> \
   --source ./contracts --build-root . \
@@ -228,7 +230,7 @@ flounder ui --no-daemon     # control plane only — connect your own daemon(s) 
 flounder daemon --server http://<server>:4500 --token <token>   # run the executor on another machine
 ```
 
-A web dashboard to track and drive audits across projects: per-project scope coverage (mapped vs audited vs deferred, live), findings with their status timeline, and the bugs actually **confirmed** on the real target, updating in real time via SSE. Create a project, **Start/Continue** an audit (resume), **Restart** (re-map), **Run…** (map / audit a region / confirm), edit its config, or stop a running run. Global config lives behind the gear: **provider profiles** (a reusable model strategy — provider + model + thinking, with optional per-phase map/dig/refute overrides) and the connected **daemons**.
+A web dashboard to track and drive audits across projects, updating live via SSE. A project's detail is the **prepare → map → dig → confirm** pipeline: it auto-follows the running phase, each phase shows its elapsed time, and the scope being dug is marked `auditing`. Below it — a scored **scope queue** you can hand-order (**↑ Top** pushes a scope to the front of the dig, separate from its score) and skip/resume; **findings that stream in as each scope lands** and change status through refutation, each with a per-finding **Confirm** button and its real-target outcome (reproduced / not-reproduced); a project-wide **Confirm pending on real target** (reproduces every still-undecided finding; a re-run only does what's still pending); and viewable Markdown **reports**. **Start/Continue** an audit (resume), **Restart** (re-map), **Run…**, or stop a running run. A separate **Bugs** tab is a cross-project board of every finding with submission tracking. Behind the gear: **provider profiles** (the **vendor** only — model & thinking are chosen **per phase** in each project's config, from the vendor's live model list) and **daemon** CRUD (mint a token, rename, revoke).
 
 Execution is **decoupled** from the dashboard: the `flounder ui` server is a **control plane** (REST API + SQLite + a job queue) and the audit runs on a **daemon**, so the target code and provider keys stay on the daemon's machine. `flounder ui` spawns a co-located daemon by default (rooted at `--workspace`, default `./workspace`); pass `--no-daemon` and run `flounder daemon` elsewhere (with a token from `flounder db mint-token`) to execute on a different host. A project's materials are paths **relative to** its directory under the daemon's workspace, so nothing leaks an absolute path. The server binds to `127.0.0.1` by default; the daemon protocol is bearer-token-authenticated.
 
@@ -245,7 +247,7 @@ curl 'localhost:4500/api/projects/p/findings?status=confirmed-differential'
 curl 'localhost:4500/api/projects/p/confirm-decisions?reproduced=yes'  # the confirmed bugs
 ```
 
-Resources: **project** (CRUD), **provider** (model-strategy profiles), **run** (`POST /api/projects/:name/runs` enqueues a job a daemon claims; `GET /api/runs/:id`; `POST /api/runs/:id/stop`), and read-only **scope** / **finding** / **confirm-decision** (paginated + filterable). `GET /api/stream` is an SSE feed for live updates; `GET /api/runs/:id/log` streams a run's live token-level activity, fed by the executing daemon.
+Resources: **project** (CRUD), **provider** (vendor profiles), **daemon** (CRUD — mint/rename/revoke), **run** (`POST /api/projects/:name/runs` enqueues a job a daemon claims; `GET /api/runs/:id`; `POST /api/runs/:id/stop`; `GET /api/runs/:id/artifact?name=` reads a report file), and read-only **scope** / **finding** / **confirm-decision** (paginated + filterable). Operator actions: `PATCH …/scopes/:id {prioritize:true}` reorders the dig queue; `PATCH /api/findings/:id/tracking` advances a finding's submission state; a confirm `POST …/runs {verb:"confirm"}` reproduces all pending findings (or one, with `findingId`). `GET /api/bugs` is a cross-project finding+tracking view. `GET /api/stream` is an SSE feed for live updates; `GET /api/runs/:id/log` streams a run's live token-level activity, fed by the executing daemon.
 
 ## Library API
 

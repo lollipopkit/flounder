@@ -29,7 +29,9 @@ contract OwnerConfiguredVerifierControl {
     }
 
     function processRollup(bytes calldata proofData, bytes32 statementHash, bytes32 newStateRoot) external {
-        require(verifier.verify(proofData, statementHash), "bad proof");
+        bytes32 expectedStatementHash = keccak256(abi.encode(newStateRoot));
+        require(statementHash == expectedStatementHash, "statement/root mismatch");
+        require(verifier.verify(proofData, expectedStatementHash), "bad proof");
         acceptedStateRoot = newStateRoot;
     }
 }

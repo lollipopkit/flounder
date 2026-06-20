@@ -6,7 +6,8 @@ import { runAudit } from "../dist/agent/audit.js";
 import { defaultConfig } from "../dist/config.js";
 import { MockAuditLlmClient } from "../dist/llm/mock.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const currentFile = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(currentFile);
 const root = path.resolve(__dirname, "..");
 const registryPath = path.join(root, "fixtures/prompt-regression/known-bugs.json");
 
@@ -232,7 +233,13 @@ function renderPlanEntry(entry, fixtureGroup, sampleIndex, cfg, options) {
   };
 }
 
-function scoreArtifact(entry, text, fixtureSet) {
+export function confirmedFindingCount(text) {
+  const match = text.match(/Confirmed findings:\s*(\d+)/i);
+  if (!match) return undefined;
+  return Number.parseInt(match[1], 10);
+}
+
+export function scoreArtifact(entry, text, fixtureSet) {
   const lowerText = text.toLowerCase();
   const groups = entry.artifactSignalGroups.map((group) => {
     const matched = group.anyOf.filter((needle) => lowerText.includes(String(needle).toLowerCase()));
@@ -249,14 +256,17 @@ function scoreArtifact(entry, text, fixtureSet) {
     lowerText.includes(String(needle).toLowerCase()),
   );
   const positiveScore = passed === required && forbiddenMatches.length === 0;
+  const confirmedFindings = confirmedFindingCount(text);
+  const hasConfirmedFindings = typeof confirmedFindings === "number" && confirmedFindings > 0;
   const expectedOutcome = fixtureSet === "positive" ? "detect-positive" : "reject-positive";
   return {
     caseId: entry.id,
     label: entry.label,
     fixtureSet,
     expectedOutcome,
-    passed: fixtureSet === "positive" ? positiveScore : !positiveScore,
+    passed: fixtureSet === "positive" ? positiveScore : !positiveScore && !hasConfirmedFindings,
     positiveScore,
+    confirmedFindings,
     passedGroups: passed,
     requiredGroups: required,
     forbiddenMatches,
@@ -377,7 +387,9 @@ async function main() {
   if (!summary.pass) process.exitCode = 1;
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === currentFile) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}

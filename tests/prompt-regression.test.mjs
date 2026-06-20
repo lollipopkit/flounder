@@ -15,6 +15,7 @@ import {
   POC_TRUST_RULE,
 } from "../dist/agent/prompts.js";
 import { buildSessionPrompt } from "../dist/agent/pi-session.js";
+import { confirmedFindingCount, scoreArtifact } from "../scripts/prompt-regression-eval.mjs";
 
 const root = path.resolve(".");
 const registryPath = path.join(root, "fixtures/prompt-regression/known-bugs.json");
@@ -126,6 +127,35 @@ test("prompt regression expected artifacts exercise scorer pass and fail paths",
       );
     }
   }
+});
+
+test("prompt regression negative and control scoring rejects confirmed findings", () => {
+  const entry = {
+    id: "case-a",
+    label: "Case A",
+    artifactSignalGroups: [
+      {
+        name: "binding",
+        anyOf: ["missing binding sentinel"],
+      },
+    ],
+    forbiddenArtifactSignals: [],
+  };
+
+  const cleanControl = scoreArtifact(entry, "- Confirmed findings: 0\nNo positive signal is present.", "control");
+  assert.equal(cleanControl.passed, true);
+  assert.equal(cleanControl.positiveScore, false);
+  assert.equal(cleanControl.confirmedFindings, 0);
+
+  const confirmedControl = scoreArtifact(
+    entry,
+    "- Confirmed findings: 1 (high)\nThe artifact reports an unrelated confirmed issue.",
+    "control",
+  );
+  assert.equal(confirmedControl.passed, false);
+  assert.equal(confirmedControl.positiveScore, false);
+  assert.equal(confirmedControl.confirmedFindings, 1);
+  assert.equal(confirmedFindingCount("## Summary\n- Confirmed findings: 2 (critical)"), 2);
 });
 
 test("default prompts retain the generic capabilities needed by known-bug regressions", async () => {

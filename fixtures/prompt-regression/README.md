@@ -45,8 +45,10 @@ score means the prompt failed to surface at least one required capability signal
 for that case.
 
 Negative/control fixtures invert the scoring target: they pass when the artifact
-does **not** satisfy the positive bug signal set. They are false-positive guards,
-not recall targets.
+does **not** satisfy the positive bug signal set and reports zero confirmed
+findings. They are false-positive guards, not recall targets; any confirmed
+finding in a negative/control report is a harness failure that needs fixture or
+prompt review.
 
 Compare two summary files:
 

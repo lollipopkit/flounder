@@ -31,6 +31,8 @@ export interface RunTracker {
   /** This run's dig batch: how many scopes it is digging (target) + how many done so far. */
   runScopes(done: number, target: number): void;
   findings(findings: AgentFinding[], runDir: string, reason?: string): void;
+  /** Record one post-dig stage's outcome (synthesis / differential / refutation / discharge-challenge). */
+  stage(name: string, info: Record<string, unknown>): void;
   confirmDecisions(rows: ConfirmDecisionInput[], decisionPath?: string): void;
   finish(status: RunStatus, coverage?: Coverage, findingsTotal?: number): void;
 }
@@ -112,6 +114,15 @@ export class RunRecorder implements RunTracker {
       this.store!.upsertFindings(this.projectId!, this.runId!, findings.map((finding) => toFindingRow(finding, runDir)), reason);
     } catch (error) {
       this.disable("findings", error);
+    }
+  }
+
+  stage(name: string, info: Record<string, unknown>): void {
+    if (!this.ready()) return;
+    try {
+      this.store!.recordStage(this.runId!, name, info);
+    } catch (error) {
+      this.disable("stage", error);
     }
   }
 

@@ -174,6 +174,10 @@ class RemoteTracker implements RunTracker {
     this.enqueue(() => (this.runId ? this.req("PATCH", `/api/daemon/runs/${this.runId}`, { findings: findings.map((f) => toFindingRow(f, runDir)), reason }) : Promise.resolve()));
   }
 
+  stage(name: string, info: Record<string, unknown>): void {
+    this.enqueue(() => (this.runId ? this.req("PATCH", `/api/daemon/runs/${this.runId}`, { stage: { name, info } }) : Promise.resolve()));
+  }
+
   confirmDecisions(rows: ConfirmDecisionInput[], decisionPath?: string): void {
     if (rows.length === 0) return;
     this.enqueue(() => (this.runId ? this.req("PATCH", `/api/daemon/runs/${this.runId}`, { confirmDecisions: rows, decisionPath }) : Promise.resolve()));

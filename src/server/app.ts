@@ -855,6 +855,7 @@ async function daemonRunUpdate(c: Ctx): Promise<void> {
     confirmDecisions?: Parameters<MetadataStore["upsertConfirmDecisions"]>[2];
     decisionPath?: string;
     runScopes?: { done: number; target: number };
+    stage?: { name: string; info: Record<string, unknown> };
     finish?: { status: Parameters<MetadataStore["finishRun"]>[1]; coverage?: Coverage; findingsTotal?: number };
   };
   if (body.scopes) {
@@ -862,6 +863,7 @@ async function daemonRunUpdate(c: Ctx): Promise<void> {
     c.store.updateRunCoverage(runId, c.store.scopeProgress(projectId));
   }
   if (body.runScopes) c.store.updateRunScopes(runId, body.runScopes.done, body.runScopes.target);
+  if (body.stage) c.store.recordStage(runId, body.stage.name, body.stage.info);
   if (body.findings) c.store.upsertFindings(projectId, runId, body.findings, body.reason);
   if (body.confirmDecisions) c.store.upsertConfirmDecisions(projectId, runId, body.confirmDecisions, body.decisionPath);
   if (body.finish) c.store.finishRun(runId, body.finish.status, body.finish.coverage, body.finish.findingsTotal);

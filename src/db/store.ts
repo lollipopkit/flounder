@@ -159,6 +159,7 @@ CREATE TABLE IF NOT EXISTS run(
   model TEXT,
   thinking TEXT,
   budgets_json TEXT,
+  stages_json TEXT,               -- post-dig stage outcomes (synthesis / differential / refutation / discharge-challenge) for the funnel view
   scopes_total INTEGER,
   scopes_audited INTEGER,
   scopes_pending INTEGER,
@@ -306,6 +307,7 @@ export class MetadataStore {
       "ALTER TABLE finding ADD COLUMN exploit_sketch TEXT",
       "ALTER TABLE finding ADD COLUMN fix TEXT",
       "ALTER TABLE finding ADD COLUMN confidence REAL",
+      "ALTER TABLE run ADD COLUMN stages_json TEXT", // funnel: post-dig stage outcomes
     ]) {
       try {
         this.db.exec(alter);
@@ -462,6 +464,16 @@ export class MetadataStore {
     this.db
       .prepare("UPDATE run SET run_scopes_done = ?, run_scopes_target = ?, dig_started_at = COALESCE(dig_started_at, ?) WHERE id = ?")
       .run(done, target, now(), runId);
+  }
+
+  /** Record one post-dig STAGE's outcome on the run (synthesis / differential / refutation /
+   * discharge-challenge), merged into stages_json keyed by stage name, for the funnel view. */
+  recordStage(runId: number, name: string, info: Record<string, unknown>): void {
+    const row = this.db.prepare("SELECT stages_json FROM run WHERE id = ?").get(runId) as { stages_json?: string } | undefined;
+    let stages: Record<string, unknown> = {};
+    try { if (row?.stages_json) stages = JSON.parse(row.stages_json) as Record<string, unknown>; } catch { /* reset on corruption */ }
+    stages[name] = { ...(stages[name] as Record<string, unknown> | undefined), ...info, at: now() };
+    this.db.prepare("UPDATE run SET stages_json = ? WHERE id = ?").run(JSON.stringify(stages), runId);
   }
 
   listRuns(projectId?: number, limit?: number): Array<Record<string, unknown>> {

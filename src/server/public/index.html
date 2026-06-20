@@ -182,9 +182,9 @@
   .actbody .act { padding: 4px 0; border-bottom: 0; }
 
   .d-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-  .d-head h2 { font-size: 24px; font-weight: 500; margin: 0; letter-spacing: -0.01em; }
-  .stats { display: flex; gap: 32px; margin: 18px 0 2px; flex-wrap: wrap; }
-  .stat .n { font-size: 24px; font-weight: 500; } .stat .k { color: var(--fg-muted); font-size: 12px; margin-top: 2px; }
+  .d-head h2 { font-size: 21px; font-weight: 600; margin: 0; letter-spacing: -0.02em; }
+  .stats { display: flex; gap: 30px; margin: 18px 0 2px; flex-wrap: wrap; }
+  .stat .n { font-size: 22px; font-weight: 600; letter-spacing: -0.02em; } .stat .k { color: var(--fg-muted); font-size: 11.5px; margin-top: 3px; }
   .section-title { font-size: 11px; font-weight: 500; margin: 0 0 14px; display: flex; align-items: center; gap: 8px; color: var(--fg-subtle); text-transform: uppercase; letter-spacing: .05em; }
   .section-title .octicon { fill: var(--fg-subtle); }
   .pipeline { display: flex; align-items: stretch; gap: 6px; margin: 18px 0 6px; }
@@ -258,6 +258,65 @@
   .checks input { width: auto; }
   .hint { color: var(--fg-muted); font-size: 12px; margin-top: 10px; }
   .dlg-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 16px; border-top: 1px solid var(--border); background: var(--canvas-subtle); }
+
+  /* ── Funnel: the post-dig pipeline as a narrowing column. Each stage shows its effect on the
+     candidate pool (ADD a lead / REFINE a confirmation / REMOVE a refuted one), so the run reads
+     as "many hypotheses in → few high-confidence candidates out". ── */
+  .funnel { display: flex; flex-direction: column; gap: 0; margin-top: 2px; }
+  .fn-row { display: flex; align-items: center; gap: 12px; padding: 9px 0; position: relative; }
+  .fn-row + .fn-row { border-top: 1px solid var(--border-muted); }
+  .fn-sign { width: 20px; height: 20px; border-radius: 6px; flex: none; display: inline-flex; align-items: center; justify-content: center; font: 600 12px/1 var(--mono); }
+  .fn-sign.add { color: var(--success-fg); background: rgba(63,185,80,.12); }
+  .fn-sign.remove { color: var(--danger-fg); background: rgba(214,69,60,.12); }
+  .fn-sign.refine { color: var(--accent); background: var(--sel-bg); }
+  .fn-sign.start { color: var(--fg-muted); background: var(--canvas-inset); }
+  .fn-main { flex: 1; min-width: 0; }
+  .fn-name { font-weight: 500; font-size: 13px; display: flex; align-items: center; gap: 8px; }
+  .fn-name .fn-delta { font-family: var(--mono); font-size: 12px; font-weight: 600; }
+  .fn-name .fn-delta.add { color: var(--success-fg); } .fn-name .fn-delta.remove { color: var(--danger-fg); } .fn-name .fn-delta.refine { color: var(--accent); }
+  .fn-sub { font-size: 11.5px; color: var(--fg-muted); margin-top: 2px; line-height: 1.45; }
+  .fn-bartrack { width: 132px; flex: none; height: 22px; display: flex; align-items: center; }
+  .fn-bar { height: 7px; border-radius: 4px; background: var(--neutral-emphasis); opacity: .85; min-width: 4px; transition: width .25s ease; }
+  .fn-bar.add { background: var(--success-emphasis); } .fn-bar.remove { background: var(--danger-emphasis); } .fn-bar.refine { background: var(--accent-emphasis); } .fn-bar.start { background: var(--neutral-emphasis); opacity: .4; }
+  .fn-count { font: 600 13px/1 var(--mono); color: var(--fg); width: 30px; text-align: right; flex: none; }
+  .fn-row.fn-out { margin-top: 4px; padding-top: 13px; border-top: 1px solid var(--border); }
+  .fn-row.fn-out .fn-name { font-size: 14px; font-weight: 600; }
+  .fn-pending { color: var(--fg-subtle); font-style: italic; font-size: 12px; }
+
+  /* ── Top candidates: the funnel's payoff — surviving findings ranked by status × severity ×
+     confidence, the "most suspicious bugs" decision list. ── */
+  .cand { display: flex; flex-direction: column; }
+  .cand-row { display: flex; align-items: flex-start; gap: 12px; padding: 11px 2px; border-bottom: 1px solid var(--border-muted); cursor: pointer; }
+  .cand-row:last-child { border-bottom: 0; }
+  .cand-row:hover { background: var(--canvas-subtle); }
+  .cand-rank { font: 600 12px/1 var(--mono); color: var(--fg-subtle); width: 18px; flex: none; padding-top: 3px; }
+  .cand-body { flex: 1; min-width: 0; }
+  .cand-title { font-weight: 500; font-size: 13.5px; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cand-row:hover .cand-title { color: var(--accent); }
+  .cand-meta { display: flex; align-items: center; gap: 8px; margin-top: 4px; flex-wrap: wrap; }
+  .cand-loc { font: 11px/1.4 var(--mono); color: var(--fg-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+  .sev { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; padding: 1px 6px; border-radius: 4px; }
+  .sev-critical { color: #fff; background: var(--danger-emphasis); } .sev-high { color: var(--danger-fg); background: rgba(214,69,60,.12); }
+  .sev-medium { color: var(--attention-fg); background: rgba(176,122,20,.13); } .sev-low { color: var(--fg-muted); background: var(--canvas-inset); } .sev-info { color: var(--fg-subtle); background: var(--canvas-inset); }
+  .conf-meter { display: inline-flex; align-items: center; gap: 5px; font: 11px/1 var(--mono); color: var(--fg-muted); }
+  .conf-track { width: 34px; height: 4px; border-radius: 3px; background: var(--border); overflow: hidden; }
+  .conf-fill { height: 100%; background: var(--accent-emphasis); }
+
+  /* ── Cmd-K command palette ── */
+  .cmdk-back { position: fixed; inset: 0; background: rgba(20,20,24,.45); display: none; align-items: flex-start; justify-content: center; z-index: 50; padding-top: 12vh; }
+  .cmdk-back.on { display: flex; }
+  :root[data-theme="dark"] .cmdk-back { background: rgba(0,0,0,.6); }
+  .cmdk { width: min(560px, 92vw); background: var(--canvas); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 16px 48px rgba(20,20,24,.28); overflow: hidden; }
+  :root[data-theme="dark"] .cmdk { box-shadow: 0 20px 56px rgba(0,0,0,.7); }
+  .cmdk input { border: 0; border-bottom: 1px solid var(--border); border-radius: 0; padding: 14px 16px; font-size: 15px; }
+  .cmdk input:focus { box-shadow: none; border-color: var(--border); }
+  .cmdk-list { max-height: 50vh; overflow-y: auto; padding: 6px; }
+  .cmdk-item { display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 7px; cursor: pointer; font-size: 13.5px; }
+  .cmdk-item .octicon { fill: var(--fg-muted); flex: none; }
+  .cmdk-item.sel { background: var(--sel-bg); } .cmdk-item.sel .octicon { fill: var(--accent); }
+  .cmdk-item .ci-sub { color: var(--fg-subtle); font-size: 11px; margin-left: auto; font-family: var(--mono); }
+  .cmdk-empty { padding: 22px 16px; text-align: center; color: var(--fg-muted); font-size: 13px; }
+  .kbd { font: 11px/1 var(--mono); border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 5px; padding: 2px 5px; color: var(--fg-muted); background: var(--canvas-subtle); }
 </style>
 </head>
 <body>
@@ -278,7 +337,7 @@
       <span id="projCount" class="counter">0</span>
       <button class="btn primary sm" id="newProjectBtn"><svg class="octicon" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M7.75 2a.75.75 0 0 1 .75.75V7h4.25a.75.75 0 0 1 0 1.5H8.5v4.25a.75.75 0 0 1-1.5 0V8.5H2.75a.75.75 0 0 1 0-1.5H7V2.75A.75.75 0 0 1 7.75 2Z"></path></svg>New project</button>
     </div>
-    <input class="searchbar" id="projSearch" placeholder="Filter projects…" />
+    <input class="searchbar" id="projSearch" placeholder="Filter projects…  ⌘K for commands" />
     <div id="listItems"></div>
   </div>
   <div id="detail"><div class="empty">Select a project, or create one with “New project”.</div></div>
@@ -294,6 +353,13 @@
   </div>
   <div class="card"><div id="bugsTable"></div></div>
 </section>
+
+<div class="cmdk-back" id="cmdkBack">
+  <div class="cmdk" role="dialog" aria-label="Command palette">
+    <input id="cmdkInput" placeholder="Jump to a project or run a command…" autocomplete="off" spellcheck="false" />
+    <div class="cmdk-list" id="cmdkList"></div>
+  </div>
+</div>
 
 <dialog id="projDialog"><form method="dialog" id="projForm">
   <div class="dlg-head">Create project</div>
@@ -651,6 +717,10 @@ async function loadDetail() {
   if (state.detail) {
     const sr = await fetch("/api/projects/" + encodeURIComponent(state.selected) + "/scopes");
     state.detail.scopes = sr.ok ? (await sr.json()).scopes : [];
+    // A wider, unpaginated slice JUST for ranking the top-candidates panel (the paginated
+    // state.f.rows below the funnel is a separate, filtered view).
+    const fr = await fetch("/api/projects/" + encodeURIComponent(state.selected) + "/findings?limit=300");
+    state.detail.allFindings = fr.ok ? (await fr.json()).findings : [];
   }
   // Skip the re-render when nothing visible changed, so the ~1.2s live-update tick doesn't churn
   // the whole detail DOM (which disrupts scrolling the scopes/findings and flickers). The live
@@ -754,6 +824,69 @@ function renderPipeline(d, pr) {
     + node("confirm", "confirm", "shieldcheck", ph.confirm) + '</div>';
 }
 
+// A titled detail-card (shared by the phase panels + the funnel/candidates sections).
+function card(titleHtml, body) { return '<div class="card"><div class="section-title">' + titleHtml + '</div>' + body + '</div>'; }
+
+// ── Top-candidates ranking: status (execution-strength) dominates, then severity, then the
+// model's confidence. Discharged/refuted are excluded — the funnel already filtered them out.
+const STATUS_RANK = { "confirmed-differential": 5, "confirmed-executable": 4, "confirmed-source": 3, "suspected": 2, "discharged": 0, "refuted": -1 };
+const SEV_RANK = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
+function rankCandidates(rows) {
+  return (rows || [])
+    .filter((f) => (STATUS_RANK[f.status] ?? 0) >= 2 && (SEV_RANK[f.severity] ?? 0) >= 2) // drop discharged/refuted + low/info noise
+    .map((f) => ({ f, key: (STATUS_RANK[f.status] ?? 0) * 100 + (SEV_RANK[f.severity] ?? 0) * 10 + (Number(f.confidence) || 0) }))
+    .sort((a, b) => b.key - a.key)
+    .map((x) => x.f);
+}
+
+// The dig run's post-loop pipeline (synthesis → differential → refutation → discharge-challenge),
+// persisted per-run in stages_json, rendered as a narrowing funnel: hypotheses in, candidates out.
+function renderFunnel(d) {
+  const digRuns = (d.runs || []).filter((r) => r.kind === "run" || r.kind === "audit");
+  const stageRun = digRuns.find((r) => { try { return Object.keys(JSON.parse(r.stages_json || "{}")).length > 0; } catch { return false; } });
+  if (!stageRun) return ""; // no post-dig stages recorded yet (older run, or still digging)
+  let S = {}; try { S = JSON.parse(stageRun.stages_json) || {}; } catch {}
+  const cand = rankCandidates(d.allFindings);
+  const syn0 = S.synthesis;
+  // Pre-synthesis dig pool: synthesis.pool already folds in the +produced chains, so back them out.
+  const start = syn0 && syn0.pool != null ? (syn0.pool - (syn0.produced || 0))
+    : (stageRun.findings_total != null ? stageRun.findings_total : (d.allFindings || []).length);
+  // Relative bar width vs the largest count in play, so the column reads as a funnel.
+  const counts = [start, cand.length, S["discharge-challenge"] && S["discharge-challenge"].discharged, syn0 && syn0.pool].filter((n) => n != null);
+  const peak = Math.max(start || 1, ...counts, 1);
+  const bar = (n, cls) => '<div class="fn-bartrack"><div class="fn-bar ' + cls + '" style="width:' + Math.max(6, Math.round((n / peak) * 100)) + '%"></div></div>';
+  const row = (cls, sign, name, delta, deltaCls, sub, count, barN) =>
+    '<div class="fn-row"><span class="fn-sign ' + cls + '">' + sign + '</span>'
+    + '<div class="fn-main"><div class="fn-name">' + name + (delta ? ' <span class="fn-delta ' + (deltaCls || cls) + '">' + delta + '</span>' : '') + '</div>'
+    + (sub ? '<div class="fn-sub">' + sub + '</div>' : '') + '</div>'
+    + bar(barN, cls) + '<span class="fn-count">' + count + '</span></div>';
+  let rows = row("start", "•", "dig findings", "", "", "raw hypotheses from the per-scope digs", start, start);
+  const syn = S.synthesis;
+  if (syn) rows += row("add", "+", "synthesis", "+" + (syn.produced || 0) + " chains", "add", "cross-scope composition over " + (syn.scopes || "?") + " scopes — inputs unbound in one region reaching a sink in another", (syn.pool != null ? syn.pool : start + (syn.produced || 0)), syn.pool != null ? syn.pool : start);
+  const diff = S.differential;
+  if (diff) rows += row("refine", "⚙", "differential", (diff.confirmed || 0) + "/" + (diff.tested || 0) + " → differential", "refine", "fix-equivalence: a real bug's exploit is blocked by its own fix; a tautology is not", (diff.confirmed || 0), diff.tested || 0);
+  const ref = S.refutation;
+  if (ref) rows += row("remove", "−", "refutation", "−" + (ref.refuted || 0) + " refuted" + (ref.disputed ? " · " + ref.disputed + " disputed" : ""), "remove", "a fresh-context skeptic re-derives the invariant and breaks single-test confirmations", (ref.candidates || 0) - (ref.refuted || 0), ref.candidates || 0);
+  const ch = S.discharge_challenge || S["discharge-challenge"];
+  if (ch) rows += row("add", "+", "discharge challenge", "+" + (ch.overturned || 0) + " re-opened", "add", "skeptic re-examines " + (ch.challenged || 0) + " of " + (ch.discharged || 0) + " obligations dismissed as safe; unsound ones return as leads", (ch.overturned || 0), ch.challenged || 0);
+  rows += '<div class="fn-row fn-out"><span class="fn-sign refine">=</span><div class="fn-main"><div class="fn-name">candidates</div>'
+    + '<div class="fn-sub">medium+ leads surviving the pipeline — ranked below, top 8 shown</div></div>' + bar(cand.length, "refine") + '<span class="fn-count">' + cand.length + '</span></div>';
+  return card(icon("bug") + 'dig funnel <span class="muted">run #' + stageRun.id + ' · hypotheses → candidates</span>', '<div class="funnel">' + rows + '</div>');
+}
+
+// The funnel's payoff: the surviving findings as a decision-ready "most suspicious bugs" list.
+function renderTopCandidates(d) {
+  const cand = rankCandidates(d.allFindings).slice(0, 8);
+  if (!cand.length) return "";
+  const sevTag = (s) => s ? '<span class="sev sev-' + esc(s) + '">' + esc(s) + '</span>' : "";
+  const conf = (c) => c != null ? '<span class="conf-meter"><span class="conf-track"><span class="conf-fill" style="width:' + Math.round(Number(c) * 100) + '%"></span></span>' + Math.round(Number(c) * 100) + '%</span>' : "";
+  const repro = (f) => f.confirm_status === "reproduced" ? '<span class="label s-confirmed-differential">✓ reproduced</span>' : "";
+  const rows = cand.map((f, i) => '<div class="cand-row" data-cand="' + esc(String(f.id)) + '"><span class="cand-rank">' + (i + 1) + '</span>'
+    + '<div class="cand-body"><div class="cand-title">' + esc(f.title || "") + '</div>'
+    + '<div class="cand-meta">' + statusBadge(f.status) + sevTag(f.severity) + conf(f.confidence) + repro(f) + '<span class="cand-loc">' + esc(f.location || "") + '</span></div></div></div>').join("");
+  return card(icon("shieldcheck") + 'most suspicious bugs <span class="muted">top ' + cand.length + ' after the funnel</span>', '<div class="cand">' + rows + '</div>');
+}
+
 function renderDetail() {
   const el = $("#detail");
   const d = state.detail;
@@ -844,7 +977,6 @@ function renderDetail() {
   } else if (!["prepare", "map", "dig", "confirm"].includes(state.phase)) {
     state.phase = d.confirmDecisions.length ? "confirm" : (pr.audited > 0 || d.findingsTotal > 0) ? "dig" : pr.total > 0 ? "map" : d.runs.some((r) => r.kind === "prepare") ? "prepare" : "dig";
   }
-  const card = (titleHtml, body) => '<div class="card"><div class="section-title">' + titleHtml + '</div>' + body + '</div>';
   let phaseContent = "";
   if (state.phase === "prepare") {
     const rs = d.runs.filter((r) => r.kind === "prepare");
@@ -857,7 +989,9 @@ function renderDetail() {
     phaseContent = card(icon("shieldcheck") + 'confirm · decisions', decisionsInner) + (rs.length ? card(icon("play") + 'confirm runs', runsTableHtml(rs)) : "");
   } else {
     const rs = d.runs.filter((r) => r.kind === "run" || r.kind === "audit");
-    phaseContent = card(icon("bug") + 'dig · findings <span class="muted">' + d.findingsTotal + '</span>', '<div class="chips" id="chips"></div><div id="findings"></div>') + card(icon("play") + 'dig runs', runsTableHtml(rs));
+    phaseContent = renderFunnel(d) + renderTopCandidates(d)
+      + card(icon("bug") + 'dig · all findings <span class="muted">' + d.findingsTotal + '</span>', '<div class="chips" id="chips"></div><div id="findings"></div>')
+      + card(icon("play") + 'dig runs', runsTableHtml(rs));
   }
   el.innerHTML =
     '<div class="card">'
@@ -943,6 +1077,7 @@ function renderDetail() {
     else body += '<div class="muted" style="margin-top:8px">' + (sc.status === "audited" ? "Result: audited — no finding recorded for this obligation (the dig surfaced no violation; full reasoning is in the run dir's audit_report.md)." : sc.status === "auditing" ? "auditing — this scope is being deep-audited right now." : sc.status === "deferred" ? "skipped — excluded from auto-dig." : "pending — not yet audited.") + '</div>';
     row.insertAdjacentHTML("afterend", '<tr class="scope-detail"><td></td><td colspan="5" style="padding:10px 14px;background:rgba(127,127,127,.06)">' + body + '</td></tr>');
   });
+  el.querySelectorAll("[data-cand]").forEach((row) => row.onclick = () => { const f = (state.detail.allFindings || []).find((x) => String(x.id) === row.dataset.cand); if (f) openFindingDetail(f); });
   el.querySelectorAll("[data-report]").forEach((b) => b.onclick = (e) => { e.stopPropagation(); openReport(b.dataset.report, b.dataset.rname, b.dataset.rtitle); });
   el.querySelectorAll("[data-phase]").forEach((n) => n.onclick = () => { state.phase = n.dataset.phase; state.phasePinned = true; renderDetail(); });
   const sp = $("#prevS"); if (sp) sp.onclick = () => { state.scopePage = Math.max(0, state.scopePage - 1); renderDetail(); };
@@ -1362,6 +1497,43 @@ function connect() {
   };
   es.onerror = () => { $("#livePill").textContent = "reconnecting…"; $("#livePill").className = "counter"; };
 }
+// ── Cmd-K command palette: fuzzy-jump to any project + the global/context actions, with
+// full keyboard control (⌘K toggle, ↑/↓ navigate, Enter run, Esc close). ──
+const cmdkBack = $("#cmdkBack"), cmdkInput = $("#cmdkInput"), cmdkList = $("#cmdkList");
+let cmdkItems = [], cmdkSel = 0;
+function cmdkCommands() {
+  const cmds = (state.projects || []).map((p) => ({ icon: "bug", label: p.name, sub: "project", run: () => { setView("projects"); selectProject(p.name); } }));
+  cmds.push({ icon: "package", label: "New project", sub: "create", run: () => $("#newProjectBtn").click() });
+  cmds.push({ icon: "search", label: "Go to Bugs", sub: "view", run: () => setView("bugs") });
+  cmds.push({ icon: "shieldcheck", label: "Go to Projects", sub: "view", run: () => setView("projects") });
+  cmds.push({ icon: (localStorage.getItem("flounder-theme") === "dark") ? "sun" : "moon", label: "Toggle theme", sub: "appearance", run: () => $("#themeBtn").click() });
+  if (state.selected && state.detail) cmds.push({ icon: "play", label: (state.detail.runsTotal > 0 ? "Continue audit · " : "Start audit · ") + state.selected, sub: "run", run: () => command("continue") });
+  return cmds;
+}
+function openCmdk() { cmdkBack.classList.add("on"); cmdkInput.value = ""; cmdkSel = 0; renderCmdk(); setTimeout(() => cmdkInput.focus(), 0); }
+function closeCmdk() { cmdkBack.classList.remove("on"); }
+function renderCmdk() {
+  const q = cmdkInput.value.trim().toLowerCase();
+  cmdkItems = cmdkCommands().filter((c) => !q || c.label.toLowerCase().includes(q) || (c.sub || "").includes(q));
+  if (cmdkSel >= cmdkItems.length) cmdkSel = Math.max(0, cmdkItems.length - 1);
+  if (!cmdkItems.length) { cmdkList.innerHTML = '<div class="cmdk-empty">No matches</div>'; return; }
+  cmdkList.innerHTML = cmdkItems.map((c, i) => '<div class="cmdk-item ' + (i === cmdkSel ? "sel" : "") + '" data-i="' + i + '">' + icon(c.icon) + '<span>' + esc(c.label) + '</span><span class="ci-sub">' + esc(c.sub || "") + '</span></div>').join("");
+  cmdkList.querySelectorAll(".cmdk-item").forEach((it) => { it.onclick = () => runCmdk(Number(it.dataset.i)); it.onmousemove = () => { cmdkSel = Number(it.dataset.i); paintCmdkSel(); }; });
+}
+function paintCmdkSel() { cmdkList.querySelectorAll(".cmdk-item").forEach((it, i) => it.classList.toggle("sel", i === cmdkSel)); }
+function scrollCmdkSel() { const el = cmdkList.querySelectorAll(".cmdk-item")[cmdkSel]; if (el) el.scrollIntoView({ block: "nearest" }); }
+function runCmdk(i) { const c = cmdkItems[i]; if (!c) return; closeCmdk(); c.run(); }
+cmdkInput.oninput = () => { cmdkSel = 0; renderCmdk(); };
+cmdkBack.onclick = (e) => { if (e.target === cmdkBack) closeCmdk(); };
+window.addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); cmdkBack.classList.contains("on") ? closeCmdk() : openCmdk(); return; }
+  if (!cmdkBack.classList.contains("on")) return;
+  if (e.key === "Escape") { e.preventDefault(); closeCmdk(); }
+  else if (e.key === "ArrowDown") { e.preventDefault(); cmdkSel = Math.min(cmdkItems.length - 1, cmdkSel + 1); paintCmdkSel(); scrollCmdkSel(); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); cmdkSel = Math.max(0, cmdkSel - 1); paintCmdkSel(); scrollCmdkSel(); }
+  else if (e.key === "Enter") { e.preventDefault(); runCmdk(cmdkSel); }
+});
+
 loadProviders(); // so the detail header can show the selected provider's name
 connect();
 routeFromHash(); // open the project/view named in the URL on first load

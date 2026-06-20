@@ -411,8 +411,10 @@ export async function runAudit(
       aggregatedSteps.push(...synthPhase.steps);
       ingestFindingsFromScratch(session);
       for (const composed of session.findings) aggregated.push(composed);
-      await logger.event("audit_synthesis_done", { produced: session.findings.length });
+      const produced = session.findings.length;
+      await logger.event("audit_synthesis_done", { produced });
       recorder.findings(aggregated, logger.runDir, "synthesis");
+      recorder.stage("synthesis", { scopes: scopeInventory.length, produced, pool: aggregated.length }); // funnel: cross-scope chains ADDED
     }
     // Each scope/dig session numbered its findings independently (f1, f2, …), so
     // aggregating across scopes collides. Re-id uniquely so every finding gets its
@@ -463,6 +465,7 @@ export async function runAudit(
     }
     if (differentials.length > 0) await logger.artifact("audit_differential.json", differentials);
     recorder.findings(session.findings, logger.runDir, "differential"); // push status upgrades (confirmed-differential) to the UI live
+    if (differentials.length > 0) recorder.stage("differential", { tested: differentials.length, confirmed: differentials.filter((d) => d.confirmed).length }); // funnel: executable→differential
   }
 
   // Independent refutation: a fresh-context skeptic re-derives the invariant and
@@ -550,6 +553,11 @@ export async function runAudit(
         }
         clearScratchFindings(session);
       }
+      recorder.stage("refutation", {
+        candidates: candidates.length,
+        refuted: candidates.filter((f) => f.refutation?.refuted).length, // funnel: confirmations the skeptic broke
+        disputed: candidates.filter((f) => f.disputed).length, // execution-proven but flagged for humans
+      });
     }
     recorder.findings(session.findings, logger.runDir, "refutation"); // push refutation downgrades (suspected/refuted) to the UI
   }
@@ -582,6 +590,7 @@ export async function runAudit(
       if (verdicts.length > 0) await logger.artifact("audit_discharge_challenge.json", verdicts);
       await logger.event("audit_discharge_challenge_done", { challenged: verdicts.length, overturned });
       if (overturned > 0) recorder.findings(session.findings, logger.runDir, "discharge-challenge");
+      recorder.stage("discharge-challenge", { discharged: discharged.length, challenged: verdicts.length, overturned }); // funnel: re-opened misses ADDED
     }
   }
 

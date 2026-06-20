@@ -161,21 +161,45 @@ function selectedFixtureGroups(entry, registry, fixtureSet) {
   return groups;
 }
 
-function focusFor(entry) {
+function focusFor() {
   return [
-    `Prompt regression case: ${entry.label}.`,
-    "Audit the supplied minimized public-safe fixture as a blind target.",
-    "Derive the relevant security obligations from the code and any included comments.",
-    "Do not assume the historical incident name, target name, address, or proprietary report.",
+    "Audit the supplied source as an authorized blind target.",
+    "Derive the relevant security obligations from the code and any supplied design material.",
+    "Do not assume a historical incident, target name, address, or proprietary report.",
     "Do not assume a bug exists; discharge obligations when the code binds the value or capability correctly.",
     "A valid result must explain the general bug class and, if possible, confirm it with a local attacker-real PoC.",
   ].join(" ");
 }
 
-function buildConfig(entry, fixtureGroup, sampleIndex, options) {
+function neutralSourcePath(runKey, sourceIndex, sourcePath, options) {
+  const ext = path.extname(sourcePath) || ".txt";
+  return path.join(root, options.out, "_neutral-inputs", runKey, `source_${sourceIndex + 1}${ext}`);
+}
+
+export function stripLineComments(text) {
+  return text
+    .split(/\r?\n/)
+    .map((line) => {
+      const marker = line.indexOf("//");
+      return marker >= 0 ? line.slice(0, marker).trimEnd() : line;
+    })
+    .join("\n");
+}
+
+async function materializeNeutralSources(sourcePaths, neutralPaths) {
+  for (let i = 0; i < sourcePaths.length; i++) {
+    const sourcePath = path.join(root, sourcePaths[i]);
+    const neutralPath = neutralPaths[i];
+    await mkdir(path.dirname(neutralPath), { recursive: true });
+    await writeFile(neutralPath, stripLineComments(await readFile(sourcePath, "utf8")));
+  }
+}
+
+function buildConfig(entry, fixtureGroup, sampleIndex, options, planIds) {
   const cfg = defaultConfig();
-  cfg.targetName = `prompt-regression-${options.variant}-${entry.id}-${fixtureGroup.fixtureSet}-${fixtureGroup.fixtureId}-s${sampleIndex}`;
-  cfg.sourcePaths = fixtureGroup.sourcePaths.map((fixture) => path.join(root, fixture));
+  const runKey = `c${planIds.caseIndex + 1}-f${planIds.fixtureIndex + 1}-s${sampleIndex}`;
+  cfg.targetName = `prompt-regression-${runKey}`;
+  cfg.sourcePaths = fixtureGroup.sourcePaths.map((fixture, idx) => neutralSourcePath(runKey, idx, fixture, options));
   cfg.corpusPaths = [];
   cfg.outputDir = path.resolve(root, options.out);
   cfg.provider = options.provider;
@@ -189,7 +213,7 @@ function buildConfig(entry, fixtureGroup, sampleIndex, options) {
   cfg.auditAppeal = false;
   cfg.auditSynthesize = options.synthesize;
   cfg.auditChallengeDischarges = false;
-  cfg.auditScopeNote = focusFor(entry);
+  cfg.auditScopeNote = focusFor();
   cfg.sandboxBackend = "host";
   cfg.sandboxAllowHostFallback = true;
   cfg.sandboxConfirmNetwork = "none";
@@ -199,7 +223,7 @@ function buildConfig(entry, fixtureGroup, sampleIndex, options) {
 
   if (options.mode === "deep") {
     cfg.auditDeep = true;
-    cfg.auditDeepFocus = fixtureGroup.sourcePaths.join(", ");
+    cfg.auditDeepFocus = cfg.sourcePaths.map((sourcePath) => path.basename(sourcePath)).join(", ");
   } else if (options.mode === "map-dig") {
     cfg.auditDeep = true;
     cfg.auditDeepFocus = undefined;
@@ -226,7 +250,8 @@ function renderPlanEntry(entry, fixtureGroup, sampleIndex, cfg, options) {
     thinking: cfg.thinkingLevel,
     synthesize: cfg.auditSynthesize === true,
     targetName: cfg.targetName,
-    sourcePaths: fixtureGroup.sourcePaths,
+    sourcePaths: cfg.sourcePaths.map((sourcePath) => path.relative(root, sourcePath)),
+    originalSourcePaths: fixtureGroup.sourcePaths,
     outputDir: path.relative(root, cfg.outputDir),
     maxSteps: cfg.auditMaxSteps,
     mapSteps: cfg.auditMapSteps,
@@ -326,10 +351,13 @@ async function main() {
   const registry = await loadRegistry();
   const cases = selectCases(registry, readFlags("--case"));
   const plan = [];
-  for (const entry of cases) {
-    for (const fixtureGroup of selectedFixtureGroups(entry, registry, options.fixtureSet)) {
+  for (let caseIndex = 0; caseIndex < cases.length; caseIndex++) {
+    const entry = cases[caseIndex];
+    const fixtureGroups = selectedFixtureGroups(entry, registry, options.fixtureSet);
+    for (let fixtureIndex = 0; fixtureIndex < fixtureGroups.length; fixtureIndex++) {
+      const fixtureGroup = fixtureGroups[fixtureIndex];
       for (let sample = 1; sample <= options.samples; sample++) {
-        const cfg = buildConfig(entry, fixtureGroup, sample, options);
+        const cfg = buildConfig(entry, fixtureGroup, sample, options, { caseIndex, fixtureIndex });
         plan.push({ entry, fixtureGroup, sample, cfg, publicPlan: renderPlanEntry(entry, fixtureGroup, sample, cfg, options) });
       }
     }
@@ -354,6 +382,7 @@ async function main() {
   await mkdir(path.resolve(root, options.out), { recursive: true });
   const results = [];
   for (const item of plan) {
+    await materializeNeutralSources(item.fixtureGroup.sourcePaths, item.cfg.sourcePaths);
     const llm = options.mockLlm ? new MockAuditLlmClient() : undefined;
     const startedAt = new Date().toISOString();
     const run = await runAudit(item.cfg, { kind: "run", ...(llm ? { llm } : {}) });

@@ -15,7 +15,7 @@ import {
   POC_TRUST_RULE,
 } from "../dist/agent/prompts.js";
 import { buildSessionPrompt } from "../dist/agent/pi-session.js";
-import { confirmedFindingCount, scoreArtifact } from "../scripts/prompt-regression-eval.mjs";
+import { confirmedFindingCount, scoreArtifact, stripLineComments } from "../scripts/prompt-regression-eval.mjs";
 
 const root = path.resolve(".");
 const registryPath = path.join(root, "fixtures/prompt-regression/known-bugs.json");
@@ -156,6 +156,35 @@ test("prompt regression negative and control scoring rejects confirmed findings"
   assert.equal(confirmedControl.positiveScore, false);
   assert.equal(confirmedControl.confirmedFindings, 1);
   assert.equal(confirmedFindingCount("## Summary\n- Confirmed findings: 2 (critical)"), 2);
+});
+
+test("prompt regression live inputs use neutral model-visible names", async () => {
+  const registry = await loadRegistry();
+  const { stdout } = await execFileAsync(
+    "node",
+    ["scripts/prompt-regression-eval.mjs", "--dry-run", "--fixture-set", "all", "--variant", "candidate"],
+    { cwd: root },
+  );
+  const plan = JSON.parse(stdout);
+  const forbidden = new Set(registry.promptContract.forbiddenDefaultPromptNeedles);
+  for (const entry of registry.cases) {
+    for (const needle of entry.doNotInjectIntoPrompt) forbidden.add(needle);
+  }
+  for (const run of plan.runs) {
+    const modelVisible = [run.targetName, ...run.sourcePaths].join("\n");
+    assert.equal(modelVisible.includes(run.caseId), false, `${run.caseId} leaked into model-visible plan`);
+    assert.equal(modelVisible.includes(run.fixtureId), false, `${run.fixtureId} leaked into model-visible plan`);
+    for (const needle of forbidden) {
+      assert.equal(modelVisible.includes(needle), false, `model-visible plan leaked known-bug term: ${needle}`);
+    }
+  }
+});
+
+test("prompt regression neutral source materialization strips line comments", () => {
+  assert.equal(
+    stripLineComments("uint256 x; // answer-bearing comment\nstring memory y = \"keep\";\n"),
+    "uint256 x;\nstring memory y = \"keep\";\n",
+  );
 });
 
 test("default prompts retain the generic capabilities needed by known-bug regressions", async () => {

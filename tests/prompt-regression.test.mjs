@@ -207,7 +207,32 @@ test("prompt regression eval runner expands dry-run plans without model calls", 
     ["aztec-2026-06-17-recursive-verifier-boundary", "aztec-2026-06-17-recursive-verifier-boundary"],
   );
   assert.ok(plan.runs.every((run) => run.mode === "deep"));
+  assert.ok(plan.runs.every((run) => run.synthesize === false));
   assert.ok(plan.runs.every((run) => run.sourcePaths.length === 1));
+});
+
+test("prompt regression eval runner can plan map-dig synthesis runs", async () => {
+  const { stdout } = await execFileAsync(
+    "node",
+    [
+      "scripts/prompt-regression-eval.mjs",
+      "--dry-run",
+      "--case",
+      "aztec-2026-06-17-recursive-verifier-boundary",
+      "--fixture-set",
+      "positive",
+      "--mode",
+      "map-dig",
+      "--synthesize",
+      "--variant",
+      "candidate",
+    ],
+    { cwd: root },
+  );
+  const plan = JSON.parse(stdout);
+  assert.equal(plan.runs.length, 1);
+  assert.equal(plan.runs[0].mode, "map-dig");
+  assert.equal(plan.runs[0].synthesize, true);
 });
 
 test("prompt regression eval runner can plan positive, negative, and control fixtures", async () => {

@@ -22,6 +22,7 @@ Options:
   --samples <n>        Independent samples per case. Default: 1.
   --variant <name>     Label for A/B comparison output. Default: current.
   --mode <mode>        breadth | deep | map-dig. Default: deep.
+  --synthesize         Enable the post-dig synthesis phase. Requires --mode map-dig.
   --provider <name>    Live provider. Default: openai-codex.
   --model <name>       Live model. Default: config default.
   --thinking <level>   minimal | low | medium | high | xhigh. Default: xhigh.
@@ -186,7 +187,7 @@ function buildConfig(entry, fixtureGroup, sampleIndex, options) {
   cfg.auditPrepare = false;
   cfg.auditRefute = false;
   cfg.auditAppeal = false;
-  cfg.auditSynthesize = false;
+  cfg.auditSynthesize = options.synthesize;
   cfg.auditChallengeDischarges = false;
   cfg.auditScopeNote = focusFor(entry);
   cfg.sandboxBackend = "host";
@@ -223,6 +224,7 @@ function renderPlanEntry(entry, fixtureGroup, sampleIndex, cfg, options) {
     provider: cfg.provider,
     model: cfg.auditModel,
     thinking: cfg.thinkingLevel,
+    synthesize: cfg.auditSynthesize === true,
     targetName: cfg.targetName,
     sourcePaths: fixtureGroup.sourcePaths,
     outputDir: path.relative(root, cfg.outputDir),
@@ -301,6 +303,7 @@ async function main() {
     mockLlm: hasFlag("--mock-llm"),
     variant: validateLabel("--variant", readFlag("--variant") ?? "current"),
     mode: validateMode(readFlag("--mode") ?? "deep"),
+    synthesize: hasFlag("--synthesize"),
     fixtureSet: validateFixtureSet(readFlag("--fixture-set") ?? "positive"),
     provider: readFlag("--provider") ?? "openai-codex",
     model: readFlag("--model"),
@@ -315,6 +318,9 @@ async function main() {
 
   if (!options.dryRun && !options.live && !options.mockLlm) {
     throw new Error("refusing to call a model without --live or --mock-llm; use --dry-run to inspect the plan");
+  }
+  if (options.synthesize && options.mode !== "map-dig") {
+    throw new Error("--synthesize requires --mode map-dig");
   }
 
   const registry = await loadRegistry();
@@ -371,6 +377,7 @@ async function main() {
     registryVersion: registry.version,
     variant: options.variant,
     mode: options.mode,
+    synthesize: options.synthesize,
     fixtureSet: options.fixtureSet,
     provider: options.provider,
     model: options.model ?? "(config default)",

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { cp, mkdir, readdir, stat, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdir, readdir, realpath, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { analyzeReproductionCommandSafety } from "./policy.js";
 import type { ReproductionCommand, ReproductionCommandResult, ReproductionFile } from "../types.js";
@@ -72,7 +72,7 @@ export function analyzeSandboxFileSafety(file: ReproductionFile): string | undef
 
 export async function writeSandboxFiles(workspaceAbsolute: string, files: ReproductionFile[]): Promise<void> {
   for (const file of files) {
-    const target = resolveWorkspacePath(workspaceAbsolute, file.path);
+    const target = await resolveWorkspacePathForWrite(workspaceAbsolute, file.path);
     await mkdir(path.dirname(target), { recursive: true });
     await writeFile(target, file.content);
   }
@@ -85,7 +85,7 @@ export async function runSandboxCommand(
   redactPaths: string[],
   cacheDir?: string,
 ): Promise<ReproductionCommandResult> {
-  const cwd = command.cwd ? resolveWorkspacePath(workspaceAbsolute, command.cwd) : workspaceAbsolute;
+  const cwd = command.cwd ? await resolveWorkspacePathForRead(workspaceAbsolute, command.cwd) : workspaceAbsolute;
   const started = Date.now();
   let stdout = "";
   let stderr = "";
@@ -176,6 +176,34 @@ export function resolveWorkspacePath(workspace: string, relativePath: string): s
   return target;
 }
 
+export async function resolveWorkspacePathForRead(workspace: string, relativePath: string): Promise<string> {
+  const target = resolveWorkspacePath(workspace, relativePath);
+  return assertInsideRealWorkspace(workspace, target, relativePath);
+}
+
+export async function resolveWorkspacePathForWrite(workspace: string, relativePath: string): Promise<string> {
+  const target = resolveWorkspacePath(workspace, relativePath);
+  const parent = path.dirname(target);
+  await mkdir(parent, { recursive: true });
+  await assertInsideRealWorkspace(workspace, parent, relativePath);
+  try {
+    const info = await lstat(target);
+    if (info.isSymbolicLink()) throw new Error(`Unsafe sandbox path: ${relativePath}`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return target;
+}
+
+async function assertInsideRealWorkspace(workspace: string, target: string, original: string): Promise<string> {
+  const rootReal = await realpath(workspace);
+  const targetReal = await realpath(target);
+  if (targetReal !== rootReal && !targetReal.startsWith(`${rootReal}${path.sep}`)) {
+    throw new Error(`Unsafe sandbox path escapes workspace through symlink: ${original}`);
+  }
+  return target;
+}
+
 export function safeName(input: string): string {
   return input.replace(/[^a-zA-Z0-9_.-]+/g, "_").slice(0, 80) || "finding";
 }
@@ -216,11 +244,16 @@ async function copyDirectoryContents(sourceDir: string, targetDir: string): Prom
 
 async function copySourcePath(sourcePath: string, targetPath: string): Promise<void> {
   if (shouldSkipCopyName(path.basename(sourcePath))) return;
-  await cp(sourcePath, targetPath, {
-    recursive: true,
-    force: true,
-    filter: (source) => !shouldSkipCopyName(path.basename(source)),
-  });
+  const info = await lstat(sourcePath);
+  if (info.isSymbolicLink()) return;
+  if (info.isDirectory()) {
+    await mkdir(targetPath, { recursive: true });
+    await copyDirectoryContents(sourcePath, targetPath);
+    return;
+  }
+  if (!info.isFile()) return;
+  await mkdir(path.dirname(targetPath), { recursive: true });
+  await copyFile(sourcePath, targetPath);
 }
 
 async function isDirectory(input: string): Promise<boolean> {

@@ -8,7 +8,7 @@ import {
   matchSuccessPatterns,
   normalizeRelativePath,
   prepareSandboxWorkspace,
-  resolveWorkspacePath,
+  resolveWorkspacePathForRead,
   runSandboxCommand,
   type SandboxWorkspace,
   writeSandboxFiles,
@@ -208,9 +208,11 @@ export function ingestFindingsFromScratch(session: AgentSession): { parsed: numb
       exploitSketch: asString(record.exploit_sketch) ?? asString(record.exploitSketch) ?? "",
       fix: asString(record.fix) ?? "",
       confidence: clampFloat(record.confidence, 0, 1, 0.5),
-      // The dig records a checked-and-satisfied obligation by prefixing its title "DISCHARGED:".
-      // Map that to the discharged status so it is not lumped into the suspected (lead) bucket.
-      confirmationStatus: confirmed ? "confirmed-executable" : title && DISCHARGE_TITLE.test(title) ? "discharged" : "suspected",
+      // A model can record checked-and-satisfied obligations either as
+      // status:"discharged" (preferred schema) or with the legacy
+      // "DISCHARGED:" title prefix. Only a passed command_id can promote a
+      // claim to confirmed-executable.
+      confirmationStatus: confirmed ? "confirmed-executable" : declaredUnconfirmedStatus(record, title),
       ...(confirmed && citedRun ? { commandRunId: citedRun.id } : {}),
       ...(fixPatch ? { fixPatch } : {}),
       ...(asStringList(record.patched_success_patterns ?? record.patchedSuccessPatterns).length > 0
@@ -441,7 +443,7 @@ async function readWorkspaceCandidate(ctx: ToolContext, target: string): Promise
   for (const candidate of workspacePathCandidates(ctx, target)) {
     if (ctx.session.scratchFiles.has(candidate)) return { path: candidate, content: ctx.session.scratchFiles.get(candidate) as string };
     try {
-      const content = await readFile(resolveWorkspacePath(workspace.absolute, candidate), "utf8");
+      const content = await readFile(await resolveWorkspacePathForRead(workspace.absolute, candidate), "utf8");
       return { path: candidate, content };
     } catch {
       // Try the next candidate.
@@ -559,6 +561,16 @@ export function readScratchScopes(session: AgentSession): AuditScope[] {
 
 // A satisfied-and-checked obligation; "DISCHARGED:" title -> discharged status (the model marks it).
 const DISCHARGE_TITLE = /^(obligation\s+)?discharged\b/i;
+const DISCHARGE_STATUS = /^(discharged|discharged[-_\s].*)$/i;
+
+function declaredUnconfirmedStatus(record: Record<string, unknown>, title: string): "suspected" | "discharged" {
+  const raw =
+    asString(record.confirmation_status) ??
+    asString(record.confirmationStatus) ??
+    asString(record.status);
+  if ((raw && DISCHARGE_STATUS.test(raw)) || DISCHARGE_TITLE.test(title)) return "discharged";
+  return "suspected";
+}
 
 const CONFIRMATION_RANK: Record<string, number> = {
   discharged: -1, // below suspected: if dig samples disagree, a suspicion (possible bug) beats a discharge (safe)

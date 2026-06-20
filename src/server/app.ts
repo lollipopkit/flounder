@@ -13,6 +13,7 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { readFileSync } from "node:fs";
+import { timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { MetadataStore, type RunKind, type Coverage, type ProviderInput, type ProviderProfile, type ProjectInput, type ProviderRoles, type RoleOverride } from "../db/store.js";
@@ -34,6 +35,7 @@ export interface UiServerOptions {
   out?: string;
   port?: number;
   host?: string;
+  operatorToken?: string;
 }
 
 // The control plane: the live registry of connected daemons (for server→daemon nudges) and
@@ -378,7 +380,12 @@ function catalog(): unknown {
 export function startUiServer(options: UiServerOptions = {}): ReturnType<typeof createServer> {
   const out = options.out ?? "runs";
   const port = options.port ?? 4500;
-  const host = options.host ?? "127.0.0.1"; // localhost by default; expose only with daemon tokens set
+  const host = options.host ?? "127.0.0.1"; // localhost by default; exposing the control plane requires operator auth
+  const loopback = isLoopbackHost(host);
+  const operatorToken = options.operatorToken ?? (loopback ? undefined : process.env.FLOUNDER_UI_TOKEN);
+  if (!isLoopbackHost(host) && !operatorToken) {
+    throw new Error("Refusing to bind flounder ui to a non-loopback host without operator auth. Set FLOUNDER_UI_TOKEN and send Authorization: Bearer <token> for control-plane API access.");
+  }
   const store = MetadataStore.openForOutput(out);
   // Seed a couple of starter profiles so a fresh install has something to select (no-op if any exist).
   store.seedProviders([
@@ -399,6 +406,10 @@ export function startUiServer(options: UiServerOptions = {}): ReturnType<typeof 
       if (!match) continue;
       const params: Record<string, string> = {};
       r.paramNames.forEach((name, i) => (params[name] = decodeURIComponent(match[i + 1] ?? "")));
+      if (operatorToken && !isDaemonRoute(r.path) && !operatorAuth(req, operatorToken)) {
+        sendJson(res, 401, { error: "unauthorized: a valid operator bearer token is required" });
+        return;
+      }
       // .then(run) (not Promise.resolve(run())) so a SYNCHRONOUS throw in a handler becomes a
       // rejection we can turn into a 500 — never an uncaught exception that kills the server.
       Promise.resolve()
@@ -411,10 +422,34 @@ export function startUiServer(options: UiServerOptions = {}): ReturnType<typeof 
     }
     sendJson(res, 404, { error: "not found", hint: "GET /api lists every endpoint" });
   });
+  let storeClosed = false;
+  server.on("close", () => {
+    if (storeClosed) return;
+    storeClosed = true;
+    store.close();
+  });
   server.listen(port, host, () => {
     console.log(`[flounder ui] http://${host}:${port}  (API catalog: http://${host}:${port}/api · store: ${out}/flounder.db)`);
   });
   return server;
+}
+
+function isLoopbackHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+}
+
+function isDaemonRoute(routePath: string): boolean {
+  return routePath.startsWith("/api/daemon/");
+}
+
+function operatorAuth(req: IncomingMessage, expected: string): boolean {
+  const header = req.headers["authorization"];
+  const token = typeof header === "string" && header.startsWith("Bearer ") ? header.slice(7) : "";
+  if (!token) return false;
+  const a = Buffer.from(token);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 // ---- handlers -------------------------------------------------------------------------
@@ -534,8 +569,8 @@ async function runLaunch(c: Ctx): Promise<void> {
   // finding's confirm_status, so a re-run only picks up what's still pending.
   if (spec.verb === "confirm" && !spec.inputRunDir && !(spec.inputRunDirs && spec.inputRunDirs.length > 0)) {
     if (body.findingId != null) {
-      const f = c.store.getConfirmable(Number(body.findingId));
-      if (!f || !f.run_dir) return sendJson(c.res, 400, { error: "that finding has no source run dir to confirm from" });
+      const f = c.store.getConfirmable(Number(project.id), Number(body.findingId));
+      if (!f || !f.run_dir) return sendJson(c.res, 400, { error: "that finding is not pending confirm for this project, or has no source run dir" });
       spec.inputRunDir = String(f.run_dir);
       spec.confirmKeys = [f.finding_key];
     } else {

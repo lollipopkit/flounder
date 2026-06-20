@@ -92,3 +92,20 @@ test("api: provider profiles — seed + CRUD + per-phase roles; pi discovery", a
     assert.equal((await fetch(base + "/api/providers/" + created.id)).status, 404);
   });
 });
+
+test("api: non-loopback control plane requires operator bearer auth", async () => {
+  const out = await mkdtemp(path.join(os.tmpdir(), "flounder-api-auth-"));
+  assert.throws(() => startUiServer({ port: 0, out, host: "0.0.0.0" }), /operator auth/);
+
+  const server = startUiServer({ port: 0, out, host: "0.0.0.0", operatorToken: "secret" });
+  await new Promise((resolve) => server.once("listening", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    assert.equal((await fetch(base + "/api")).status, 401);
+    const ok = await fetch(base + "/api", { headers: { authorization: "Bearer secret" } });
+    assert.equal(ok.status, 200);
+    assert.equal((await ok.json()).name, "flounder");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});

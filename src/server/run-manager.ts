@@ -79,8 +79,8 @@ export interface LaunchSpec {
 export function specToConfig(spec: LaunchSpec, out: string, workspace?: string): AuditorConfig {
   const cfg = defaultConfig();
   cfg.targetName = spec.target;
-  const root = spec.dir !== undefined ? path.resolve(workspace ?? ".", spec.dir) : undefined;
-  const resolveMat = (p: string): string => (root ? path.resolve(root, p) : p);
+  const root = spec.dir !== undefined ? resolveUnder(path.resolve(workspace ?? "."), spec.dir, "project dir") : undefined;
+  const resolveMat = (p: string): string => (root ? resolveUnder(root, p, "project material") : p);
   cfg.sourcePaths = spec.sourcePaths.map(resolveMat);
   cfg.corpusPaths = (spec.corpusPaths ?? []).map(resolveMat);
   if (spec.buildRoot) cfg.buildRoot = resolveMat(spec.buildRoot);
@@ -124,6 +124,20 @@ export function specToConfig(spec: LaunchSpec, out: string, workspace?: string):
     cfg.auditDeep = true; // run = map -> dig, unless --quick (breadth)
   }
   return cfg;
+}
+
+function resolveUnder(root: string, input: string, label: string): string {
+  if (path.isAbsolute(input)) throw new Error(`Unsafe ${label}: absolute paths are not allowed in project-relative launch specs.`);
+  const normalized = path.normalize(input);
+  if (!normalized || normalized === ".." || normalized.startsWith(`..${path.sep}`)) {
+    throw new Error(`Unsafe ${label}: ${input}`);
+  }
+  const base = path.resolve(root);
+  const target = path.resolve(base, normalized);
+  if (target !== base && !target.startsWith(`${base}${path.sep}`)) {
+    throw new Error(`Unsafe ${label}: ${input}`);
+  }
+  return target;
 }
 
 // Translate a launch spec into `flounder` CLI argv — NOT used to run (the manager runs in-process),

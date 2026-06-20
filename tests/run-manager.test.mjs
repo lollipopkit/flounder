@@ -120,6 +120,21 @@ test("specToConfig: a project dir + relative materials resolve under the daemon 
   assert.equal(cfg.corpusPaths[0], path.resolve("/ws/myproj/docs/specs"));
 });
 
+test("specToConfig: project-relative specs cannot escape the daemon workspace", () => {
+  assert.throws(
+    () => specToConfig({ verb: "run", target: "p", dir: "../outside", sourcePaths: ["src"] }, "runs", "/ws"),
+    /Unsafe project dir/,
+  );
+  assert.throws(
+    () => specToConfig({ verb: "run", target: "p", dir: "p", sourcePaths: ["../secret"] }, "runs", "/ws"),
+    /Unsafe project material/,
+  );
+  assert.throws(
+    () => specToConfig({ verb: "run", target: "p", dir: "p", sourcePaths: ["/abs/secret"] }, "runs", "/ws"),
+    /absolute paths are not allowed/,
+  );
+});
+
 test("specToConfig: per-phase models from the profile land on cfg.models; no dir = materials as-is", () => {
   const cfg = specToConfig(
     { verb: "run", target: "p", sourcePaths: ["/abs/x"], models: { map: { thinking: "low" }, dig: { model: "big" } } },

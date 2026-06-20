@@ -3,7 +3,7 @@ import type { AuditorConfig } from "../config.js";
 import {
   matchSuccessPatterns,
   normalizeRelativePath,
-  resolveWorkspacePath,
+  resolveWorkspacePathForRead,
   runSandboxCommand,
   writeSandboxFiles,
   type SandboxWorkspace,
@@ -62,7 +62,7 @@ export async function runDifferentialConfirmation(input: {
 
   let target: string;
   try {
-    target = resolveWorkspacePath(input.workspace.absolute, rel);
+    target = await resolveWorkspacePathForRead(input.workspace.absolute, rel);
   } catch {
     return base(`fix_patch.path "${fixPatch.path}" is outside the workspace`);
   }

@@ -35,6 +35,7 @@
     --shadow-sm: 0 1px 2px rgba(0,0,0,.3); --shadow-pop: 0 12px 36px rgba(0,0,0,.6);
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; } /* a component's own display (e.g. .counter's inline-flex) must not defeat the hidden attribute */
   body { margin: 0; background: var(--canvas); color: var(--fg); font: 13.5px/1.55 var(--sans); -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; letter-spacing: -0.006em; }
   a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
   ::selection { background: var(--sel-bg); }
@@ -261,8 +262,21 @@
   tbody tr:hover { background: var(--canvas-subtle); }
   td:first-child { white-space: nowrap; }
   .mono { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+  /* Truncate a long path to one line (ellipsis + hover tooltip) inside a fixed-layout table cell. */
+  td.trunc { max-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .timeline { color: var(--fg-muted); font-size: 11px; font-family: var(--mono); }
   .empty { color: var(--fg-subtle); padding: 60px 20px; text-align: center; font-size: 13px; line-height: 1.6; }
+  /* First-run hero (shown in the detail pane when there are no projects yet) */
+  .hero { max-width: 440px; margin: 11vh auto 0; text-align: center; padding: 0 20px; }
+  .hero .hero-mark { display: inline-flex; margin-bottom: 16px; opacity: .85; }
+  .hero .hero-mark .octicon { fill: var(--accent); }
+  .hero h2 { font-size: 20px; font-weight: 600; letter-spacing: -0.02em; margin: 0 0 8px; }
+  .hero p { color: var(--fg-muted); font-size: 13.5px; line-height: 1.6; margin: 0 0 20px; }
+  .hero .btn { display: inline-flex; }
+  .hero-steps { display: flex; flex-direction: column; gap: 11px; margin: 26px auto 0; max-width: 370px; text-align: left; }
+  .hero-step { display: flex; align-items: flex-start; gap: 11px; font-size: 12.5px; color: var(--fg-muted); line-height: 1.45; }
+  .hero-step .hs-n { width: 20px; height: 20px; border-radius: 6px; background: var(--canvas-inset); color: var(--fg); font: 600 11px/20px var(--mono); text-align: center; flex: none; }
+  .hero-step b { color: var(--fg); font-weight: 600; }
   .loadmore { margin: 12px 0; text-align: center; }
 
   dialog { background: var(--canvas); color: var(--fg); border: 1px solid var(--border); border-radius: 12px; padding: 0; width: min(560px, 92vw); box-shadow: var(--shadow-pop); }
@@ -450,7 +464,7 @@
 </form></dialog>
 
 <dialog id="reportDialog" class="report-dlg"><div>
-  <div class="dlg-head" style="display:flex;align-items:center;gap:10px"><span id="reportTitle" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Report</span><button type="button" class="btn sm" id="reportCopy" style="margin-left:auto">Copy</button><button type="button" class="btn sm" id="reportClose">Close</button></div>
+  <div class="dlg-head" style="display:flex;align-items:center;gap:8px"><span id="reportTitle" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Report</span><button type="button" class="btn sm primary" id="fdConfirm" hidden>Confirm on real target</button><button type="button" class="btn sm" id="fdReport" hidden>Open run report</button><button type="button" class="btn sm" id="reportCopy">Copy</button><button type="button" class="btn sm" id="reportClose">Close</button></div>
   <div id="reportBody" class="md-body"></div>
 </div></dialog>
 
@@ -506,7 +520,7 @@ function attachActivity(d) {
   const slot = document.getElementById("activitySlot");
   if (slot) slot.appendChild(activityEl); // move the persistent node (with its log) into the fresh detail
   activityEl.scrollTop = activityWasBottom ? activityEl.scrollHeight : activityPrevTop; // restore the pre-re-render position (the move reset it to 0)
-  const liveRun = d.runs.find((r) => r.status === "running") || d.runs[0]; // follow the RUNNING run's log, not merely the newest row
+  const liveRun = d.runs.find((r) => r.status === "running"); // only stream a LIVE run — finished runs aren't followed (their card isn't rendered)
   const rid = liveRun ? liveRun.id : null;
   if (rid === logRunId) return; // already streaming this run — keep the feed + connection
   if (logES) { logES.close(); logES = null; }
@@ -598,7 +612,7 @@ const icon = (n, s) => '<svg class="octicon" width="' + (s||16) + '" height="' +
 const STATUSES = ["confirmed-differential", "confirmed-executable", "confirmed-source", "suspected", "discharged", "refuted"];
 function statusBadge(s) { return '<span class="label s-' + s + '">' + s + '</span>'; }
 function stateBadge(s) { const cls = ["running","done","error","killed"].includes(s) ? s : "none"; return '<span class="state ' + cls + '">' + (s || "no runs") + '</span>'; }
-function esc(s) { return String(s ?? "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+function esc(s) { return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
 function pct(a, t) { return t > 0 ? Math.round((a / t) * 100) : 0; }
 function fmtTime(s) { if (!s) return ""; const d = new Date(s); return isNaN(d.getTime()) ? "" : d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }); }
 // A compact one-line summary of the project's per-phase model/thinking config (blank if none set).
@@ -654,6 +668,7 @@ function prettyJson(t) { try { return JSON.stringify(JSON.parse(t), null, 2); } 
 let reportRaw = ""; // the raw report source, for the Copy button (markdown, or pretty-printed JSON)
 async function openReport(runId, name, title) {
   const body = $("#reportBody"), dlg = $("#reportDialog");
+  $("#fdConfirm").hidden = true; $("#fdReport").hidden = true; // run-report mode: no finding actions
   $("#reportTitle").textContent = title || name;
   $("#reportCopy").textContent = "Copy";
   reportRaw = "";
@@ -924,6 +939,29 @@ function renderTopCandidates(d) {
   return card(icon("shieldcheck") + 'most suspicious bugs <span class="muted">top ' + cand.length + ' after the funnel</span>', '<div class="cand">' + rows + '</div>');
 }
 
+// The detail pane when nothing is selected: a first-run hero (with the flow + a CTA) when there
+// are NO projects yet, or a quiet prompt when projects exist but none is open.
+function emptyDetail() {
+  if ((state.projects || []).length === 0) {
+    const step = (n, html) => '<div class="hero-step"><span class="hs-n">' + n + '</span><div>' + html + '</div></div>';
+    return '<div class="hero"><div class="hero-mark">' + icon("shieldcheck", 48) + '</div>'
+      + '<h2>Audit your first target</h2>'
+      + '<p>Flounder maps a codebase into security obligations, deep-audits each, then ranks the most likely real bugs — each with a reproduction and a fix.</p>'
+      + '<button class="btn primary" id="heroNew">' + icon("package") + 'New project</button>'
+      + '<div class="hero-steps">'
+        + step(1, '<b>Create a project</b> — point it at your code and pick a provider.')
+        + step(2, '<b>Run the audit</b> — map → dig → synthesis → refutation, automatically.')
+        + step(3, '<b>Review candidates</b> — the funnel ranks the most suspicious bugs.')
+        + step(4, '<b>Confirm</b> — reproduce the top ones on the real target.')
+      + '</div></div>';
+  }
+  return '<div class="empty">Select a project to see its audit, or create one with “New project”.</div>';
+}
+function setEmptyDetail() {
+  const el = $("#detail"); el.innerHTML = emptyDetail();
+  const hn = $("#heroNew"); if (hn) hn.onclick = () => $("#newProjectBtn").click();
+}
+
 function renderDetail() {
   const el = $("#detail");
   const d = state.detail;
@@ -933,7 +971,7 @@ function renderDetail() {
   activityWasBottom = activityEl.scrollHeight - activityEl.scrollTop - activityEl.clientHeight < 60;
   activityPrevTop = activityEl.scrollTop;
   savedScopesTop = (document.getElementById("scopesScroll") || {}).scrollTop || 0;
-  if (!d) { el.innerHTML = '<div class="empty">Select a project, or create one with “New project”.</div>'; return; }
+  if (!d) { setEmptyDetail(); return; }
   const cfg = (() => { try { return JSON.parse(d.project.config_json) || {}; } catch { return {}; } })();
   const pr = d.progress;
   const running = state.active.filter((a) => a.target === d.project.name);
@@ -985,7 +1023,7 @@ function renderDetail() {
       : (sc.status === "audited" && sc.dig_seconds ? '<div class="muted" style="font-size:10px;margin-top:3px">' + fmtDur(sc.dig_seconds * 1000) + '</div>' : '');
     const pin = (sc.priority > 0 && sc.status !== "audited") ? ' <span class="muted" title="manually prioritized (priority ' + sc.priority + ')" style="font-size:10px">↑ pinned</span>' : "";
     return '<tr class="scope-row" data-sdetail="' + esc(sc.scope_id) + '" style="cursor:pointer"><td><span class="sdot ' + dot + '"></span> <span class="label s-' + sc.status + '">' + sc.status + '</span>' + pin + sub + '</td><td class="mono">' + esc(sc.scope_id) + '</td><td>' + esc(sc.title)
-      + '</td><td class="mono muted">' + esc(sc.location) + '</td><td class="mono muted">' + (sc.score != null ? Number(sc.score).toFixed(1) : "") + '</td><td style="white-space:nowrap">' + act + '</td></tr>';
+      + '</td><td class="mono muted trunc" title="' + esc(sc.location) + '">' + esc(sc.location) + '</td><td class="mono muted">' + (sc.score != null ? Number(sc.score).toFixed(1) : "") + '</td><td style="white-space:nowrap">' + act + '</td></tr>';
   }).join("");
   const scopesInner = allScopes.length
     ? '<table class="fixed"><colgroup><col style="width:11%"><col style="width:14%"><col style="width:28%"><col style="width:25%"><col style="width:6%"><col style="width:16%"></colgroup><thead><tr><th>status</th><th>id</th><th>obligation</th><th>location</th><th>score</th><th></th></tr></thead><tbody>' + scopeRows + '</tbody></table>' + pager("S", state.scopePage * SCOPE_PAGE, SCOPE_PAGE, allScopes.length, scopeSlice.length)
@@ -1032,19 +1070,17 @@ function renderDetail() {
   }
   el.innerHTML =
     '<div class="card">'
-      + '<div class="d-head"><h2>' + esc(d.project.name) + '</h2>' + stateBadge(st) + '</div>'
-      + '<div class="muted mono" style="margin-top:6px">' + esc(providerName(d.project.provider_id) || "(no provider)") + " · dir " + esc(d.project.dir || d.project.name)
-        + " · max-scopes " + (cfg.maxScopes ?? "-") + " · map/dig steps " + (cfg.mapSteps ?? "∞") + "/" + (cfg.digSteps ?? "∞") + '</div>'
+      + '<div class="d-head"><h2 title="' + esc(d.project.name) + '">' + esc(d.project.name) + '</h2>' + stateBadge(st) + '</div>'
+      + '<div class="muted mono" style="margin-top:6px">' + esc(providerName(d.project.provider_id) || "no provider set") + " · " + esc(d.project.dir || d.project.name) + '</div>'
       + phaseModelsLine(cfg.phases)
       + renderPipeline(d, pr)
-      + '<div class="muted" style="font-size:11px;margin-top:5px">click a phase to view its content below</div>'
+      // Outcome-focused stats — scope/audited counts already live in the pipeline + scopes table, so
+      // this row summarizes the FUNNEL result (findings → candidates → reproduced) instead of repeating them.
       + '<div class="stats">'
-        + '<div class="stat"><div class="n">' + pr.total + '</div><div class="k">scopes mapped</div></div>'
-        + '<div class="stat"><div class="n" style="color:var(--success-fg)">' + pr.audited + '</div><div class="k">audited</div></div>'
-        + '<div class="stat"><div class="n">' + pr.pending + '</div><div class="k">pending</div></div>'
-        + (pr.deferred ? '<div class="stat"><div class="n" style="color:var(--attention-fg)">' + pr.deferred + '</div><div class="k">skipped</div></div>' : '')
+        + '<div class="stat"><div class="n">' + pr.total + '</div><div class="k">scopes</div></div>'
         + '<div class="stat"><div class="n">' + d.findingsTotal + '</div><div class="k">findings</div></div>'
-        + '<div class="stat"><div class="n" style="color:var(--success-fg)">' + confirmed.length + '</div><div class="k">confirmed bugs</div></div>'
+        + '<div class="stat" title="medium+ leads surviving the pipeline, ranked"><div class="n" style="color:var(--accent)">' + rankCandidates(d.allFindings).length + '</div><div class="k">candidates</div></div>'
+        + '<div class="stat" title="reproduced on the real target (confirm phase)"><div class="n" style="color:var(--success-fg)">' + confirmed.length + '</div><div class="k">reproduced</div></div>'
         + '<div class="stat"><div class="n">' + d.runsTotal + '</div><div class="k">runs</div></div>'
       + '</div>'
       + '<div class="actions">'
@@ -1062,7 +1098,9 @@ function renderDetail() {
       + '</div>'
     + '</div>'
     + (confirmedSection ? '<div class="card">' + confirmedSection + '</div>' : "")
-    + (d.runs.length ? '<div class="card"><div class="section-title">' + icon("play") + 'Live activity <span class="muted">' + (liveRun ? liveRun.kind + " #" + liveRun.id : "") + '</span></div><div id="activitySlot"></div></div>' : "")
+    // Live activity is a LIVE concern — only surface it while a run is actually streaming, so a
+    // finished project isn't padded with a dead "waiting for activity…" panel.
+    + (runningRuns.length ? '<div class="card"><div class="section-title">' + icon("play") + 'Live activity <span class="muted">' + (liveRun ? liveRun.kind + " #" + liveRun.id : "") + '</span></div><div id="activitySlot"></div></div>' : "")
     + phaseContent;
   $("#continueBtn").onclick = () => command("continue");
   const moreMenu = $("#moreMenu");
@@ -1088,7 +1126,7 @@ function renderDetail() {
     await fetch("/api/projects/" + encodeURIComponent(state.selected), { method: "DELETE" });
     if (logES) { logES.close(); logES = null; logRunId = null; }
     state.selected = null; state.detail = null;
-    $("#detail").innerHTML = '<div class="empty">Select a project, or create one with “New project”.</div>';
+    setEmptyDetail();
   };
   el.querySelectorAll("[data-runid]").forEach((b) => b.onclick = () => fetch("/api/runs/" + b.dataset.runid + "/stop", { method: "POST" }));
   el.querySelectorAll("[data-delrun]").forEach((b) => b.onclick = async () => {
@@ -1159,7 +1197,7 @@ function renderFindings() {
     : confirmable(f.status) ? '<button class="rowbtn" data-confirm="' + f.id + '" title="reproduce this one finding on a mainnet fork">Confirm</button>'
     : '<span class="muted">—</span>';
   const rows = state.f.rows.map((f, i) => '<tr><td>' + statusBadge(f.status) + '</td><td><a href="#" class="flink" data-detail="' + i + '" title="show full finding">' + esc(f.title) + '</a>'
-    + '</td><td class="mono muted">' + esc(f.location) + '</td><td class="muted" style="font-size:11px">' + fmtTime(f.updated_at || f.created_at) + '</td><td style="white-space:nowrap">' + confCell(f) + '</td></tr>').join("");
+    + '</td><td class="mono muted trunc" title="' + esc(f.location) + '">' + esc(f.location) + '</td><td class="muted" style="font-size:11px">' + fmtTime(f.updated_at || f.created_at) + '</td><td style="white-space:nowrap">' + confCell(f) + '</td></tr>').join("");
   el.innerHTML = '<table class="fixed"><colgroup><col style="width:158px"><col style="width:32%"><col style="width:35%"><col style="width:88px"><col style="width:112px"></colgroup><thead><tr><th>status</th><th>title</th><th>location</th><th>found</th><th>confirm</th></tr></thead><tbody>' + rows + '</tbody></table>' + pager("F", state.f.offset, state.f.limit, state.f.total, state.f.rows.length);
   el.querySelectorAll("[data-confirm]").forEach((b) => b.onclick = () => {
     if (confirm("Confirm this one finding on the real target (mainnet fork; never broadcasts)?")) launchRun({ verb: "confirm", findingId: Number(b.dataset.confirm) });
@@ -1543,7 +1581,7 @@ function connect() {
       // Refresh while active AND once more on the active -> done edge, so the header + phase
       // pipeline don't freeze on the last "running" frame.
       if ((p && p.activeRuns > 0) || wasActive) { loadDetail(); loadFindings(true); }
-    }
+    } else if (!state.selected && state.view === "projects" && !document.querySelector("dialog[open]")) setEmptyDetail(); // keep the hero/empty pane in sync as projects load
   };
   es.onerror = () => { const _p = $("#livePill"); _p.hidden = false; _p.textContent = "reconnecting…"; _p.className = "counter"; };
 }
@@ -1591,6 +1629,7 @@ window.addEventListener("keydown", (e) => {
 loadProviders(); // so the detail header can show the selected provider's name
 connect();
 routeFromHash(); // open the project/view named in the URL on first load
+if (!state.selected) setEmptyDetail(); // first paint: hero (no projects) or the quiet prompt
 </script>
 </body>
 </html>

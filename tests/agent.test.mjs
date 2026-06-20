@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -94,6 +94,24 @@ test("findings.json only reaches confirmed-executable when it cites a passing ba
   assert.equal(session.findings[3].confirmationStatus, "suspected");
 });
 
+test("findings.json honors discharged status fields without allowing asserted confirmation", () => {
+  const session = newSession();
+  session.scratchFiles.set(
+    "findings.json",
+    JSON.stringify([
+      { title: "balance obligation", location: "x.rs:1", status: "discharged", severity: "info" },
+      { title: "proof obligation", location: "x.rs:2", confirmation_status: "discharged-with-line", severity: "info" },
+      { title: "asserted confirm", location: "x.rs:3", status: "confirmed-executable", severity: "high" },
+    ]),
+  );
+
+  const result = ingestFindingsFromScratch(session);
+  assert.equal(result.parsed, 3);
+  assert.equal(session.findings[0].confirmationStatus, "discharged");
+  assert.equal(session.findings[1].confirmationStatus, "discharged");
+  assert.equal(session.findings[2].confirmationStatus, "suspected", "confirmed status still requires a passed command_id");
+});
+
 test("bash refuses non-local or non-inspection commands without touching the workspace", async () => {
   const dir = await tempDir();
   try {
@@ -142,6 +160,30 @@ test("read, write, edit, and bash operate on loaded material and the copied work
     assert.match(run.observation, /CONFIRMATION-ELIGIBLE PASS/);
     assert.equal(ctx.session.commandRuns.length, 1);
     assert.equal(ctx.session.commandRuns[0].passed, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("sandbox workspace copy and read skip symlinks that point outside the source", async () => {
+  const dir = await tempDir();
+  try {
+    const src = path.join(dir, "src");
+    const outside = path.join(dir, "secret.txt");
+    await mkdir(src);
+    await writeFile(path.join(src, "safe.txt"), "safe");
+    await writeFile(outside, "secret");
+    await symlink(outside, path.join(src, "leak.txt"));
+
+    const cfg = defaultConfig();
+    cfg.sourcePaths = [src];
+    const logger = await tempLogger(dir);
+    const ctx = { cfg, source: [], corpus: [], memory: new ProjectMemory(path.join(dir, "memory.jsonl")), logger, session: newSession() };
+
+    const safe = await tool("read").run({ path: "safe.txt" }, ctx);
+    assert.match(safe.observation, /safe/);
+    const leaked = await tool("read").run({ path: "leak.txt" }, ctx);
+    assert.match(leaked.observation, /no loaded or sandbox file matches/i);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

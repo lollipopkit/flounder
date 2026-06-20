@@ -699,11 +699,16 @@ export class MetadataStore {
       .all(projectId) as Array<{ finding_key: string; title: string; run_dir: string | null }>;
   }
 
-  /** One confirmable finding by id (for a finding-level confirm) — its key + source run dir. */
-  getConfirmable(findingId: number): { finding_key: string; title: string; run_dir: string | null } | undefined {
+  /** One pending confirmable finding by project + id (for finding-level confirm). */
+  getConfirmable(projectId: number, findingId: number): { finding_key: string; title: string; run_dir: string | null } | undefined {
     return this.db
-      .prepare("SELECT f.finding_key, f.title, r.run_dir FROM finding f LEFT JOIN run r ON r.id = f.run_id WHERE f.id = ?")
-      .get(findingId) as { finding_key: string; title: string; run_dir: string | null } | undefined;
+      .prepare(
+        `SELECT f.finding_key, f.title, r.run_dir
+           FROM finding f LEFT JOIN run r ON r.id = f.run_id
+          WHERE f.project_id = ? AND f.id = ? AND f.confirm_status IS NULL
+            AND f.status IN ('confirmed-differential','confirmed-executable','confirmed-source')`,
+      )
+      .get(projectId, findingId) as { finding_key: string; title: string; run_dir: string | null } | undefined;
   }
 
   /** Set a finding's real-target confirm state, addressed by its content key within a project

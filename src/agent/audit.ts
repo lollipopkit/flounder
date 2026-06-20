@@ -328,7 +328,7 @@ export async function runAudit(
       // differential confirmation, so parallel digs cannot corrupt each other's
       // test files, build output, or findings. A bounded pool caps simultaneous digs.
       const workspaceRoots = cfg.buildRoot ? [cfg.buildRoot] : cfg.sourcePaths;
-      const digScope = async (scope: AuditScope): Promise<{ findings: AgentFinding[]; steps: TranscriptStep[]; commandRuns: typeof session.commandRuns }> => {
+      const digScope = async (scope: AuditScope): Promise<{ findings: AgentFinding[]; steps: TranscriptStep[]; commandRuns: typeof session.commandRuns; scratchFiles: Array<[string, string]> }> => {
         scope.status = "auditing"; // mark in-progress so the live UI shows which scope is being dug
         recorder.scopes(scopeInventory);
         const digT0 = Date.now();
@@ -356,6 +356,7 @@ export async function runAudit(
         for (const finding of unioned) {
           if (finding.commandRunId) finding.commandRunId = `${scope.id}:${finding.commandRunId}`;
         }
+        const scopedScratchFiles = [...digSession.scratchFiles.entries()].map(([scratchPath, content]) => [`dig-${safeScopeDir(scope.id)}/${scratchPath}`, content] as [string, string]);
         scope.status = "audited";
         scope.digSeconds = Math.max(1, Math.round((Date.now() - digT0) / 1000));
         await logger.event("audit_dig_done", { scope: scope.id, samples, findings: unioned.length, concurrent: true, digSeconds: scope.digSeconds });
@@ -365,7 +366,7 @@ export async function runAudit(
         recorder.scopes(scopeInventory);
         recorder.findings(unioned, logger.runDir, "dig checkpoint"); // persist this scope's findings live (content-keyed upsert)
         recorder.runScopes(++digDone, toDig.length);
-        return { findings: unioned, steps: digSteps, commandRuns: scopedRuns };
+        return { findings: unioned, steps: digSteps, commandRuns: scopedRuns, scratchFiles: scopedScratchFiles };
       };
       await logger.event("audit_dig_concurrent_start", { scopes: toDig.length, concurrency });
       const perScope = await runWithConcurrency(toDig, concurrency, digScope);
@@ -376,6 +377,7 @@ export async function runAudit(
         aggregated.push(...result.findings);
         aggregatedSteps.push(...result.steps);
         session.commandRuns.push(...result.commandRuns);
+        for (const [scratchPath, content] of result.scratchFiles) session.scratchFiles.set(scratchPath, content);
       }
       digDifferentialDone = true; // each dig confirmed differentially in its own workspace
     } else {

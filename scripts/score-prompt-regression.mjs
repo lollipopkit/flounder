@@ -29,7 +29,10 @@ const results = groups.map((group) => {
   };
 });
 const missing = results.filter((result) => !result.passed).map((result) => result.name);
-const passed = missing.length === 0;
+const forbiddenMatches = (entry.forbiddenArtifactSignals ?? []).filter((needle) =>
+  lowerBody.includes(String(needle).toLowerCase()),
+);
+const passed = missing.length === 0 && forbiddenMatches.length === 0;
 
-console.log(JSON.stringify({ caseId, passed, results, missing }, null, 2));
+console.log(JSON.stringify({ caseId, passed, results, missing, forbiddenMatches }, null, 2));
 process.exit(passed ? 0 : 1);

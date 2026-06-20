@@ -9,6 +9,15 @@ The regression goal is two-part:
 
 Live model comparison can use these source files as small replay targets. CI keeps the cheaper static contract: prompt capabilities are present, known-answer terms are absent, and the replay fixtures exist.
 
+The tracked data is intentionally distilled:
+
+- `positiveFixtures` are minimized vulnerable shapes for live prompt recall tests.
+- `negativeFixtures` are similar safe shapes that should be discharged, not reported.
+- `controlFixtures` model prompt-safety boundaries such as unfaithful verifier stubs or owner-only capabilities.
+- `expected-artifacts/*-pass.md` and `*-fail.md` test the scorer itself.
+
+Do not add raw `runs/` artifacts, private reports, full target checkouts, transcripts, or exploit-ready production PoCs here. Extract the general bug class into a small public-safe fixture instead.
+
 ## Live Eval Harness
 
 Inspect the replay plan without model calls:

@@ -23,6 +23,17 @@ async function loadRegistry() {
   return JSON.parse(await readFile(registryPath, "utf8"));
 }
 
+function promptRegressionPaths(entry) {
+  return [
+    ...(entry.requiredFixtures ?? []),
+    ...(entry.positiveFixtures ?? []),
+    ...((entry.negativeFixtures ?? []).map((fixture) => fixture.path)),
+    ...((entry.controlFixtures ?? []).map((fixture) => fixture.path)),
+    ...((entry.expectedArtifacts?.pass ?? [])),
+    ...((entry.expectedArtifacts?.fail ?? [])),
+  ];
+}
+
 function defaultPromptCorpus() {
   const cfg = defaultConfig();
   return [
@@ -42,7 +53,7 @@ function defaultPromptCorpus() {
 
 test("known-bug prompt regression registry has replay fixtures for all local evidence cases", async () => {
   const registry = await loadRegistry();
-  assert.equal(registry.version, 1);
+  assert.equal(registry.version, 2);
   assert.deepEqual(
     registry.cases.map((entry) => entry.id),
     [
@@ -52,15 +63,66 @@ test("known-bug prompt regression registry has replay fixtures for all local evi
     ],
   );
 
+  assert.ok(registry.sharedControlFixtures.length >= 1, "registry needs shared control fixtures");
+  for (const fixture of registry.sharedControlFixtures) {
+    assert.match(fixture.path, /^fixtures\/prompt-regression\//);
+    await access(path.join(root, fixture.path));
+  }
+
   for (const entry of registry.cases) {
+    assert.ok(entry.caseVersion >= 1, `${entry.id} needs a case version`);
+    assert.ok(entry.bugClass.length > 20, `${entry.id} needs a bug class`);
     assert.ok(entry.localEvidenceSummary.length > 40, `${entry.id} needs a local evidence summary`);
+    assert.ok(entry.positiveFixtures.length >= 1, `${entry.id} needs positive fixtures`);
+    assert.ok(entry.negativeFixtures.length >= 1, `${entry.id} needs negative fixtures`);
+    assert.ok(entry.expectedArtifacts.pass.length >= 1, `${entry.id} needs expected pass artifacts`);
+    assert.ok(entry.expectedArtifacts.fail.length >= 1, `${entry.id} needs expected fail artifacts`);
+    assert.ok(entry.mustDetect.length >= 3, `${entry.id} needs must-detect criteria`);
+    assert.ok(entry.mustNotAssume.length >= 3, `${entry.id} needs must-not-assume criteria`);
     assert.ok(entry.expectedLiveEvalSignals.length >= 4, `${entry.id} needs live-eval signals`);
     assert.ok(entry.artifactSignalGroups.length >= 3, `${entry.id} needs scoreable artifact signal groups`);
+    assert.ok(entry.forbiddenArtifactSignals.length >= 3, `${entry.id} needs forbidden artifact signals`);
     assert.ok(entry.doNotInjectIntoPrompt.length >= 3, `${entry.id} needs answer-leak sentinels`);
-    for (const fixture of entry.requiredFixtures) {
+    for (const fixture of promptRegressionPaths(entry)) {
+      assert.equal(fixture.startsWith("runs/"), false, `${fixture} must not point at raw run output`);
+      assert.equal(fixture.startsWith("files/audit-reports/"), false, `${fixture} must be distilled before tracking`);
       await access(path.join(root, fixture));
       const content = await readFile(path.join(root, fixture), "utf8");
       assert.ok(content.length > 100, `${fixture} should be a meaningful replay fixture`);
+    }
+  }
+});
+
+test("prompt regression expected artifacts exercise scorer pass and fail paths", async () => {
+  const registry = await loadRegistry();
+
+  for (const entry of registry.cases) {
+    for (const artifact of entry.expectedArtifacts.pass) {
+      const { stdout } = await execFileAsync(
+        "node",
+        ["scripts/score-prompt-regression.mjs", entry.id, artifact],
+        { cwd: root },
+      );
+      const result = JSON.parse(stdout);
+      assert.equal(result.passed, true, `${artifact} should pass scorer`);
+      assert.deepEqual(result.missing, []);
+      assert.deepEqual(result.forbiddenMatches, []);
+    }
+
+    for (const artifact of entry.expectedArtifacts.fail) {
+      await assert.rejects(
+        execFileAsync("node", ["scripts/score-prompt-regression.mjs", entry.id, artifact], { cwd: root }),
+        (error) => {
+          assert.equal(error.code, 1, `${artifact} should fail scorer with code 1`);
+          const result = JSON.parse(error.stdout);
+          assert.equal(result.passed, false, `${artifact} should fail scorer`);
+          assert.ok(
+            result.missing.length > 0 || result.forbiddenMatches.length > 0,
+            `${artifact} should fail through missing required signals or forbidden signals`,
+          );
+          return true;
+        },
+      );
     }
   }
 });

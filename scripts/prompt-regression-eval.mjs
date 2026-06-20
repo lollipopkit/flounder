@@ -84,7 +84,7 @@ function validateLabel(name, value) {
 
 async function loadRegistry() {
   const registry = JSON.parse(await readFile(registryPath, "utf8"));
-  if (registry.version !== 1 || !Array.isArray(registry.cases)) {
+  if (![1, 2].includes(registry.version) || !Array.isArray(registry.cases)) {
     throw new Error("unsupported prompt regression registry");
   }
   return registry;
@@ -101,7 +101,7 @@ function selectCases(registry, requestedIds) {
 }
 
 function fixturePaths(entry) {
-  return entry.requiredFixtures.map((fixture) => path.join(root, fixture));
+  return (entry.positiveFixtures ?? entry.requiredFixtures).map((fixture) => path.join(root, fixture));
 }
 
 function focusFor(entry) {
@@ -163,7 +163,7 @@ function renderPlanEntry(entry, sampleIndex, cfg, options) {
     model: cfg.auditModel,
     thinking: cfg.thinkingLevel,
     targetName: cfg.targetName,
-    sourcePaths: entry.requiredFixtures,
+    sourcePaths: entry.positiveFixtures ?? entry.requiredFixtures,
     outputDir: path.relative(root, cfg.outputDir),
     maxSteps: cfg.auditMaxSteps,
     mapSteps: cfg.auditMapSteps,
@@ -173,8 +173,9 @@ function renderPlanEntry(entry, sampleIndex, cfg, options) {
 }
 
 function scoreArtifact(entry, text) {
+  const lowerText = text.toLowerCase();
   const groups = entry.artifactSignalGroups.map((group) => {
-    const matched = group.anyOf.filter((needle) => text.toLowerCase().includes(String(needle).toLowerCase()));
+    const matched = group.anyOf.filter((needle) => lowerText.includes(String(needle).toLowerCase()));
     return {
       name: group.name,
       passed: matched.length > 0,
@@ -184,12 +185,16 @@ function scoreArtifact(entry, text) {
   });
   const required = groups.length;
   const passed = groups.filter((group) => group.passed).length;
+  const forbiddenMatches = (entry.forbiddenArtifactSignals ?? []).filter((needle) =>
+    lowerText.includes(String(needle).toLowerCase()),
+  );
   return {
     caseId: entry.id,
     label: entry.label,
-    passed: passed === required,
+    passed: passed === required && forbiddenMatches.length === 0,
     passedGroups: passed,
     requiredGroups: required,
+    forbiddenMatches,
     groups,
   };
 }

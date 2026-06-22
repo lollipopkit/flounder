@@ -1562,6 +1562,11 @@ function ProjectDetailView(props: {
     return phases[phase].status;
   };
   const jumpToPhase = (phase: ProjectPhase) => {
+    if (phase === "prepare") {
+      setTab("setup");
+      scrollToProjectSection("project-setup-tab");
+      return;
+    }
     if (phase === "map") {
       setTab("scopes");
       return;
@@ -1964,12 +1969,16 @@ function RealTargetCallout({ decisions, onOpen }: { decisions: ConfirmDecision[]
 }
 
 function ProjectSetupTab({ detail }: { detail: ProjectDetail }) {
-  return detail.prepareSummary ? (
-    <PrepareMaterialsCard summary={detail.prepareSummary} />
-  ) : (
-    <Card title="Prepared materials">
-      <EmptyInline>Prepared source, corpus, deployment matching, and sandbox details appear here after a prepare run.</EmptyInline>
-    </Card>
+  return (
+    <section id="project-setup-tab" className="section-anchor">
+      {detail.prepareSummary ? (
+        <PrepareMaterialsCard summary={detail.prepareSummary} />
+      ) : (
+        <Card title="Prepared materials">
+          <EmptyInline>Prepared source, corpus, deployment matching, and sandbox details appear here after a prepare run.</EmptyInline>
+        </Card>
+      )}
+    </section>
   );
 }
 

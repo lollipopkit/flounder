@@ -197,7 +197,7 @@ const ROUTES: Route[] = [
       verb: "'run' | 'map' | 'audit' | 'confirm' | 'prepare' (default 'run'; run = map→dig, resumes)",
       remap: "boolean? — re-enumerate scopes (restart)", fresh: "boolean? — confirm: ignore a prior interrupted confirm",
       quick: "boolean? — run: single breadth pass", mockLlm: "boolean? — offline mock model",
-      region: "string? — audit: pinned region e.g. src/Foo.sol:120-180", scope: "string? — audit: scope id(s)", verifyFindings: "object|array? — audit: inline suspected finding(s) to confirm-or-refute by execution",
+      region: "string? — audit: pinned region e.g. src/Foo.sol:120-180", scope: "string? — audit: scope id(s)", verifyFindings: "object|array? — audit: inline suspected finding(s) to confirm-or-refute by execution; project finding rows with id are linked back to that original row",
       scopeCoverageMode: "focused|standard|half|full|custom? — one-off coverage mode for this run",
       maxScopes: "number? — one-off scope cap for this dig batch", mapSteps: "number? — one-off map turn cap", digSteps: "number? — one-off per-scope dig turn cap",
       maxSteps: "number? — one-off global turn cap", digSamples: "number? — one-off samples per scope", digConcurrency: "number? — one-off parallel scopes",
@@ -1950,7 +1950,7 @@ function launchSpec(project: Record<string, unknown>, body: Record<string, unkno
     region: str(body.region),
     scope: str(body.scope),
     scopeNote: str(merged.scopeNote), // a project may store a default focus note in its config
-    ...(body.verifyFindings !== undefined ? { verifyFindings: body.verifyFindings } : {}),
+    ...(body.verifyFindings !== undefined ? { verifyFindings: normalizeProjectVerifyFindings(body.verifyFindings) } : {}),
     inputRunDir: str(body.inputRunDir),
     clue: str(body.clue),
     posture: str(body.posture),
@@ -1958,6 +1958,15 @@ function launchSpec(project: Record<string, unknown>, body: Record<string, unkno
     endpoint: str(body.endpoint),
     out,
   };
+}
+
+function normalizeProjectVerifyFindings(input: unknown): unknown {
+  if (Array.isArray(input)) return input.map(normalizeProjectVerifyFindings);
+  if (!input || typeof input !== "object") return input;
+  const row = input as Record<string, unknown>;
+  if (typeof row.originId === "number" || typeof row.origin_id === "number") return input;
+  if (typeof row.id !== "number" || !Number.isFinite(row.id)) return input;
+  return { ...row, originId: row.id };
 }
 
 function runBodyConfigOverrides(body: Record<string, unknown>): Record<string, unknown> {

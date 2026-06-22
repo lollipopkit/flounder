@@ -49,6 +49,7 @@ test("api: GET /api is a self-describing catalog of every resource + operation",
     assert.match(projectRun.body.maxScopes, /one-off scope cap/);
     assert.match(projectRun.body.mapSteps, /one-off map turn cap/);
     assert.match(projectRun.body.digSteps, /one-off per-scope dig turn cap/);
+    assert.match(projectRun.body.verifyFindings, /original row/);
     const scopePatch = cat.endpoints.find((e) => e.method === "PATCH" && e.path === "/api/projects/:uuid/scopes/:scopeId");
     assert.match(scopePatch.summary, /top of the next auto-dig batch/i);
     assert.match(scopePatch.body.prioritize, /top/i);
@@ -115,6 +116,46 @@ test("api: project run one-off coverage options are copied into the queued launc
     assert.equal(spec.maxSteps, 7);
     assert.equal(spec.digSamples, 2);
     assert.equal(spec.digConcurrency, 2);
+  });
+});
+
+test("api: verify launch links project finding rows back to the original finding", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const created = await json(await post("/api/projects", { name: "verify-origin", sourcePaths: ["./src"] }));
+    const runDir = await mkdtemp(path.join(out, "verify-origin-run-"));
+    const store = MetadataStore.openForOutput(out);
+    try {
+      const runId = store.startRun({ projectId: created.id, kind: "audit", runDir });
+      store.upsertFindings(created.id, runId, [
+        {
+          findingKey: "suspected-bug",
+          title: "Proof input is not bound",
+          location: "src/Rollup.sol:44",
+          severity: "high",
+          status: "suspected",
+          scopeId: "SCOPE-1",
+          confidence: 0.82,
+        },
+      ]);
+    } finally {
+      store.close();
+    }
+
+    const detail = await json(await fetch(base + `/api/projects/${created.uuid}`));
+    assert.equal(detail.allFindings.length, 1);
+    const finding = detail.allFindings[0];
+    const launched = await json(await post(`/api/projects/${created.uuid}/runs`, {
+      verb: "audit",
+      verifyFindings: [finding],
+    }));
+    const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
+    const spec = JSON.parse(job.spec_json);
+
+    assert.equal(spec.verb, "audit");
+    assert.equal(spec.verifyFindings[0].id, finding.id);
+    assert.equal(spec.verifyFindings[0].originId, finding.id);
   });
 });
 

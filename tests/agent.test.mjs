@@ -15,6 +15,7 @@ import { runRefutation } from "../dist/agent/refutation.js";
 import { buildSessionPrompt, FINDINGS_FINALIZE_PROMPT, isPiSessionProvider, mapThinkingLevel, toolSchemas } from "../dist/agent/pi-session.js";
 import { MockAuditLlmClient } from "../dist/llm/mock.js";
 import { RunLogger } from "../dist/trace/logger.js";
+import { renderDisclosure } from "../dist/reports/disclosure.js";
 
 process.env.FLOUNDER_SANDBOX_BACKEND = "host";
 process.env.FLOUNDER_ALLOW_HOST_EXECUTION = "1";
@@ -625,6 +626,32 @@ test("differential confirmation: a real fix blocks the exploit; a no-op fix does
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("disclosure report only labels patch-blocking patterns after differential confirmation", () => {
+  const baseFinding = {
+    id: "f1",
+    title: "Noncanonical field accepted",
+    severity: "medium",
+    location: "src/verifier.cpp:10",
+    description: "description",
+    evidence: "evidence",
+    exploitSketch: "exploit",
+    fix: "fix",
+    confidence: 0.9,
+    failureMode: "autonomous",
+    confirmationStatus: "confirmed-executable",
+    commandRunId: "cmd1",
+    patchedSuccessPatterns: ["EXPLOIT BLOCKED"],
+  };
+  const executableOnly = renderDisclosure("target", baseFinding);
+  assert.match(executableOnly, /Confirmation command: `cmd1`/);
+  assert.doesNotMatch(executableOnly, /Patch-blocking success patterns/);
+  assert.doesNotMatch(executableOnly, /EXPLOIT BLOCKED/);
+
+  const differential = renderDisclosure("target", { ...baseFinding, confirmationStatus: "confirmed-differential" });
+  assert.match(differential, /Patch-blocking success patterns/);
+  assert.match(differential, /EXPLOIT BLOCKED/);
 });
 
 test("audit produces an execution-confirmed finding and banks cross-run memory", async () => {

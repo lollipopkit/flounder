@@ -454,7 +454,8 @@ select {
 }
 
 .project-page {
-  max-width: 1180px;
+  width: 100%;
+  max-width: min(1720px, calc(100vw - 380px));
   min-width: 0;
   margin: 0 auto;
 }
@@ -576,7 +577,7 @@ small {
 .pipeline {
   position: relative;
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(178px, 1fr));
   gap: 8px;
   margin-top: 18px;
   overflow: visible;
@@ -587,7 +588,7 @@ small {
 .phase {
   position: relative;
   z-index: 1;
-  min-height: 112px;
+  min-height: 136px;
   padding: 13px 16px 14px;
   border: 1px solid var(--border);
   border-radius: 9px;
@@ -595,13 +596,31 @@ small {
   display: flex;
   flex-direction: column;
   gap: 5px;
+  width: 100%;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
 }
 
-.phase.running,
-.phase.pending,
-.phase.partial {
+.phase:hover {
+  border-color: color-mix(in srgb, var(--fg-subtle) 38%, var(--border));
+  background: var(--canvas);
+}
+
+.phase:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 58%, transparent);
+  outline-offset: 2px;
+}
+
+.phase.running {
   background: color-mix(in srgb, var(--accent) 7%, var(--canvas));
   box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+.phase.pending,
+.phase.partial {
+  background: color-mix(in srgb, var(--warning) 7%, var(--canvas));
 }
 
 .phase.ready,
@@ -621,7 +640,24 @@ small {
   min-width: 0;
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  gap: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.phase-index {
+  width: 18px;
+  height: 18px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--canvas);
+  border: 1px solid var(--border);
+  color: var(--fg-muted);
+  font-size: 10px;
+  font-weight: 720;
+  flex: none;
 }
 
 .phase-marker {
@@ -635,11 +671,16 @@ small {
   color: var(--fg-muted);
 }
 
-.phase.running .phase-marker,
-.phase.pending .phase-marker,
-.phase.partial .phase-marker {
+.phase.running .phase-marker {
   color: var(--accent);
   border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
+  background: var(--canvas);
+}
+
+.phase.pending .phase-marker,
+.phase.partial .phase-marker {
+  color: var(--warning);
+  border-color: color-mix(in srgb, var(--warning) 42%, var(--border));
   background: var(--canvas);
 }
 
@@ -658,14 +699,14 @@ small {
 
 .phase-state {
   flex: none;
-  min-height: 18px;
-  padding: 0 7px;
-  border-radius: 999px;
+  width: 22px;
+  height: 22px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 50%;
   color: var(--fg-muted);
   background: var(--canvas-inset);
-  font-size: 11px;
-  font-weight: 650;
-  white-space: nowrap;
+  border: 1px solid transparent;
 }
 
 .phase-state.running {
@@ -683,6 +724,7 @@ small {
 .phase-state.partial {
   color: var(--warning);
   background: color-mix(in srgb, var(--warning) 13%, transparent);
+  border-color: color-mix(in srgb, var(--warning) 18%, transparent);
 }
 
 .phase-state.error,
@@ -694,6 +736,12 @@ small {
 .phase strong {
   font-weight: 560;
   line-height: 1.3;
+  min-height: 42px;
+  flex: 1 0 auto;
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
 }
 
 .phase small,
@@ -706,8 +754,17 @@ small {
   flex-direction: column;
   align-items: flex-start;
   gap: 4px;
-  margin-top: auto;
+  margin-top: 0;
+  min-height: 50px;
+  justify-content: flex-end;
   color: var(--fg-muted);
+}
+
+.phase-detail > span:first-child {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
 }
 
 .phase-time {
@@ -2278,6 +2335,14 @@ small {
   width: fit-content;
 }
 
+.decision-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  max-width: 360px;
+}
+
 .decision-main strong {
   color: var(--fg);
   font-size: 13.5px;
@@ -2632,7 +2697,7 @@ small {
 
 @media (max-width: 860px) {
   .topbar {
-    padding: 0 8px;
+    padding: 0 14px;
     gap: 6px;
   }
 
@@ -2752,13 +2817,46 @@ small {
     min-height: 44px;
   }
 
-  .pipeline,
   .queue-grid,
   .prepare-lists,
   .onboarding-steps,
   .setup-detail-grid,
   .phase-provider-grid {
     grid-template-columns: 1fr;
+  }
+
+  .pipeline {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .phase {
+    min-height: 74px;
+    padding: 10px 11px;
+    gap: 6px;
+  }
+
+  .phase-head {
+    gap: 6px;
+  }
+
+  .phase-marker {
+    width: 21px;
+    height: 21px;
+  }
+
+  .phase-state {
+    width: 20px;
+    height: 20px;
+  }
+
+  .phase strong {
+    min-height: auto;
+    font-size: 12.5px;
+    -webkit-line-clamp: 2;
+  }
+
+  .phase-detail {
+    display: none;
   }
 
   .prepare-head {
@@ -2880,6 +2978,10 @@ small {
 
   .project-row {
     min-height: 72px;
+  }
+
+  .pipeline {
+    grid-template-columns: 1fr;
   }
 
   .modal-back {

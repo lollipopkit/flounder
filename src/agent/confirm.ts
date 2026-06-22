@@ -213,7 +213,7 @@ export async function runConfirm(
 
 // --- freeze / provenance -----------------------------------------------------
 
-const FROZEN_FILE = /^(audit_report\.md|audit_findings\.json|report_f\d+\.md)$/;
+const FROZEN_FILE = /^(audit_report\.md|audit_findings\.json|report_[a-z0-9_.-]+\.md)$/;
 
 async function freezeInputRun(runDir: string): Promise<ConfirmProvenance> {
   let names: string[] = [];

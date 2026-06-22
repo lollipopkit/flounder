@@ -101,6 +101,7 @@ export interface FindingRow {
   tracking_status?: string | null;
   confirm_status?: string | null;
   report_path?: string | null;
+  report_markdown?: string | null;
   scope_id?: string | null;
   description?: string | null;
   evidence?: string | null;
@@ -311,6 +312,7 @@ export const api = {
   deleteDaemon: (id: number) => fetchJson<unknown>(`/api/daemons/${id}`, { method: "DELETE" }),
   bugs: (params: URLSearchParams) =>
     fetchJson<{ findings: FindingRow[]; total: number; limit: number; offset: number; stats: { total: number; byStatus: Record<string, number>; byTracking: Record<string, number> } }>(`/api/bugs?${params.toString()}`),
+  findingReport: (id: number) => fetchJson<{ markdown: string; source: "db" | "generated" }>(`/api/findings/${id}/report`),
   trackFinding: (id: number, status: string) => patchJson<unknown>(`/api/findings/${id}/tracking`, { status }),
   artifact: (runId: number, name: string) => fetch(`/api/runs/${runId}/artifact?name=${encodeURIComponent(name)}`),
 };

@@ -234,6 +234,12 @@ const ROUTES: Route[] = [
     handler: findingsList,
   }),
   route({
+    method: "GET", path: "/api/findings/:id/report",
+    summary: "Read one finding's submission report markdown from DB-backed finding data. Local run artifacts are provenance only, not the UI source of truth.",
+    params: { id: "finding id" },
+    handler: findingReport,
+  }),
+  route({
     method: "GET", path: "/api/projects/:uuid/confirm-decisions",
     summary: "List confirm decisions (one per distinct bug). Filter ?reproduced=yes for the bugs actually reproduced on the real target (the audit's payoff).",
     params: { uuid: "project UUID" }, query: { reproduced: "string? — e.g. 'yes' for confirmed bugs" },
@@ -397,7 +403,7 @@ const ROUTES: Route[] = [
   route({
     method: "GET", path: "/api/runs/:id/artifact",
     summary: "Read a run's report artifact (text) from its run dir — the detailed report behind a run/decision. Allowlisted names only.",
-    params: { id: "run id" }, query: { name: "artifact filename (audit_report.md | confirm_report.md | report_f<N>.md | prepare_manifest.json | confirm_decision.json | confirm_provenance.json)" },
+    params: { id: "run id" }, query: { name: "artifact filename (audit_report.md | confirm_report.md | report_<finding>.md | prepare_manifest.json | confirm_decision.json | confirm_provenance.json)" },
     handler: runArtifact,
   }),
   route({
@@ -493,6 +499,15 @@ export function startUiServer(options: UiServerOptions = {}): ReturnType<typeof 
         return;
       }
       serveUiAsset(url.pathname, res);
+      return;
+    }
+    if (method === "GET" && !url.pathname.startsWith("/api")) {
+      if (operatorToken && !operatorAuth(req, operatorToken)) {
+        sendJson(res, 401, { error: "unauthorized: a valid operator bearer token is required" });
+        return;
+      }
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" });
+      res.end(loadUiHtml());
       return;
     }
     sendJson(res, 404, { error: "not found", hint: "GET /api lists every endpoint" });
@@ -1304,7 +1319,6 @@ function findingSummaryRow(row: Record<string, unknown>): Record<string, unknown
     "severity",
     "status",
     "confirm_status",
-    "report_path",
     "scope_id",
     "confidence",
     "tracking_status",
@@ -1319,6 +1333,42 @@ function findingSummaryRow(row: Record<string, unknown>): Record<string, unknown
 function findingDisplayRow(row: Record<string, unknown>): Record<string, unknown> {
   if (!("title" in row)) return row;
   return { ...row, title: cleanFindingTitle(row.title) };
+}
+
+function findingReport(c: Ctx): void {
+  const row = c.store.getFinding(Number(c.params.id));
+  if (!row) return sendJson(c.res, 404, { error: "no such finding" });
+  const display = findingDisplayRow(row);
+  const stored = stringValue(display.report_markdown);
+  sendJson(c.res, 200, {
+    markdown: stored || renderFindingReportMarkdown(display),
+    source: stored ? "db" : "generated",
+  });
+}
+
+function renderFindingReportMarkdown(row: Record<string, unknown>): string {
+  const title = stringValue(row.title) || "Finding report";
+  const confidence = numberValue(row.confidence);
+  const lines = [
+    `# ${title}`,
+    "",
+    `- Project: ${stringValue(row.project_name) || "unknown"}`,
+    `- Status: ${stringValue(row.status) || "unknown"}`,
+    stringValue(row.confirm_status) ? `- Real-target status: ${stringValue(row.confirm_status)}` : "",
+    stringValue(row.location) ? `- Location: \`${stringValue(row.location)}\`` : "",
+    stringValue(row.severity) ? `- Severity: ${stringValue(row.severity)}` : "",
+    confidence != null ? `- Confidence: ${Math.round(confidence * 100)}%` : "",
+    "",
+  ].filter(Boolean);
+  const description = stringValue(row.description);
+  const evidence = stringValue(row.evidence);
+  const exploit = stringValue(row.exploit_sketch);
+  const fix = stringValue(row.fix);
+  if (description) lines.push("## Description", "", description, "");
+  if (evidence) lines.push("## Evidence", "", "```", evidence, "```", "");
+  if (exploit) lines.push("## Impact / Exploit", "", exploit, "");
+  if (fix) lines.push("## Suggested Fix", "", fix, "");
+  return lines.join("\n").trim();
 }
 
 function cleanFindingTitle(value: unknown): unknown {
@@ -1587,9 +1637,9 @@ async function findingTracking(c: Ctx): Promise<void> {
   ok ? sendJson(c.res, 200, { ok: true }) : sendJson(c.res, 404, { error: "no such finding" });
 }
 
-// Serve a run's report artifact (text) from its run dir. Allowlisted filenames only (no slashes,
+// Serve a run's raw artifact (text) from its run dir. Allowlisted filenames only (no slashes,
 // so no path traversal); the file must resolve directly inside the run dir.
-const ALLOWED_ARTIFACT = /^(audit_report\.md|confirm_report\.md|report_f\d+\.md|prepare_manifest\.json|confirm_decision\.json|confirm_provenance\.json|audit_findings\.json)$/;
+const ALLOWED_ARTIFACT = /^(audit_report\.md|confirm_report\.md|report_[a-z0-9_.-]+\.md|prepare_manifest\.json|confirm_decision\.json|confirm_provenance\.json|audit_findings\.json)$/;
 function runArtifact(c: Ctx): void {
   const run = c.store.getRun(Number(c.params.id));
   if (!run || !run.run_dir) return sendJson(c.res, 404, { error: "no such run, or it has no run dir" });

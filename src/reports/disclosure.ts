@@ -8,6 +8,9 @@ export function renderDisclosure(target: string, finding: RankedFinding, verific
   const reproductionStatus = reproduction?.status ?? finding.reproductionStatus ?? "not-run";
   const verificationMarkdown = verification?.markdown ?? localVerificationMarkdown(finding);
   const reproductionMarkdown = reproduction?.markdown ?? localReproductionMarkdown(finding);
+  const classLine = finding.failureMode && finding.failureMode !== "unknown" && finding.failureMode !== "autonomous"
+    ? `- Class: ${finding.failureMode}\n`
+    : "";
   return `# Security disclosure: ${finding.title}
 
 Private report for maintainers. Please coordinate disclosure.
@@ -15,8 +18,7 @@ Private report for maintainers. Please coordinate disclosure.
 - Project: ${target}
 - Severity estimate: ${finding.severity.toUpperCase()}
 - Component / location: ${finding.location}
-- Class: ${finding.failureMode}
-- Confirmation status: ${finding.confirmationStatus}${finding.disputed ? `\n- DISPUTED by independent refutation (execution-proven but a skeptic disagrees — needs human review): ${finding.refutationReason ?? "see audit_refutation.json"}` : ""}
+${classLine}- Confirmation status: ${finding.confirmationStatus}${finding.disputed ? `\n- DISPUTED by independent refutation (execution-proven but a skeptic disagrees — needs human review): ${finding.refutationReason ?? "see audit_refutation.json"}` : ""}
 - Source verifier verdict: ${verification?.verdict ?? "not-run"}
 - Verification mode: ${verification?.mode ?? "not-run"}
 - Impact signals: ${finding.impactSignals?.join(", ") || "not-scored"}

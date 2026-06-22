@@ -2,13 +2,19 @@ import type { ConfirmDecision, Coverage, FindingRow, PhaseConfig, ProjectDetail,
 
 export const STATUSES = ["confirmed-differential", "confirmed-executable", "confirmed-source", "suspected", "discharged", "refuted"] as const;
 export const TRACKING = ["open", "triaging", "submitted", "accepted", "fixed", "duplicate", "rejected"] as const;
-export const PHASES = ["prepare", "map", "dig", "confirm"] as const;
+export const PROVIDER_PHASES = ["prepare", "map", "dig", "confirm"] as const;
+export const PHASES = ["prepare", "map", "dig", "synthesis", "verify", "confirm", "report"] as const;
+export type ProviderPhase = (typeof PROVIDER_PHASES)[number];
+export type ProjectPhase = (typeof PHASES)[number];
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 export const PHASE_DESC: Record<(typeof PHASES)[number], string> = {
   prepare: "Stage source and warm the build sandbox",
   map: "Build the scope inventory",
   dig: "Audit mapped scopes and confirm locally",
+  synthesis: "Compose findings into distinct bug candidates",
+  verify: "Confirm or refute candidates by local execution",
   confirm: "Reproduce confirmed findings on the real target",
+  report: "Prepare one submission package per bug",
 };
 
 const STATUS_RANK: Record<string, number> = {
@@ -74,7 +80,7 @@ export interface ProjectConfigShape {
   digSamples?: number;
   digConcurrency?: number;
   phases?: PhaseConfig;
-  phaseProviders?: Partial<Record<"prepare" | "map" | "dig" | "confirm", number>>;
+  phaseProviders?: Partial<Record<ProviderPhase, number>>;
 }
 
 export function parseJson<T>(input: unknown, fallback: T): T {
@@ -122,17 +128,34 @@ export function pct(a: number | null | undefined, t: number | null | undefined):
   return t && t > 0 ? Math.round(((a ?? 0) / t) * 100) : 0;
 }
 
+interface RunStages {
+  synthesis?: { scopes?: number; produced?: number; pool?: number; at?: string };
+}
+
+function stages(run: RunRow | undefined): RunStages {
+  if (!run?.stages_json) return {};
+  return parseJson<RunStages>(run.stages_json, {});
+}
+
+function latestRunWithStage(runs: RunRow[], stage: keyof RunStages): RunRow | undefined {
+  return runs.find((run) => Boolean(stages(run)[stage]));
+}
+
 export function phaseState(detail: ProjectDetail, progress: Coverage): PhaseState {
   const runs = detail.runs ?? [];
   const latest = (...kinds: string[]) => runs.find((r) => kinds.includes(r.kind));
   const prep = latest("prepare");
   const repro = confirmedDecisions(detail.confirmDecisions).length;
   const conf = latest("confirm");
+  const synthesis = stages(latestRunWithStage(runs, "synthesis")).synthesis;
   const pendingConfirm = (detail.allFindings ?? []).filter((finding) => {
     return (finding.status === "confirmed-executable" || finding.status === "confirmed-differential") && !finding.confirm_status;
   }).length;
+  const pendingVerify = (detail.allFindings ?? []).filter((finding) => finding.status === "suspected" || finding.status === "confirmed-source").length;
+  const locallyVerified = (detail.allFindings ?? []).filter((finding) => finding.status === "confirmed-executable" || finding.status === "confirmed-differential").length;
   const audit = runs.find((r) => r.status === "running" && ["run", "audit", "map"].includes(r.kind));
   const auditLatest = latest("run", "audit", "map");
+  const verifyLatest = runs.find((run) => isVerifyRun(run));
   const digStarted = Boolean(audit && audit.run_scopes_target != null);
   const mapRunning = Boolean(audit && audit.kind !== "audit" && !digStarted);
   const digRunning = Boolean(audit && (audit.kind === "audit" || digStarted));
@@ -161,6 +184,8 @@ export function phaseState(detail: ProjectDetail, progress: Coverage): PhaseStat
         ? fmtDur(endMs - boundMs)
         : runDur(auditLatest, false)
       : "";
+  const reportable = detail.confirmDecisions.filter((row) => row.reproduced === "yes");
+  const submitCandidates = reportable.filter((row) => row.recommendation === "submit-candidate").length;
 
   return {
     prepare: { status: prep ? prep.status : "none", stat: prep ? (prep.status === "done" ? "Source staged" : prep.status === "running" ? "Preparing source" : prep.status) : "Not started", dur: runDur(prep, prep?.status === "running") },
@@ -176,6 +201,40 @@ export function phaseState(detail: ProjectDetail, progress: Coverage): PhaseStat
             : "Not started",
       dur: digDur,
     },
+    synthesis: {
+      status: finalizingAudit
+        ? "running"
+        : synthesis
+          ? "done"
+          : progress.audited > 0
+            ? "done"
+            : "none",
+      stat: finalizingAudit
+        ? "Composing bug candidates"
+        : synthesis
+          ? `${synthesis.produced ?? 0} composed ${synthesis.produced === 1 ? "candidate" : "candidates"}`
+          : progress.audited > 0
+            ? "No cross-scope candidate"
+            : "Not started",
+      dur: "",
+    },
+    verify: {
+      status: isVerify
+        ? "running"
+        : pendingVerify > 0
+          ? "pending"
+          : locallyVerified > 0
+            ? "done"
+            : "none",
+      stat: isVerify
+        ? verifyStat
+        : pendingVerify > 0
+          ? `${pendingVerify} ${pendingVerify === 1 ? "candidate" : "candidates"} waiting`
+          : locallyVerified > 0
+            ? `${locallyVerified} locally verified`
+            : "Not started",
+      dur: runDur(verifyLatest, verifyLatest?.status === "running"),
+    },
     confirm: {
       status: conf?.status === "running"
         ? "running"
@@ -190,6 +249,15 @@ export function phaseState(detail: ProjectDetail, progress: Coverage): PhaseStat
           ? `${pendingConfirm} waiting for real-target confirmation`
           : "Not started",
       dur: runDur(conf, conf?.status === "running"),
+    },
+    report: {
+      status: reportable.length > 0 ? "ready" : detail.confirmDecisions.length > 0 ? "pending" : "none",
+      stat: reportable.length > 0
+        ? `${reportable.length} ${reportable.length === 1 ? "report" : "reports"} ready${submitCandidates ? ` · ${submitCandidates} submit` : ""}`
+        : detail.confirmDecisions.length > 0
+          ? "No reproduced bug yet"
+          : "Not started",
+      dur: "",
     },
   };
 }
@@ -221,5 +289,5 @@ export function runProgress(run: RunRow, decisions: ConfirmDecision[]): string {
 
 export function reportFileForFinding(finding: FindingRow): string {
   const name = (finding.report_path ?? "").split("/").pop() ?? "";
-  return /^report_f\d+\.md$/.test(name) ? name : "audit_report.md";
+  return /^report_[a-z0-9_.-]+\.md$/.test(name) ? name : "audit_report.md";
 }

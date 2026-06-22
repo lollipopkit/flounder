@@ -188,12 +188,14 @@ class RemoteTracker implements RunTracker {
   readonly runDbId = undefined; // remote: the server owns the run id; not needed by the kernel
   private chain: Promise<void>;
   private runId: number | undefined;
+  private readonly targetName: string;
 
   constructor(
     private readonly base: string,
     private readonly headers: Record<string, string>,
     start: { jobId: number; project: string; kind: string; runDir: string; provider?: string; model?: string; thinking?: string; budgets: unknown },
   ) {
+    this.targetName = start.project;
     this.chain = this.req("POST", "/api/daemon/runs", start).then((r) => {
       this.runId = (r as { runId?: number } | null)?.runId;
     });
@@ -222,7 +224,7 @@ class RemoteTracker implements RunTracker {
   findings(findings: AgentFinding[], runDir: string, reason?: string): void {
     const reportable = findings.filter((finding) => finding.severity !== "info" && finding.confirmationStatus !== "discharged");
     if (reportable.length === 0) return;
-    this.enqueue(() => (this.runId ? this.req("PATCH", `/api/daemon/runs/${this.runId}`, { findings: reportable.map((f) => toFindingRow(f, runDir)), reason }) : Promise.resolve()));
+    this.enqueue(() => (this.runId ? this.req("PATCH", `/api/daemon/runs/${this.runId}`, { findings: reportable.map((f) => toFindingRow(f, runDir, this.targetName)), reason }) : Promise.resolve()));
   }
 
   stage(name: string, info: Record<string, unknown>): void {

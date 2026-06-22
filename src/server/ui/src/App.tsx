@@ -22,15 +22,19 @@ import {
   isVerifyRun,
   pct,
   phaseState,
+  PHASES,
   projectConfig,
   parseJson,
   PHASE_DESC,
+  PROVIDER_PHASES,
   rankCandidates,
   runProgress,
   runScopeBatchComplete,
   STATUSES,
   THINKING_LEVELS,
   TRACKING,
+  type ProjectPhase,
+  type ProviderPhase,
 } from "./domain";
 import { Icon, type IconName } from "./icons";
 
@@ -39,7 +43,6 @@ type SettingsPane = "providers" | "daemons";
 type ProjectTab = "overview" | "findings" | "scopes" | "runs" | "setup";
 type ModalName = "new-project" | "run" | "edit-project" | "report" | "run-log" | "artifact" | null;
 type ArtifactPreview = { title: string; runId: number; name: string };
-type ProjectPhase = "prepare" | "map" | "dig" | "confirm";
 type LaunchAction = "run" | "map" | "audit" | "confirm" | "verify";
 
 interface RouteState {
@@ -83,16 +86,43 @@ function initialTheme(): "light" | "dark" {
 }
 
 function readRoute(): RouteState {
+  const pathname = window.location.pathname;
+  const projectMatch = pathname.match(/^\/projects\/([^/]+)\/?$/);
+  if (projectMatch) return { view: "projects", projectUuid: decodeURIComponent(projectMatch[1] ?? ""), settingsPane: "providers" };
+  if (pathname === "/findings" || pathname.startsWith("/findings/")) return { view: "findings", settingsPane: "providers" };
+  if (pathname === "/settings/daemons" || pathname.startsWith("/settings/daemons/")) return { view: "settings", settingsPane: "daemons" };
+  if (pathname === "/settings" || pathname.startsWith("/settings/")) return { view: "settings", settingsPane: "providers" };
+
   const hash = window.location.hash.replace(/^#/, "");
-  if (hash.startsWith("p/")) return { view: "projects", projectUuid: decodeURIComponent(hash.slice(2)), settingsPane: "providers" };
-  if (hash.startsWith("settings/daemons")) return { view: "settings", settingsPane: "daemons" };
-  if (hash.startsWith("settings")) return { view: "settings", settingsPane: "providers" };
-  if (hash.startsWith("findings")) return { view: "findings", settingsPane: "providers" };
+  if (hash.startsWith("p/")) {
+    const uuid = decodeURIComponent(hash.slice(2));
+    window.history.replaceState(null, "", projectPath(uuid));
+    return { view: "projects", projectUuid: uuid, settingsPane: "providers" };
+  }
+  if (hash.startsWith("settings/daemons")) {
+    window.history.replaceState(null, "", "/settings/daemons");
+    return { view: "settings", settingsPane: "daemons" };
+  }
+  if (hash.startsWith("settings")) {
+    window.history.replaceState(null, "", "/settings");
+    return { view: "settings", settingsPane: "providers" };
+  }
+  if (hash.startsWith("findings")) {
+    window.history.replaceState(null, "", "/findings");
+    return { view: "findings", settingsPane: "providers" };
+  }
+  if (window.location.hash) window.history.replaceState(null, "", pathname || "/");
   return { view: "projects", settingsPane: "providers" };
 }
 
-function go(hash: string) {
-  window.location.hash = hash;
+function go(pathname: string) {
+  const next = pathname || "/";
+  if (window.location.pathname === next && !window.location.hash) {
+    window.dispatchEvent(new PopStateEvent("popstate"));
+    return;
+  }
+  window.history.pushState(null, "", next);
+  window.dispatchEvent(new PopStateEvent("popstate"));
 }
 
 function scrollToProjectSection(id: string): void {
@@ -103,12 +133,12 @@ function scrollToProjectSection(id: string): void {
   });
 }
 
-function projectHash(uuid: string): string {
-  return `p/${encodeURIComponent(uuid)}`;
+function projectPath(uuid: string): string {
+  return `/projects/${encodeURIComponent(uuid)}`;
 }
 
-function projectHashFor(project: Pick<ProjectSnapshot, "uuid">): string {
-  return projectHash(project.uuid);
+function projectPathFor(project: Pick<ProjectSnapshot, "uuid">): string {
+  return projectPath(project.uuid);
 }
 
 const PROJECT_ACCENTS = ["#2563eb", "#059669", "#d97706", "#dc2626", "#0891b2", "#7c3aed", "#475569", "#be123c"];
@@ -192,12 +222,12 @@ function daemonAuthSummary(daemon: DaemonRow): string {
   return daemonProviderStatuses(daemon).length ? "provider auth: none configured" : "provider auth: not reported";
 }
 
-function phaseProviderId(config: ProjectConfig, phase: ProjectPhase): number | undefined {
+function phaseProviderId(config: ProjectConfig, phase: ProviderPhase): number | undefined {
   const id = config.phaseProviders?.[phase];
   return typeof id === "number" && Number.isFinite(id) ? id : undefined;
 }
 
-function phaseProvider(detail: ProjectDetail, providers: ProviderProfile[], phase: ProjectPhase): ProviderProfile | undefined {
+function phaseProvider(detail: ProjectDetail, providers: ProviderProfile[], phase: ProviderPhase): ProviderProfile | undefined {
   const cfg = projectConfig(detail).cfg;
   const id = phaseProviderId(cfg, phase);
   return id ? providers.find((provider) => provider.id === id) : undefined;
@@ -207,7 +237,7 @@ function requiredProviderProfiles(detail: ProjectDetail, providers: ProviderProf
   const ids = new Set<number>();
   if (typeof detail.project.provider_id === "number") ids.add(detail.project.provider_id);
   const cfg = projectConfig(detail).cfg;
-  for (const phase of ["prepare", "map", "dig", "confirm"] as const) {
+  for (const phase of PROVIDER_PHASES) {
     const id = phaseProviderId(cfg, phase);
     if (id) ids.add(id);
   }
@@ -300,21 +330,27 @@ function projectBadgeStatus(project: ProjectSnapshot): string | null | undefined
   return latest ?? (total > 0 ? "done" : undefined);
 }
 
-function phaseLabel(phase: "prepare" | "map" | "dig" | "confirm"): string {
+function phaseLabel(phase: ProjectPhase): string {
   return {
     prepare: "Prepare",
-    map: "Map scopes",
+    map: "Map",
     dig: "Dig",
+    synthesis: "Synthesis",
+    verify: "Verify",
     confirm: "Confirm",
+    report: "Report",
   }[phase];
 }
 
-function phaseIcon(phase: "prepare" | "map" | "dig" | "confirm"): IconName {
+function phaseIcon(phase: ProjectPhase): IconName {
   return {
     prepare: "sync",
     map: "search",
     dig: "bug",
+    synthesis: "package",
+    verify: "search",
     confirm: "shieldcheck",
+    report: "copy",
   }[phase] as IconName;
 }
 
@@ -329,6 +365,14 @@ function phaseStatusLabel(status: string): string {
     error: "Error",
     killed: "Stopped",
   }[status] ?? status;
+}
+
+function phaseStatusIcon(status: string): IconName {
+  if (status === "done" || status === "ready") return "shieldcheck";
+  if (status === "running") return "play";
+  if (status === "pending" || status === "partial") return "kebab";
+  if (status === "error" || status === "killed") return "x";
+  return "kebab";
 }
 
 function runKindLabel(kind: string, run?: RunRow): string {
@@ -908,9 +952,13 @@ export function App() {
   const detailRefreshRef = useRef(0);
 
   useEffect(() => {
-    const onHash = () => setRoute(readRoute());
-    addEventListener("hashchange", onHash);
-    return () => removeEventListener("hashchange", onHash);
+    const onRoute = () => setRoute(readRoute());
+    addEventListener("popstate", onRoute);
+    addEventListener("hashchange", onRoute);
+    return () => {
+      removeEventListener("popstate", onRoute);
+      removeEventListener("hashchange", onRoute);
+    };
   }, []);
 
   useEffect(() => {
@@ -1203,7 +1251,7 @@ export function App() {
               projects={projects}
               selected={route.projectUuid}
               onNew={() => setModal("new-project")}
-              onSelect={(uuid) => go(projectHash(uuid))}
+              onSelect={(uuid) => go(projectPath(uuid))}
             />
             <main className="workspace">
               {detail && selectedProject ? (
@@ -1264,7 +1312,7 @@ export function App() {
             setPage={setBugPage}
             setPageSize={setBugPageSize}
             onTracking={updateTracking}
-            onOpenProject={(uuid) => go(projectHash(uuid))}
+            onOpenProject={(uuid) => go(projectPath(uuid))}
             onOpenReport={(finding) => {
               setReportFinding(finding);
               setModal("report");
@@ -1282,7 +1330,7 @@ export function App() {
           onCreated={async (uuid) => {
             await refreshBase();
             setModal(null);
-            go(projectHash(uuid));
+            go(projectPath(uuid));
           }}
           onError={(message) => setToast({ tone: "error", message })}
         />
@@ -1321,17 +1369,17 @@ export function App() {
 function ShellHeader({ route, running, theme, onTheme, onCommands, onMenu }: { route: RouteState; running: number; theme: string; onTheme: () => void; onCommands: () => void; onMenu: () => void }) {
   return (
     <header className="topbar">
-      <button className="brand" onClick={() => go("")} aria-label="Go to projects">
+      <button className="brand" onClick={() => go("/")} aria-label="Go to projects">
         <img className="brand-logo" src={theme === "dark" ? "/flounder-white.png" : "/flounder-black.png"} alt="Flounder" />
       </button>
       <nav className="topnav desktop-nav" aria-label="Primary">
-        <button className={route.view === "projects" ? "sel" : ""} onClick={() => go(route.projectUuid ? projectHash(route.projectUuid) : "")}>Projects</button>
-        <button className={route.view === "findings" ? "sel" : ""} onClick={() => go("findings")}>Findings</button>
+        <button className={route.view === "projects" ? "sel" : ""} onClick={() => go(route.projectUuid ? projectPath(route.projectUuid) : "/")}>Projects</button>
+        <button className={route.view === "findings" ? "sel" : ""} onClick={() => go("/findings")}>Findings</button>
       </nav>
       <div className="topbar-spacer" />
       {running > 0 ? <Counter live>{`${running} running`}</Counter> : null}
       <IconButton icon="search" title="Commands (Cmd-K)" aria-label="Commands" onClick={onCommands} />
-      <IconButton className="desktop-tool" icon="gear" title="Settings" aria-label="Settings" selected={route.view === "settings"} onClick={() => go("settings")} />
+      <IconButton className="desktop-tool" icon="gear" title="Settings" aria-label="Settings" selected={route.view === "settings"} onClick={() => go("/settings")} />
       <IconButton className="desktop-tool" icon={theme === "dark" ? "sun" : "moon"} title="Toggle theme" aria-label="Toggle theme" onClick={onTheme} />
       <IconButton className="mobile-menu-button" icon="menu" title="Menu" aria-label="Menu" onClick={onMenu} />
     </header>
@@ -1339,8 +1387,8 @@ function ShellHeader({ route, running, theme, onTheme, onCommands, onMenu }: { r
 }
 
 function MobileMenu({ route, running, theme, onClose, onTheme }: { route: RouteState; running: number; theme: string; onClose: () => void; onTheme: () => void }) {
-  const navigate = (hash: string) => {
-    go(hash);
+  const navigate = (pathname: string) => {
+    go(pathname);
     onClose();
   };
   return (
@@ -1351,9 +1399,9 @@ function MobileMenu({ route, running, theme, onClose, onTheme }: { route: RouteS
           <IconButton icon="x" title="Close" aria-label="Close menu" onClick={onClose} />
         </div>
         {running > 0 ? <Counter live>{`${running} running`}</Counter> : null}
-        <button className={route.view === "projects" ? "sel" : ""} onClick={() => navigate(route.projectUuid ? projectHash(route.projectUuid) : "")}>Projects</button>
-        <button className={route.view === "findings" ? "sel" : ""} onClick={() => navigate("findings")}>Findings</button>
-        <button className={route.view === "settings" ? "sel" : ""} onClick={() => navigate("settings")}>Settings</button>
+        <button className={route.view === "projects" ? "sel" : ""} onClick={() => navigate(route.projectUuid ? projectPath(route.projectUuid) : "/")}>Projects</button>
+        <button className={route.view === "findings" ? "sel" : ""} onClick={() => navigate("/findings")}>Findings</button>
+        <button className={route.view === "settings" ? "sel" : ""} onClick={() => navigate("/settings")}>Settings</button>
         <button onClick={() => { onTheme(); onClose(); }}>{theme === "dark" ? "Light mode" : "Dark mode"}</button>
       </section>
     </div>
@@ -1466,7 +1514,7 @@ function ProjectDetailView(props: {
   const authStatuses = requiredProviders.map((profile) => ({ profile, status: daemonHasProvider(selectedDaemon, profile.provider) }));
   const authUnknown = authStatuses.some((entry) => entry.status === null);
   const authMissing = authStatuses.filter((entry) => entry.status === false);
-  const phaseOverrides = (["prepare", "map", "dig", "confirm"] as const)
+  const phaseOverrides = PROVIDER_PHASES
     .map((phase) => ({ phase, provider: phaseProvider(detail, providers, phase) }))
     .filter((entry) => entry.provider);
   const readyItems = [
@@ -1509,9 +1557,32 @@ function ProjectDetailView(props: {
       detail: "Acquire source, match deployment, warm the build sandbox",
     };
   })();
-  const phaseDisplayStatus = (phase: "prepare" | "map" | "dig" | "confirm") => {
+  const phaseDisplayStatus = (phase: ProjectPhase) => {
     if (phase === "prepare" && phases.prepare.status === "none" && (config.sourcePaths.length || config.buildRoot)) return "ready";
     return phases[phase].status;
+  };
+  const jumpToPhase = (phase: ProjectPhase) => {
+    if (phase === "map") {
+      setTab("scopes");
+      return;
+    }
+    if (phase === "dig" || phase === "verify") {
+      setTab("overview");
+      scrollToProjectSection("project-top-candidates");
+      return;
+    }
+    if (phase === "synthesis") {
+      setTab("overview");
+      scrollToProjectSection("project-audit-status");
+      return;
+    }
+    if (phase === "confirm" || phase === "report") {
+      setTab("overview");
+      scrollToProjectSection("project-real-target-decisions");
+      return;
+    }
+    setTab("overview");
+    scrollToProjectSection("project-setup");
   };
   return (
     <div className="project-page">
@@ -1581,21 +1652,27 @@ function ProjectDetailView(props: {
           </div>
         ) : null}
         <div className="pipeline" aria-label="Audit pipeline">
-          {(["prepare", "map", "dig", "confirm"] as const).map((phase) => {
+          {PHASES.map((phase, index) => {
             const displayStatus = phaseDisplayStatus(phase);
-            const label = phase === "dig" && isVerifyRun(runningRun) ? "Verify" : phaseLabel(phase);
+            const label = phaseLabel(phase);
             return (
-              <div key={phase} className={`phase ${displayStatus}`}>
+              <button key={phase} type="button" className={`phase ${displayStatus}`} onClick={() => jumpToPhase(phase)} title={`Open ${label} output`}>
                 <span className="phase-head">
-                  <span className="phase-title"><span className="phase-marker"><Icon name={phaseIcon(phase)} size={13} /></span>{label}</span>
-                  <span className={`phase-state ${displayStatus}`}>{phaseStatusLabel(displayStatus)}</span>
+                  <span className="phase-title">
+                    <span className="phase-index">{index + 1}</span>
+                    <span className="phase-marker"><Icon name={phaseIcon(phase)} size={13} /></span>
+                    {label}
+                  </span>
+                  <span className={`phase-state ${displayStatus}`} title={phaseStatusLabel(displayStatus)} aria-label={phaseStatusLabel(displayStatus)}>
+                    <Icon name={phaseStatusIcon(displayStatus)} size={12} />
+                  </span>
                 </span>
                 <strong>{phase === "prepare" ? prepareInfo.stat : phases[phase].stat}</strong>
                 <small className="phase-detail">
                   <span>{phase === "prepare" ? prepareInfo.detail : PHASE_DESC[phase]}</span>
                   {phases[phase].dur ? <span className="phase-time">{phases[phase].dur}</span> : null}
                 </small>
-              </div>
+              </button>
             );
           })}
         </div>
@@ -1625,7 +1702,7 @@ function ProjectDetailView(props: {
           </button>
         ))}
       </div>
-      {tab === "overview" ? <ProjectOverview detail={detail} candidates={overviewCandidates} verifyCount={pendingVerify} verifyLocked={launchLocked || pendingVerify === 0} onVerifyCandidates={() => props.onLaunch("verify")} onOpenReport={props.onOpenReport} onOpenArtifact={props.onOpenArtifact} /> : null}
+      {tab === "overview" ? <ProjectOverview detail={detail} candidates={overviewCandidates} verifyCount={pendingVerify} verifyLocked={launchLocked || pendingVerify === 0} onVerifyCandidates={() => props.onLaunch("verify")} onOpenReport={props.onOpenReport} /> : null}
       {tab === "findings" ? (
         <ProjectFindings
           detail={detail}
@@ -1662,7 +1739,7 @@ function prepareMaterialsAttention(summary?: PrepareSummary | null): { tone: "wa
 function ProjectSetupDisclosure({ items }: { items: Array<{ label: string; state: string; ok: boolean }> }) {
   const warnings = items.filter((item) => !item.ok).length;
   return (
-    <details className="setup-disclosure">
+    <details id="project-setup" className="setup-disclosure section-anchor">
       <summary>
         <span>Project setup</span>
         <small>{warnings ? `${plural(warnings, "setup issue")} needs attention` : "Provider, daemon, source, and coverage details"}</small>
@@ -1707,7 +1784,6 @@ function ProjectOverview({
   verifyLocked,
   onVerifyCandidates,
   onOpenReport,
-  onOpenArtifact,
 }: {
   detail: ProjectDetail;
   candidates: FindingRow[];
@@ -1715,7 +1791,6 @@ function ProjectOverview({
   verifyLocked: boolean;
   onVerifyCandidates: () => void;
   onOpenReport: (finding: FindingRow) => void;
-  onOpenArtifact: (artifact: ArtifactPreview) => void;
 }) {
   const current = detail.runs.find((run) => run.status === "running") ?? detail.runs[0];
   const runningRun = detail.runs.find((run) => run.status === "running");
@@ -1782,16 +1857,18 @@ function ProjectOverview({
           <FindingList findings={candidates} compact empty={candidateEmpty} onOpenReport={onOpenReport} />
         </Card>
       </div>
-      <Card title="Audit status">
-        <div className="queue-grid">
-          <QueueItem label={runLabel} value={runValue} detail={runDetail} />
-          <QueueItem label="Scope coverage" value={scopeValue} detail={scopeDetail} />
-          <QueueItem label="Synthesis" value={synthesisValue} detail={synthesisDetail} />
-          <QueueItem label="Candidate verification" value={verifyValue} detail={verifyDetail} />
-          <QueueItem label="Real-target proof" value={plural(reproduced, "reproduced finding")} detail={proofDetail} />
-        </div>
-      </Card>
-      <ConfirmDecisionsCard decisions={detail.confirmDecisions} onOpenArtifact={onOpenArtifact} />
+      <div id="project-audit-status" className="section-anchor">
+        <Card title="Audit status">
+          <div className="queue-grid">
+            <QueueItem label={runLabel} value={runValue} detail={runDetail} />
+            <QueueItem label="Scope coverage" value={scopeValue} detail={scopeDetail} />
+            <QueueItem label="Synthesis" value={synthesisValue} detail={synthesisDetail} />
+            <QueueItem label="Candidate verification" value={verifyValue} detail={verifyDetail} />
+            <QueueItem label="Real-target proof" value={plural(reproduced, "reproduced finding")} detail={proofDetail} />
+          </div>
+        </Card>
+      </div>
+      <ConfirmDecisionsCard decisions={detail.confirmDecisions} findings={detail.allFindings ?? []} onOpenReport={onOpenReport} />
     </>
   );
 }
@@ -1806,28 +1883,65 @@ function recommendationLabel(decision: ConfirmDecision): string {
   return decision.recommendation ? decision.recommendation.replace(/-/g, " ") : "no recommendation";
 }
 
-function ConfirmDecisionsCard({ decisions, onOpenArtifact }: { decisions: ConfirmDecision[]; onOpenArtifact: (artifact: ArtifactPreview) => void }) {
+function confirmDecisionMemberKeys(decision: ConfirmDecision): string[] {
+  const members = parseJson<unknown[]>(decision.members_json, []);
+  const keys = new Set<string>();
+  const add = (value: string) => {
+    const key = value.trim().replace(/^\[/, "").replace(/\]$/, "").toLowerCase();
+    if (/^k[0-9a-z]+$/.test(key)) keys.add(key);
+  };
+  for (const member of members) {
+    if (typeof member !== "string") continue;
+    const cleaned = member.trim();
+    add(cleaned);
+    add(cleaned.split(/\s+/)[0] ?? "");
+    const bracketed = cleaned.match(/^\[(k[0-9a-z]+)\]/i)?.[1];
+    if (bracketed) add(bracketed);
+    const embedded = cleaned.match(/\b(k[0-9a-z]+)\b/i)?.[1];
+    if (embedded) add(embedded);
+  }
+  return [...keys];
+}
+
+function decisionFindings(decision: ConfirmDecision, findings: FindingRow[]): FindingRow[] {
+  const keys = new Set(confirmDecisionMemberKeys(decision));
+  if (!keys.size) return [];
+  return findings.filter((finding) => finding.finding_key && keys.has(finding.finding_key.toLowerCase()));
+}
+
+function ConfirmDecisionsCard({ decisions, findings, onOpenReport }: { decisions: ConfirmDecision[]; findings: FindingRow[]; onOpenReport: (finding: FindingRow) => void }) {
   if (!decisions.length) return null;
   return (
     <div id="project-real-target-decisions" className="section-anchor">
       <Card title={<span>Real-target decisions <Counter>{decisions.length}</Counter></span>}>
         <div className="decision-list">
-          {decisions.map((decision) => (
-            <div className="decision-row" key={decision.id ?? `${decision.run_id}-${decision.bug}`}>
-              <div className="decision-main">
-                <span className={`label ${decision.reproduced === "yes" ? "s-confirmed-executable" : decision.reproduced === "no" ? "s-refuted" : "s-suspected"}`}>
-                  {decisionLabel(decision)}
-                </span>
-                <strong>{decision.bug}</strong>
-                <small>{recommendationLabel(decision)}</small>
+          {decisions.map((decision) => {
+            const linkedFindings = decisionFindings(decision, findings);
+            return (
+              <div className="decision-row" key={decision.id ?? `${decision.run_id}-${decision.bug}`}>
+                <div className="decision-main">
+                  <span className={`label ${decision.reproduced === "yes" ? "s-confirmed-executable" : decision.reproduced === "no" ? "s-refuted" : "s-suspected"}`}>
+                    {decisionLabel(decision)}
+                  </span>
+                  <strong>{decision.bug}</strong>
+                  <small>{recommendationLabel(decision)}{linkedFindings.length > 1 ? ` · ${linkedFindings.length} linked findings` : ""}</small>
+                </div>
+                <div className="decision-actions">
+                  {linkedFindings.length ? (
+                    linkedFindings.map((finding) => (
+                      <Button key={finding.id} size="sm" icon="copy" title={finding.title ?? "Open finding report"} onClick={() => onOpenReport(finding)}>
+                        Report #{finding.id}
+                      </Button>
+                    ))
+                  ) : (
+                    <Button size="sm" disabled title="This decision is missing a linked finding id.">
+                      No finding report
+                    </Button>
+                  )}
+                </div>
               </div>
-              {decision.run_id ? (
-                <Button size="sm" icon="shieldcheck" onClick={() => onOpenArtifact({ title: `Confirm report - #${decision.run_id}`, runId: decision.run_id!, name: "confirm_report.md" })}>
-                  Report
-                </Button>
-              ) : null}
-            </div>
-          ))}
+            );
+          })}
         </div>
       </Card>
     </div>
@@ -2486,8 +2600,8 @@ function SettingsView({ pane, providers, daemons, onRefresh }: { pane: SettingsP
     <main className="settings-view">
       <aside className="settings-rail">
         <h1>Settings</h1>
-        <button className={pane === "providers" ? "sel" : ""} onClick={() => go("settings")}>Providers</button>
-        <button className={pane === "daemons" ? "sel" : ""} onClick={() => go("settings/daemons")}>Daemons</button>
+        <button className={pane === "providers" ? "sel" : ""} onClick={() => go("/settings")}>Providers</button>
+        <button className={pane === "daemons" ? "sel" : ""} onClick={() => go("/settings/daemons")}>Daemons</button>
       </aside>
       <section className="settings-content">
         {pane === "providers" ? <ProvidersPane providers={providers} onRefresh={onRefresh} /> : <DaemonsPane daemons={daemons} onRefresh={onRefresh} />}
@@ -2820,7 +2934,7 @@ function Field({ label, help, children, span }: { label: string; help?: string; 
 }
 
 type BudgetForm = { digSamples: string; mapSteps: string; digSteps: string; digConcurrency: string };
-type PhaseProviderForm = Record<ProjectPhase, string>;
+type PhaseProviderForm = Record<ProviderPhase, string>;
 
 function applyBudgetFields(config: ProjectConfig, form: BudgetForm): ProjectConfig {
   const next = { ...config };
@@ -2839,7 +2953,7 @@ function setOptionalNumber(config: ProjectConfig, key: keyof Pick<ProjectConfig,
 
 function phaseProviderConfig(form: PhaseProviderForm): ProjectConfig["phaseProviders"] | undefined {
   const out: NonNullable<ProjectConfig["phaseProviders"]> = {};
-  for (const phase of ["prepare", "map", "dig", "confirm"] as const) {
+  for (const phase of PROVIDER_PHASES) {
     const id = numberOrUndefined(form[phase]);
     if (id !== undefined) out[phase] = id;
   }
@@ -2850,7 +2964,7 @@ function selectedProfilesForForm(defaultProviderId: string, phaseProviders: Phas
   const ids = new Set<number>();
   const defaultId = numberOrUndefined(defaultProviderId);
   if (defaultId !== undefined) ids.add(defaultId);
-  for (const phase of ["prepare", "map", "dig", "confirm"] as const) {
+  for (const phase of PROVIDER_PHASES) {
     const id = numberOrUndefined(phaseProviders[phase]);
     if (id !== undefined) ids.add(id);
   }
@@ -2912,7 +3026,7 @@ function PhaseProviderOverrides({ providers, defaultProviderId, values, onChange
   const defaultName = providers.find((provider) => String(provider.id) === defaultProviderId)?.name ?? "none";
   return (
     <div className="phase-provider-grid">
-      {(["prepare", "map", "dig", "confirm"] as const).map((phase) => (
+      {PROVIDER_PHASES.map((phase) => (
         <Field key={phase} label={phaseLabel(phase)} help={values[phase] ? "Overrides the project default for this phase." : "Uses the default provider profile."}>
           <select value={values[phase]} onChange={(event) => onChange({ ...values, [phase]: event.target.value })}>
             <option value="">Use default ({defaultName})</option>
@@ -3329,9 +3443,34 @@ function RunLogModal({ run, onClose }: { run: RunRow; onClose: () => void }) {
 }
 
 function ReportModal({ finding, onClose }: { finding: FindingRow; onClose: () => void }) {
-  const markdown = findingReportMarkdown(finding);
+  const fallback = useMemo(() => findingReportMarkdown(finding), [finding]);
+  const [markdown, setMarkdown] = useState(fallback);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    setMarkdown(fallback);
+    setError("");
+    setLoading(true);
+    void api
+      .findingReport(finding.id)
+      .then((response) => {
+        if (!cancelled && response.markdown.trim()) setMarkdown(redactReportMarkdown(response.markdown));
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) setError(String(err instanceof Error ? err.message : err));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [fallback, finding.id]);
   return (
-    <Modal title="Finding report" wide onClose={onClose}>
+    <Modal title={`Finding report #${finding.id}`} wide onClose={onClose}>
+      {loading ? <EmptyInline>Loading report...</EmptyInline> : null}
+      {!loading && error ? <div className="inline-note">Showing the stored finding summary because the DB report endpoint could not be loaded.</div> : null}
       <MarkdownReport markdown={markdown} fileName={`finding-${finding.id}.md`} />
     </Modal>
   );
@@ -3381,6 +3520,7 @@ function findingReportMarkdown(finding: FindingRow): string {
     `# ${finding.title ?? "Finding report"}`,
     "",
     `- Status: ${finding.status}`,
+    finding.confirm_status ? `- Real-target status: ${finding.confirm_status}` : "",
     finding.location ? `- Location: \`${finding.location}\`` : "",
     finding.severity ? `- Severity: ${finding.severity}` : "",
     finding.confidence != null ? `- Confidence: ${Math.round(finding.confidence * 100)}%` : "",
@@ -3449,8 +3589,8 @@ function MarkdownReport({ markdown, fileName }: { markdown: string; fileName: st
         <div className="report-actions">
           <IconButton icon="copy" title="Copy Markdown" aria-label="Copy Markdown" onClick={() => void copy()} />
           {copyLabel === "Copied" ? <span className="copied-note">Copied</span> : null}
-          <Button size="sm" onClick={() => downloadText(fileName, markdown)}>Download .md</Button>
-          <Button size="sm" onClick={() => window.print()}>Export PDF</Button>
+          <IconButton icon="download" title="Download Markdown" aria-label="Download Markdown" onClick={() => downloadText(fileName, markdown)} />
+          <IconButton icon="printer" title="Export PDF" aria-label="Export PDF" onClick={() => window.print()} />
         </div>
       </div>
       <article className="report-preview markdown-body">
@@ -3536,16 +3676,16 @@ function renderInlineMarkdown(text: string): ReactNode[] {
 function CommandPalette({ projects, currentProjectUuid, onClose, onNewProject, onLaunch }: { projects: ProjectSnapshot[]; currentProjectUuid?: string; onClose: () => void; onNewProject: () => void; onLaunch: () => void }) {
   const [query, setQuery] = useState("");
   const commands = useMemo(() => {
-    const projectCommands = projects.map((project) => ({ id: `p-${project.uuid}`, label: project.name, meta: "project", run: () => go(projectHashFor(project)) }));
+    const projectCommands = projects.map((project) => ({ id: `p-${project.uuid}`, label: project.name, meta: "project", run: () => go(projectPathFor(project)) }));
     const current = currentProjectUuid ? projects.find((project) => project.uuid === currentProjectUuid) : undefined;
     const currentRunning = Boolean(current && ((current.activeRuns ?? 0) > 0 || current.latestRun?.status === "running"));
     const base = [
       { id: "new", label: "New project", meta: "create", run: onNewProject },
-      { id: "findings", label: "Go to Findings", meta: "view", run: () => go("findings") },
-      { id: "projects", label: "Go to Projects", meta: "view", run: () => go("") },
-      { id: "settings", label: "Settings", meta: "view", run: () => go("settings") },
-      { id: "providers", label: "Provider profiles", meta: "settings", run: () => go("settings") },
-      { id: "daemons", label: "Daemons", meta: "settings", run: () => go("settings/daemons") },
+      { id: "findings", label: "Go to Findings", meta: "view", run: () => go("/findings") },
+      { id: "projects", label: "Go to Projects", meta: "view", run: () => go("/") },
+      { id: "settings", label: "Settings", meta: "view", run: () => go("/settings") },
+      { id: "providers", label: "Provider profiles", meta: "settings", run: () => go("/settings") },
+      { id: "daemons", label: "Daemons", meta: "settings", run: () => go("/settings/daemons") },
       ...(current && !currentRunning ? [{ id: "run", label: `Continue audit - ${current.name}`, meta: "run", run: onLaunch }] : []),
     ];
     return [...projectCommands, ...base].filter((command) => command.label.toLowerCase().includes(query.toLowerCase()));
@@ -3607,8 +3747,8 @@ function FirstRunGuide({ providers, daemons, onNewProject }: { providers: Provid
         <SetupStep index={3} title="Create a project" ok={false} detail="Point the daemon workspace at source, build root, and optional docs/specs." muted />
       </div>
       <div className="onboarding-actions">
-        <Button variant={!hasProvider ? "primary" : undefined} icon="package" onClick={() => go("settings")}>{hasProvider ? "View Providers" : "Set up Provider"}</Button>
-        <Button variant={hasProvider && online === 0 ? "primary" : undefined} icon="package" onClick={() => go("settings/daemons")}>{online > 0 ? "View Daemons" : "Set up Daemon"}</Button>
+        <Button variant={!hasProvider ? "primary" : undefined} icon="package" onClick={() => go("/settings")}>{hasProvider ? "View Providers" : "Set up Provider"}</Button>
+        <Button variant={hasProvider && online === 0 ? "primary" : undefined} icon="package" onClick={() => go("/settings/daemons")}>{online > 0 ? "View Daemons" : "Set up Daemon"}</Button>
         <Button variant={hasProvider && online > 0 ? "primary" : undefined} icon="package" disabled={!hasProvider} title={hasProvider ? "Create project" : "Create a provider profile first"} onClick={onNewProject}>New project</Button>
       </div>
     </div>

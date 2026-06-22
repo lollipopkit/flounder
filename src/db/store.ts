@@ -1,9 +1,9 @@
 // SQLite metadata store — the system of record for run TRACKING.
 //
 // flounder writes here on every run (project, run lifecycle, scope coverage, findings, and
-// their status transitions, confirm decisions). The big evidentiary content stays on
-// disk (transcripts, PoCs, provenance, the JSON artifacts); the DB stores PATHS to it
-// plus the denormalized metadata a UI needs to list/filter/track across all projects.
+// their status transitions, confirm decisions). User-facing structured content and final
+// reports live in the DB; large raw evidentiary artifacts stay on disk (transcripts, PoCs,
+// provenance, JSON artifacts) with paths recorded for provenance/debugging.
 //
 // This is NOT a derived/rebuildable projection — it is written live alongside the run.
 // node:sqlite is used so the package stays dependency-free. WAL + a busy timeout let one
@@ -64,6 +64,7 @@ export interface FindingRow {
   severity?: string | undefined;
   status: FindingStatus;
   reportPath?: string | undefined;
+  reportMarkdown?: string | undefined;
   scopeId?: string | undefined;
   // The rich content the kernel produces (previously only in the run dir's audit_hypotheses /
   // audit_findings artifacts). Persisted so findings are self-contained in the DB — the UI shows
@@ -201,6 +202,7 @@ CREATE TABLE IF NOT EXISTS finding(
   status TEXT NOT NULL,
   confirm_status TEXT,            -- per-finding real-target confirm state: NULL=not confirmed yet | confirming | reproduced | not-reproduced
   report_path TEXT,
+  report_markdown TEXT,           -- user-facing per-finding report markdown; local artifacts are only provenance/debug fallback
   scope_id TEXT,
   description TEXT,               -- the kernel's rich finding content (was only in run-dir artifacts)
   evidence TEXT,
@@ -324,6 +326,7 @@ export class MetadataStore {
       "ALTER TABLE scope ADD COLUMN priority INTEGER DEFAULT 0", // manual dig-queue ordering, separate from score
       "ALTER TABLE finding ADD COLUMN tracking_status TEXT", // submission tracking: open|triaging|submitted|accepted|fixed|duplicate|rejected
       "ALTER TABLE finding ADD COLUMN confirm_status TEXT", // per-finding real-target confirm state
+      "ALTER TABLE finding ADD COLUMN report_markdown TEXT", // user-facing per-finding report markdown
       "ALTER TABLE finding ADD COLUMN description TEXT", // rich finding content, previously only in run-dir artifacts
       "ALTER TABLE finding ADD COLUMN evidence TEXT",
       "ALTER TABLE finding ADD COLUMN exploit_sketch TEXT",
@@ -682,11 +685,12 @@ export class MetadataStore {
             this.db
               .prepare(
                 `UPDATE finding SET status = ?, report_path = COALESCE(?, report_path),
+                   report_markdown = COALESCE(NULLIF(?, ''), report_markdown),
                    description = COALESCE(NULLIF(?, ''), description), evidence = COALESCE(NULLIF(?, ''), evidence),
                    exploit_sketch = COALESCE(NULLIF(?, ''), exploit_sketch), fix = COALESCE(NULLIF(?, ''), fix),
                    confidence = COALESCE(?, confidence), updated_at = ? WHERE id = ?`,
               )
-              .run(f.status, f.reportPath ?? null, f.description ?? null, f.evidence ?? null, f.exploitSketch ?? null, f.fix ?? null, f.confidence ?? null, ts, orig.id);
+              .run(f.status, f.reportPath ?? null, f.reportMarkdown ?? null, f.description ?? null, f.evidence ?? null, f.exploitSketch ?? null, f.fix ?? null, f.confidence ?? null, ts, orig.id);
             if (orig.status !== f.status) this.recordStatusEvent(orig.id, orig.status, f.status, reason, runId, ts);
             continue;
           }
@@ -698,10 +702,10 @@ export class MetadataStore {
         if (!existing) {
           const info = this.db
             .prepare(
-              `INSERT INTO finding(project_id, run_id, finding_key, title, location, severity, status, report_path, scope_id, description, evidence, exploit_sketch, fix, confidence, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              `INSERT INTO finding(project_id, run_id, finding_key, title, location, severity, status, report_path, report_markdown, scope_id, description, evidence, exploit_sketch, fix, confidence, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             )
-            .run(projectId, runId, f.findingKey, f.title ?? null, f.location ?? null, f.severity ?? null, f.status, f.reportPath ?? null, f.scopeId ?? null, f.description ?? null, f.evidence ?? null, f.exploitSketch ?? null, f.fix ?? null, f.confidence ?? null, ts, ts);
+            .run(projectId, runId, f.findingKey, f.title ?? null, f.location ?? null, f.severity ?? null, f.status, f.reportPath ?? null, f.reportMarkdown ?? null, f.scopeId ?? null, f.description ?? null, f.evidence ?? null, f.exploitSketch ?? null, f.fix ?? null, f.confidence ?? null, ts, ts);
           this.recordStatusEvent(Number(info.lastInsertRowid), null, f.status, reason, runId, ts);
         } else {
           // COALESCE(NULLIF(?, ''), col): keep the stored content when a later re-persist (a status
@@ -709,7 +713,7 @@ export class MetadataStore {
           // never wiped — mirrors the dig_seconds keep-on-omit rule.
           this.db
             .prepare(
-              `UPDATE finding SET title = ?, location = ?, severity = ?, status = ?, report_path = ?, scope_id = ?,
+              `UPDATE finding SET title = ?, location = ?, severity = ?, status = ?, report_path = ?, report_markdown = COALESCE(NULLIF(?, ''), report_markdown), scope_id = ?,
                  description = COALESCE(NULLIF(?, ''), description),
                  evidence = COALESCE(NULLIF(?, ''), evidence),
                  exploit_sketch = COALESCE(NULLIF(?, ''), exploit_sketch),
@@ -717,7 +721,7 @@ export class MetadataStore {
                  confidence = COALESCE(?, confidence),
                  updated_at = ? WHERE id = ?`,
             )
-            .run(f.title ?? null, f.location ?? null, f.severity ?? null, f.status, f.reportPath ?? null, f.scopeId ?? null, f.description ?? null, f.evidence ?? null, f.exploitSketch ?? null, f.fix ?? null, f.confidence ?? null, ts, existing.id);
+            .run(f.title ?? null, f.location ?? null, f.severity ?? null, f.status, f.reportPath ?? null, f.reportMarkdown ?? null, f.scopeId ?? null, f.description ?? null, f.evidence ?? null, f.exploitSketch ?? null, f.fix ?? null, f.confidence ?? null, ts, existing.id);
           if (existing.status !== f.status) {
             this.recordStatusEvent(existing.id, existing.status, f.status, reason, runId, ts);
           }
@@ -734,6 +738,10 @@ export class MetadataStore {
 
   listFindings(projectId: number): Array<Record<string, unknown>> {
     return this.db.prepare("SELECT * FROM finding WHERE project_id = ? ORDER BY updated_at DESC").all(projectId) as Array<Record<string, unknown>>;
+  }
+
+  getFinding(id: number): Record<string, unknown> | undefined {
+    return this.db.prepare("SELECT f.*, p.name AS project_name, p.uuid AS project_uuid FROM finding f JOIN project p ON p.id = f.project_id WHERE f.id = ?").get(id) as Record<string, unknown> | undefined;
   }
 
   // --- global (cross-project) bug view -------------------------------------

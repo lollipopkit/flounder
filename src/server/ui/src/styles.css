@@ -1571,11 +1571,17 @@ small {
   color: var(--warning);
 }
 
-.confidence,
 .score {
   color: var(--fg-muted);
   font-family: var(--mono);
   font-size: 12px;
+}
+
+.confidence-label {
+  color: var(--fg-muted);
+  background: var(--canvas-subtle);
+  font-family: var(--mono);
+  font-size: 11px;
 }
 
 .run-log-head {

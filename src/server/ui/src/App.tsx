@@ -301,7 +301,13 @@ function FindingChecks({ finding }: { finding: FindingRow }) {
 function formatConfidence(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return "";
   const pct = value <= 1 ? Math.round(value * 100) : Math.round(value);
-  return `confidence ${pct}%`;
+  return `${pct}%`;
+}
+
+function ConfidenceBadge({ value }: { value: number | null | undefined }) {
+  const label = formatConfidence(value);
+  if (!label) return null;
+  return <span className="label confidence-label" title={`Model confidence: ${label}`}>{label}</span>;
 }
 
 function coverageModeFromConfig(cfg: { scopeCoverageMode?: string; maxScopes?: number }): CoverageMode {
@@ -2531,7 +2537,7 @@ function FindingList({ findings, compact, empty, onOpenReport }: { findings: Fin
             <StatusBadge status={finding.status} />
             <FindingChecks finding={finding} />
             {finding.severity ? <span className={`severity sev-${finding.severity}`}>{finding.severity}</span> : null}
-            {finding.confidence != null ? <span className="confidence">{formatConfidence(finding.confidence)}</span> : null}
+            <ConfidenceBadge value={finding.confidence} />
           </span>
         </button>
       ))}

@@ -299,6 +299,7 @@ export interface LaunchPayload {
   findingId?: number;
   findingIds?: number[];
   verifyFindings?: unknown;
+  allowMaterialDrift?: boolean;
 }
 
 export async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {

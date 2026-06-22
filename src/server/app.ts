@@ -203,6 +203,7 @@ const ROUTES: Route[] = [
       remap: "boolean? — re-enumerate scopes (restart)", fresh: "boolean? — confirm: ignore a prior interrupted confirm",
       quick: "boolean? — run: single breadth pass", mockLlm: "boolean? — offline mock model",
       region: "string? — audit: pinned region e.g. src/Foo.sol:120-180", scope: "string? — audit: scope id(s)", verifyFindings: "object|array? — audit: inline suspected finding(s) to confirm-or-refute by execution; project finding rows with id are linked back to that original row",
+      allowMaterialDrift: "boolean? — expert override for verifyFindings when a newer Prepare run changed project materials after the selected findings were produced",
       scopeCoverageMode: "focused|standard|half|full|custom? — one-off coverage mode for this run; standard means audit until the project has 30 audited scopes",
       maxScopes: "number? — one-off per-run scope cap, or the custom target when scopeCoverageMode=custom", mapSteps: "number? — one-off map turn cap", digSteps: "number? — one-off per-scope dig turn cap",
       maxSteps: "number? — one-off global turn cap", digSamples: "number? — one-off samples per scope", digConcurrency: "number? — one-off parallel scopes",
@@ -1374,6 +1375,8 @@ async function runLaunch(c: Ctx): Promise<void> {
   const spec = launchSpec(project, body, c.out, profile, progress, phaseProfiles);
   const prepared = applyPreparedWorkspaceIfNeeded(spec, runs);
   if (!prepared.ok) return sendJson(c.res, 400, { error: prepared.error });
+  const materialDrift = verifyMaterialDrift(c.store, projectId, spec.verifyFindings, body.allowMaterialDrift === true);
+  if (materialDrift) return sendJson(c.res, 409, materialDrift);
   if (coverageTargetReached(spec)) {
     const target = spec.coverageTarget;
     const denominator = target ? Math.min(target, progress.total || target) : progress.total;
@@ -1439,6 +1442,63 @@ function selectedFindingIds(body: Record<string, unknown>): number[] {
     }
   }
   return [...ids];
+}
+
+function verifyMaterialDrift(store: MetadataStore, projectId: number, verifyFindings: unknown, allowOverride: boolean): Record<string, unknown> | null {
+  if (allowOverride || verifyFindings === undefined) return null;
+  const ids = extractVerifyOriginIds(verifyFindings);
+  if (ids.length === 0) return null;
+  const missing: number[] = [];
+  const drifted: Array<Record<string, unknown>> = [];
+  for (const id of ids) {
+    const finding = store.getFinding(id);
+    if (!finding || Number(finding.project_id) !== projectId) {
+      missing.push(id);
+      continue;
+    }
+    const runId = Number(finding.run_id);
+    if (!Number.isFinite(runId)) continue;
+    const newerPrepare = store.latestPrepareAfterRun(projectId, runId);
+    if (!newerPrepare) continue;
+    drifted.push({
+      findingId: id,
+      title: stringValue(finding.title),
+      findingRunId: runId,
+      findingRunStartedAt: store.getRun(runId)?.started_at ?? null,
+      prepareRunId: newerPrepare.id,
+      prepareStartedAt: newerPrepare.started_at,
+    });
+  }
+  if (missing.length > 0) {
+    return {
+      error: `verifyFindings references finding ${missing.join(", ")} outside this project or no longer present`,
+      missingFindings: missing,
+    };
+  }
+  if (drifted.length === 0) return null;
+  return {
+    error: "Cannot verify selected findings against the current project materials because a newer Prepare run exists after those findings were produced. Re-run Map/Dig on the current prepared materials, or pass allowMaterialDrift:true only if you intentionally want to verify old findings against the current workspace.",
+    materialDrift: true,
+    findings: drifted,
+  };
+}
+
+function extractVerifyOriginIds(input: unknown): number[] {
+  const out = new Set<number>();
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item);
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    const row = value as Record<string, unknown>;
+    for (const key of ["originId", "origin_id", "id"]) {
+      const raw = row[key];
+      if (typeof raw === "number" && Number.isInteger(raw)) out.add(raw);
+    }
+  };
+  visit(input);
+  return [...out];
 }
 
 function reportWorklist(store: MetadataStore, projectId: number, selectedIds: number[] = []): { findings: ReportFindingSpec[]; error?: undefined } | { findings?: undefined; error: string } {

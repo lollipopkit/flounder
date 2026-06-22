@@ -601,6 +601,21 @@ export class MetadataStore {
     return this.db.prepare("SELECT * FROM run WHERE id = ?").get(id) as Record<string, unknown> | undefined;
   }
 
+  latestPrepareAfterRun(projectId: number, runId: number): Record<string, unknown> | undefined {
+    return this.db
+      .prepare(
+        `SELECT newer.* FROM run newer
+         JOIN run source ON source.id = ?
+         WHERE newer.project_id = ?
+           AND newer.kind = 'prepare'
+           AND newer.status = 'done'
+           AND newer.started_at > source.started_at
+         ORDER BY newer.started_at DESC
+         LIMIT 1`,
+      )
+      .get(runId, projectId) as Record<string, unknown> | undefined;
+  }
+
   /** Delete a run and its run-scoped children (findings + their status events, confirm
    * decisions). Scopes are project-level (the persisted inventory) and are left intact.
    * On-disk run artifacts are untouched. Returns true if a run was removed. */

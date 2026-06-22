@@ -883,6 +883,35 @@ test("api: run log supports a bounded JSON tail for agents", async () => {
   });
 });
 
+test("api: run rows include job error summaries", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+    const created = await json(await post("/api/projects", { name: "run-error-summary", sourcePaths: ["./src"] }));
+    const runDir = await mkdtemp(path.join(out, "run-error-summary-"));
+    const store = MetadataStore.openForOutput(out);
+    let runId;
+    try {
+      const jobId = store.enqueueJob("run-error-summary", { verb: "audit" });
+      runId = store.startRun({ projectId: created.id, kind: "audit", runDir });
+      store.setJobRun(jobId, runId);
+      store.setJobStatus(jobId, "error", "sandbox image flounder-sandbox:latest is missing");
+      store.finishRun(runId, "error");
+    } finally {
+      store.close();
+    }
+
+    const list = await json(await fetch(base + `/api/projects/${created.uuid}/runs`));
+    assert.equal(list.runs[0].job_status, "error");
+    assert.equal(list.runs[0].job_error, "sandbox image flounder-sandbox:latest is missing");
+
+    const single = await json(await fetch(base + `/api/runs/${runId}`));
+    assert.equal(single.run.job_status, "error");
+    assert.equal(single.run.job_error, "sandbox image flounder-sandbox:latest is missing");
+  });
+});
+
 test("api: run scope target adjustment only applies to running runs", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();

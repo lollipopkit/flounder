@@ -68,6 +68,9 @@ export interface RunRow {
   started_at?: string | null;
   dig_started_at?: string | null;
   ended_at?: string | null;
+  job_id?: number | null;
+  job_status?: string | null;
+  job_error?: string | null;
 }
 
 export interface ScopeRow {

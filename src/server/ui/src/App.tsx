@@ -2124,6 +2124,7 @@ function RunsView({ detail, onStopRun, onOpenLog }: { detail: ProjectDetail; onS
               <div>
                 <strong>{runKindLabel(run.kind, run)}</strong>
                 <small>{runProgress(run, detail.confirmDecisions)}</small>
+                {run.job_error ? <small className="run-error">{run.job_error}</small> : null}
               </div>
               <code>{run.run_dir?.split("/").pop() ?? "-"}</code>
               <span>{fmtTime(run.started_at)}</span>
@@ -3143,6 +3144,7 @@ function RunLogModal({ run, onClose }: { run: RunRow; onClose: () => void }) {
         <span>{runProgress(run, [])}</span>
         {lastLine ? <span>Last activity {formatActivityTime(lastLine.time)}</span> : null}
       </div>
+      {run.job_error ? <div className="inline-error">{run.job_error}</div> : null}
       {error ? <div className="inline-error">{error}</div> : null}
       {loading ? <EmptyInline>Loading run log...</EmptyInline> : null}
       {!loading && !lines.length && !error ? <EmptyInline>No activity has been recorded for this run.</EmptyInline> : null}

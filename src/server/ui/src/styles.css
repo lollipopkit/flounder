@@ -1347,6 +1347,12 @@ small {
   white-space: nowrap;
 }
 
+.run-row .run-error {
+  color: var(--danger);
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
 .resource-command {
   margin-top: 3px;
   font-family: var(--mono);

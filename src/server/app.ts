@@ -185,9 +185,9 @@ const ROUTES: Route[] = [
 
   route({
     method: "GET", path: "/api/projects/:uuid/runs",
-    summary: "List a project's runs (newest first).",
+    summary: "List a project's runs (newest first), including job error summaries when available.",
     params: { uuid: "project UUID" }, query: { limit: "number? — cap rows" },
-    handler: (c) => withProject(c, (id) => sendJson(c.res, 200, { runs: c.store.listRuns(id, clampInt(c.url.searchParams.get("limit"), 200, 1, 1000)) })),
+    handler: (c) => withProject(c, (id) => sendJson(c.res, 200, { runs: runApiRows(c.store, c.store.listRuns(id, clampInt(c.url.searchParams.get("limit"), 200, 1, 1000))) })),
   }),
   route({
     method: "POST", path: "/api/projects/:uuid/runs",
@@ -364,11 +364,11 @@ const ROUTES: Route[] = [
   }),
   route({
     method: "GET", path: "/api/runs/:id",
-    summary: "A single run (status, kind, coverage, finding count, run dir, timestamps).",
+    summary: "A single run (status, kind, coverage, finding count, run dir, timestamps, and job error summary when available).",
     params: { id: "run id" },
     handler: (c) => {
       const run = c.store.getRun(Number(c.params.id));
-      run ? sendJson(c.res, 200, { run }) : sendJson(c.res, 404, { error: "no such run" });
+      run ? sendJson(c.res, 200, { run: runApiRow(c.store, run) }) : sendJson(c.res, 404, { error: "no such run" });
     },
   }),
   route({
@@ -659,7 +659,7 @@ async function projectCreate(c: Ctx): Promise<void> {
 
 function projectGet(c: Ctx): void {
   withProject(c, (id, project) => {
-    const runs = c.store.listRuns(id, 50);
+    const runs = runApiRows(c.store, c.store.listRuns(id, 50));
     const storedProgress = c.store.scopeProgress(id);
     const storedScopes = c.store.queryScopes(id, { limit: 50, offset: 0 });
     const scopeCheckpoint = latestScopeCheckpoint(runs);
@@ -685,6 +685,22 @@ function projectGet(c: Ctx): void {
       prepareSummary: latestPrepareSummary(runs),
     });
   });
+}
+
+function runApiRows(store: MetadataStore, runs: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  return runs.map((run) => runApiRow(store, run));
+}
+
+function runApiRow(store: MetadataStore, run: Record<string, unknown>): Record<string, unknown> {
+  const runId = Number(run.id);
+  const job = Number.isFinite(runId) ? store.getJobByRun(runId) : undefined;
+  if (!job) return run;
+  return {
+    ...run,
+    job_id: job.id,
+    job_status: job.status,
+    job_error: stringValue(job.error) || undefined,
+  };
 }
 
 function projectScopesGet(c: Ctx): void {

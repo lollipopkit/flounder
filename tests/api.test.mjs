@@ -501,6 +501,93 @@ test("api: project detail summarizes the latest prepare manifest and workspace q
   });
 });
 
+test("api: prepare summary normalizes verified deployment evidence", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+    const created = await json(await post("/api/projects", { name: "deployed-prepared-target" }));
+    const runDir = path.join(out, "deployed-prepared-target-prepare-test");
+    const workspace = path.join(runDir, "prepare", "workspace");
+    await mkdir(path.join(workspace, "sources", "sourcify", "1", "0xabc"), { recursive: true });
+    await mkdir(path.join(workspace, "sources", "repo"), { recursive: true });
+    await writeFile(path.join(workspace, "sources", "sourcify", "1", "0xabc", "Target.sol"), "contract Target {}\n");
+    await writeFile(
+      path.join(workspace, "prepare_manifest.json"),
+      JSON.stringify({
+        posture: "blind",
+        answer_firewall: [],
+        real_target: {
+          requires_confirmation: true,
+          reason: "The target is a deployed contract.",
+          read_only_method: "Use read-only RPC calls or a local fork; never broadcast.",
+          ground_truth: [
+            {
+              network: "ethereum-mainnet",
+              chain_id: 1,
+              address: "0xabc",
+              role: "target_proxy",
+              deployment_match_status: "verified_full_sourcify",
+              block_number: 123,
+            },
+          ],
+        },
+        components: [
+          {
+            id: "repo",
+            type: "git_repository",
+            path: "sources/repo",
+            provenance: { origin: "https://example.invalid/repo.git", revision: "abc123" },
+            deployment_match: { status: "source_files_matched_to_sourcify_for_core_targets" },
+            in_scope: true,
+          },
+          {
+            id: "deployed-target",
+            type: "ethereum_contract_implementation",
+            address: "0xabc",
+            path: "sources/sourcify/1/0xabc",
+            provenance: {
+              source_verifier: "Sourcify full_match",
+              metadata: "provenance/sourcify_target_metadata.json",
+              code_digest: { sha256: "0x123" },
+            },
+            deployment_match: { status: "verified_full_sourcify" },
+            in_scope: true,
+          },
+          {
+            id: "external-registry",
+            type: "ethereum_contract_registry",
+            address: "0xdef",
+            path: "sources/repo/Registry.sol",
+            provenance: { source_pin: "sources/repo/Registry.sol@abc123" },
+            deployment_match: { status: "unverified" },
+            in_scope: true,
+          },
+        ],
+        gaps: [{ id: "external-registry-unverified", description: "Registry source is unverified." }],
+      }),
+    );
+
+    const store = MetadataStore.openForOutput(out);
+    try {
+      store.startRun({ projectId: created.id, kind: "prepare", runDir, provider: "openai-codex", model: "gpt-5.5" });
+    } finally {
+      store.close();
+    }
+
+    const detail = await json(await fetch(base + "/api/projects/" + created.uuid));
+    assert.equal(detail.prepareSummary.componentsTotal, 3);
+    assert.equal(detail.prepareSummary.matched, 1);
+    assert.equal(detail.prepareSummary.unverified, 1);
+    assert.equal(detail.prepareSummary.sourcePinned, 3);
+    assert.equal(detail.prepareSummary.realTarget.mode, "deployed");
+    assert.equal(detail.prepareSummary.realTarget.guidance.recommendedMethod, "Use read-only RPC calls or a local fork; never broadcast.");
+    assert.equal(detail.prepareSummary.realTarget.groundTruth[0].kind, "chain");
+    assert.equal(detail.prepareSummary.realTarget.groundTruth[0].sourceMatch, "verified_full_sourcify");
+    assert.deepEqual(detail.prepareSummary.issues, ["1 deployed component(s) are unverified and should be treated as trust boundaries"]);
+  });
+});
+
 test("api: unresolved prepare manifest status is surfaced as a review issue", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();

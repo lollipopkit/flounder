@@ -887,8 +887,8 @@ function readPrepareSummary(run: Record<string, unknown>): Record<string, unknow
   for (const component of components) {
     const summary = summarizePrepareComponent(component);
     if (summary.inScope) inScope += 1;
-    if (summary.match === "matched") matched += 1;
-    else if (summary.match === "unverified") unverified += 1;
+    if (summary.deployed && summary.match === "matched") matched += 1;
+    else if (summary.deployed && summary.match === "unverified") unverified += 1;
     if (summary.revision) sourcePinned += 1;
     if (summary.deployed && summary.match !== "matched" && summary.match !== "unverified") {
       issues.push(`${summary.identity}: deployed on ${summary.platform || "unknown platform"} but match is ${summary.match || "missing"}`);
@@ -952,14 +952,25 @@ function summarizePrepareComponent(component: Record<string, unknown>): Record<s
   const deploymentMatch = objectValue(component.deployment_match);
   const platform = stringValue(component.platform);
   const normalizedPlatform = platform.trim().toLowerCase();
-  const deployed = normalizedPlatform.length > 0 && normalizedPlatform !== "none" && normalizedPlatform !== "n/a";
+  const type = stringValue(component.type);
+  const deployed = isPreparedDeployment(component, type, normalizedPlatform);
   const originSource = stringValue(component.source) || stringValue(origin?.url) || stringValue(origin?.repo_url);
-  const originRevision = stringValue(component.revision) || stringValue(origin?.revision) || stringValue(origin?.commit) || stringValue(origin?.tag) || stringValue(origin?.ref) || stringValue(origin?.branch);
+  const originRevision = stringValue(component.revision)
+    || stringValue(origin?.revision)
+    || stringValue(origin?.commit)
+    || stringValue(origin?.tag)
+    || stringValue(origin?.ref)
+    || stringValue(origin?.branch)
+    || stringValue(origin?.repo_revision)
+    || stringValue(origin?.source_pin)
+    || stringValue(origin?.source_verifier)
+    || stringValue(origin?.metadata)
+    || stringValue(objectValue(origin?.code_digest)?.sha256);
   const stagedPath = stringValue(component.staged_path) || stringValue(component.path);
   const identity = stringValue(component.identity) || stagedPath || stringValue(component.id) || stringValue(component.name) || "unknown component";
-  const match = stringValue(component.match) || stringValue(deploymentMatch?.status);
+  const match = normalizePrepareMatchStatus(stringValue(component.match) || stringValue(deploymentMatch?.status));
   return {
-    role: stringValue(component.role) || stringValue(component.security_role) || stringValue(component.component_type) || stringValue(component.type) || "component",
+    role: stringValue(component.role) || stringValue(component.security_role) || stringValue(component.component_type) || type || "component",
     identity,
     platform,
     revision: originRevision,
@@ -970,6 +981,24 @@ function summarizePrepareComponent(component: Record<string, unknown>): Record<s
     matchEvidence: stringValue(component.match_evidence) || stringValue(deploymentMatch?.evidence) || stringValue(deploymentMatch?.reason) || stringValue(deploymentMatch?.note),
     deployed,
   };
+}
+
+function isPreparedDeployment(component: Record<string, unknown>, type: string, normalizedPlatform: string): boolean {
+  if (normalizedPlatform.length > 0 && normalizedPlatform !== "none" && normalizedPlatform !== "n/a") return true;
+  if (stringValue(component.address)) return true;
+  const addresses = objectValue(component.addresses);
+  if (addresses && Object.keys(addresses).length > 0) return true;
+  const normalizedType = type.toLowerCase();
+  return normalizedType.includes("ethereum_contract") || normalizedType.includes("deployment");
+}
+
+function normalizePrepareMatchStatus(value: string): string {
+  const raw = value.trim().toLowerCase();
+  if (!raw) return "";
+  if (["n/a", "na", "none", "not_applicable", "not-applicable"].includes(raw)) return "n/a";
+  if (raw.includes("unverified") || raw.includes("not_verified") || raw.includes("no_match")) return "unverified";
+  if (raw === "matched" || raw.includes("verified") || raw.includes("matched") || raw.includes("sourcify")) return "matched";
+  return raw;
 }
 
 interface PrepareGroundTruthSummary {
@@ -1006,11 +1035,12 @@ function summarizePrepareRealTarget(value: unknown): PrepareRealTargetSummary {
   const requiresConfirmation = typeof requiredRaw === "boolean" ? requiredRaw : undefined;
   const issues: string[] = [];
   if (requiresConfirmation === undefined) issues.push("real_target.requires_confirmation is missing");
-  const mode = stringValue(row.mode);
+  const explicitMode = stringValue(row.mode);
+  const mode = explicitMode || (requiresConfirmation === true ? "deployed" : requiresConfirmation === false ? "source-only" : "");
   if (!mode) issues.push("real_target.mode is missing");
   const guidance = objectValue(row.confirm_guidance) ?? objectValue(row.confirmGuidance);
-  const methodFallback = stringValue(row.method);
-  if (!guidance) issues.push("real_target.confirm_guidance is missing");
+  const methodFallback = stringValue(row.method ?? row.read_only_method ?? row.readOnlyMethod);
+  if (!guidance && !methodFallback) issues.push("real_target.confirm_guidance is missing");
   const ground = Array.isArray(row.ground_truth)
     ? row.ground_truth
     : Array.isArray(row.groundTruth)
@@ -1061,13 +1091,16 @@ function summarizePrepareRealTarget(value: unknown): PrepareRealTargetSummary {
 function summarizePrepareGroundTruth(value: unknown): PrepareGroundTruthSummary {
   const row = objectValue(value) ?? {};
   const chainIdValue = numericValue(row.chain_id ?? row.chainId);
+  const network = stringValue(row.network);
+  const address = stringValue(row.address);
+  const kind = stringValue(row.kind) || (network && address ? "chain" : "");
   return {
-    kind: stringValue(row.kind),
-    network: stringValue(row.network),
+    kind,
+    network,
     chainId: chainIdValue === null ? undefined : chainIdValue,
-    address: stringValue(row.address),
+    address,
     role: stringValue(row.role),
-    block: stringValue(row.block),
+    block: stringValue(row.block ?? row.block_number ?? row.blockNumber),
     sourceMatch: stringValue(row.source_match ?? row.sourceMatch ?? row.deployment_match_status ?? row.deploymentMatchStatus),
     evidence: stringValue(row.evidence),
     stagedComponent: stringValue(row.staged_component ?? row.stagedComponent),

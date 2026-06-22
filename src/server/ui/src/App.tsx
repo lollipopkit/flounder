@@ -375,6 +375,15 @@ function projectBadgeStatus(project: ProjectSnapshot): string | null | undefined
   return latest ?? (total > 0 ? "done" : undefined);
 }
 
+function projectDotStatus(project: ProjectSnapshot): string {
+  const status = projectBadgeStatus(project);
+  if (status === "running") return "running";
+  if (status === "error" || status === "killed") return "error";
+  if (status === "partial") return "partial";
+  if (status === "done") return "done";
+  return "none";
+}
+
 function phaseLabel(phase: ProjectPhase): string {
   return {
     prepare: "Prepare",
@@ -1492,7 +1501,7 @@ function ProjectSidebar({ projects, selected, onSelect, onNew }: { projects: Pro
               onClick={() => onSelect(project.uuid)}
             >
               <span className="project-row-top">
-                <span className="project-dot" aria-hidden="true" />
+                <span className={`project-dot ${projectDotStatus(project)}`} aria-hidden="true" />
                 <span className="project-name">{shortName(project.name, 31)}</span>
                 <StateBadge status={projectBadgeStatus(project)} />
               </span>
@@ -2053,6 +2062,24 @@ function ProjectSetupTab({ detail }: { detail: ProjectDetail }) {
   );
 }
 
+function prepareMatchBadge(match?: string): { label: string; className: string; title: string } {
+  const raw = (match ?? "").trim();
+  const normalized = raw.toLowerCase();
+  if (!normalized) {
+    return { label: "unreported", className: "s-discharged", title: "The prepare manifest did not report source/deployment match status." };
+  }
+  if (["n/a", "na", "none", "not_applicable", "not-applicable"].includes(normalized)) {
+    return { label: "n/a", className: "s-discharged", title: "No deployed target match is required for this source-only component." };
+  }
+  if (normalized === "matched" || normalized.includes("verified") || normalized.includes("sourcify") || normalized.includes("matched")) {
+    return { label: "verified", className: "s-confirmed-source", title: `Verified source/deployment evidence: ${raw}` };
+  }
+  if (normalized.includes("unverified") || normalized.includes("partial") || normalized.includes("mixed")) {
+    return { label: normalized.includes("mixed") ? "mixed" : normalized.includes("partial") ? "partial" : "unverified", className: "s-suspected", title: `Needs review: ${raw}` };
+  }
+  return { label: raw, className: "s-discharged", title: `Reported source/deployment match status: ${raw}` };
+}
+
 function PrepareMaterialsCard({ summary }: { summary: PrepareSummary }) {
   const components = summary.components ?? [];
   const issues = summary.issues ?? [];
@@ -2095,19 +2122,22 @@ function PrepareMaterialsCard({ summary }: { summary: PrepareSummary }) {
         <PrepareRealTargetPanel realTarget={realTarget} />
         {components.length ? (
           <div className="prepare-components" aria-label="Prepared components">
-            {components.map((component, index) => (
-              <div className="prepare-component" key={`${component.identity ?? "component"}-${index}`}>
-                <span className={`label ${component.match === "matched" || component.match === "n/a" ? "s-confirmed-source" : component.match === "unverified" ? "s-suspected" : "s-refuted"}`}>
-                  {component.match || "unreported"}
-                </span>
-                <div>
-                  <strong>{component.identity || component.stagedPath || "unknown component"}</strong>
-                  <small>
-                    {[component.role, component.source, component.revision, component.stagedPath ? tailPath(component.stagedPath) : ""].filter(Boolean).join(" · ")}
-                  </small>
+            {components.map((component, index) => {
+              const match = prepareMatchBadge(component.match);
+              return (
+                <div className="prepare-component" key={`${component.identity ?? "component"}-${index}`}>
+                  <span className={`label ${match.className}`} title={match.title}>
+                    {match.label}
+                  </span>
+                  <div>
+                    <strong>{component.identity || component.stagedPath || "unknown component"}</strong>
+                    <small>
+                      {[component.role, component.source, component.revision, component.stagedPath ? tailPath(component.stagedPath) : ""].filter(Boolean).join(" · ")}
+                    </small>
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         ) : (
           <EmptyInline>No prepared components have been reported yet.</EmptyInline>

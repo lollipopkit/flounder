@@ -400,9 +400,29 @@ select {
   width: 8px;
   height: 8px;
   border-radius: 999px;
-  background: var(--project-color, var(--accent));
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--project-color, var(--accent)) 12%, transparent);
+  background: var(--fg-subtle);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--fg-subtle) 12%, transparent);
   flex: 0 0 auto;
+}
+
+.project-dot.running {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 13%, transparent);
+}
+
+.project-dot.done {
+  background: var(--success);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 13%, transparent);
+}
+
+.project-dot.partial {
+  background: var(--warning);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--warning) 14%, transparent);
+}
+
+.project-dot.error {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 13%, transparent);
 }
 
 .project-name {

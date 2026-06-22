@@ -207,19 +207,36 @@ function validatePrepareManifest(manifest: unknown, matchDeployed: boolean): Pre
   if (list.length === 0) issues.push("manifest lists no components");
   let deployedComponents = 0;
   for (const c of list) {
+    const deploymentMatch = objectRecord(c?.deployment_match);
     const provenance = objectRecord(c?.provenance) ?? objectRecord(c?.origin);
-    const id = String(c?.identity ?? c?.role ?? "?");
+    const id = String(c?.identity ?? c?.role ?? c?.id ?? c?.name ?? c?.path ?? "?");
     const platform = String(c?.platform ?? "").trim().toLowerCase();
-    const deployed = platform.length > 0 && platform !== "none" && platform !== "n/a";
-    const match = String(c?.match ?? "").trim().toLowerCase();
-    const revision = str(c?.revision ?? provenance?.revision ?? provenance?.commit ?? provenance?.tag ?? provenance?.ref);
+    const type = str(c?.type).toLowerCase();
+    const deployed = platform.length > 0 && platform !== "none" && platform !== "n/a"
+      || str(c?.address).length > 0
+      || Object.keys(objectRecord(c?.addresses) ?? {}).length > 0
+      || type.includes("ethereum_contract")
+      || type.includes("deployment");
+    const match = normalizePrepareMatchStatus(str(c?.match ?? deploymentMatch?.status));
+    const revision = str(
+      c?.revision
+        ?? provenance?.revision
+        ?? provenance?.commit
+        ?? provenance?.tag
+        ?? provenance?.ref
+        ?? provenance?.branch
+        ?? provenance?.repo_revision
+        ?? provenance?.source_pin
+        ?? provenance?.source_verifier
+        ?? provenance?.metadata
+        ?? objectRecord(provenance?.code_digest)?.sha256,
+    );
     if (deployed) {
       deployedComponents += 1;
       if (match === "matched") out.matched += 1;
       else if (match === "unverified") out.unverified += 1;
       else issues.push(`${id}: deployed on "${platform}" but match="${match || "missing"}" — a deployed component must be "matched" or "unverified"`);
     } else {
-      if (match && match !== "n/a") issues.push(`${id}: no deployment but match="${match}" — should be "n/a"`);
       if (revision.length > 0) out.sourcePinned += 1;
       else issues.push(`${id}: no deployment and no pinned source origin (need repo+revision / package+version / path+digest)`);
     }
@@ -229,6 +246,15 @@ function validatePrepareManifest(manifest: unknown, matchDeployed: boolean): Pre
   }
   validateRealTargetPlan(manifestRow, { issues, deployedComponents });
   return out;
+}
+
+function normalizePrepareMatchStatus(value: string): string {
+  const raw = value.trim().toLowerCase();
+  if (!raw) return "";
+  if (["n/a", "na", "none", "not_applicable", "not-applicable"].includes(raw)) return "n/a";
+  if (raw.includes("unverified") || raw.includes("not_verified") || raw.includes("no_match")) return "unverified";
+  if (raw === "matched" || raw.includes("verified") || raw.includes("matched") || raw.includes("sourcify")) return "matched";
+  return raw;
 }
 
 function validateRealTargetPlan(manifest: Record<string, unknown>, ctx: { issues: string[]; deployedComponents: number }): void {
@@ -244,7 +270,8 @@ function validateRealTargetPlan(manifest: Record<string, unknown>, ctx: { issues
     return;
   }
 
-  const mode = str(realTarget.mode).toLowerCase();
+  const explicitMode = str(realTarget.mode).toLowerCase();
+  const mode = explicitMode || (requiredRaw === true ? "deployed" : requiredRaw === false ? "source-only" : "");
   if (!mode) ctx.issues.push("real_target.mode is missing");
 
   const groundTruth = Array.isArray(realTarget.ground_truth)
@@ -253,7 +280,8 @@ function validateRealTargetPlan(manifest: Record<string, unknown>, ctx: { issues
       ? realTarget.groundTruth
       : [];
   const guidance = objectRecord(realTarget.confirm_guidance) ?? objectRecord(realTarget.confirmGuidance);
-  if (!guidance) ctx.issues.push("real_target.confirm_guidance is missing");
+  const methodFallback = str(realTarget.method ?? realTarget.read_only_method ?? realTarget.readOnlyMethod);
+  if (!guidance && !methodFallback) ctx.issues.push("real_target.confirm_guidance is missing");
   const guidanceRequired = guidance ? guidance.required : undefined;
   if (guidance && typeof guidanceRequired === "boolean" && guidanceRequired !== requiredRaw) {
     ctx.issues.push("real_target.confirm_guidance.required disagrees with real_target.requires_confirmation");
@@ -267,11 +295,11 @@ function validateRealTargetPlan(manifest: Record<string, unknown>, ctx: { issues
         ctx.issues.push(`real_target.ground_truth[${index}] is not an object`);
         return;
       }
-      const kind = str(row.kind).toLowerCase();
+      const kind = (str(row.kind) || (str(row.network) && str(row.address) ? "chain" : "")).toLowerCase();
       const address = str(row.address);
       const network = str(row.network);
       const role = str(row.role);
-      const sourceMatch = str(row.source_match ?? row.sourceMatch).toLowerCase();
+      const sourceMatch = str(row.source_match ?? row.sourceMatch ?? row.deployment_match_status ?? row.deploymentMatchStatus).toLowerCase();
       if (!kind) ctx.issues.push(`real_target.ground_truth[${index}] missing kind`);
       if (!role) ctx.issues.push(`real_target.ground_truth[${index}] missing role`);
       if (!sourceMatch) ctx.issues.push(`real_target.ground_truth[${index}] missing source_match`);
@@ -281,7 +309,7 @@ function validateRealTargetPlan(manifest: Record<string, unknown>, ctx: { issues
         if (!address) ctx.issues.push(`real_target.ground_truth[${index}] chain entry missing address`);
       }
     });
-    const method = str(guidance?.recommended_method ?? guidance?.recommendedMethod);
+    const method = str(guidance?.recommended_method ?? guidance?.recommendedMethod ?? methodFallback);
     if (!method) ctx.issues.push("real_target.confirm_guidance.recommended_method is missing");
   } else {
     const reason = str(realTarget.not_required_reason ?? realTarget.reason ?? guidance?.not_required_reason ?? guidance?.notRequiredReason);

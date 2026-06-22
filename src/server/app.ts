@@ -945,11 +945,19 @@ function readPrepareSummary(run: Record<string, unknown>): Record<string, unknow
     issues: summaryIssues,
     gaps: summaryGaps,
   });
+  const blockingIssues = summaryIssues.filter(isBlockingPrepareIssue);
+  const softIssues = summaryIssues.filter((issue) => !isBlockingPrepareIssue(issue));
+  const caveats = uniqueStrings([...softIssues, ...summaryGaps]).slice(0, 16);
+  const auditReady = quality === "ready" || quality === "limited";
 
   return {
     runId: run.id,
     status: run.status,
     quality,
+    auditReady,
+    blocked: !auditReady && quality !== "preparing",
+    blockingIssues,
+    caveats,
     manifestStatus,
     manifestState: manifestState || undefined,
     manifestArtifact: manifestPath ? "prepare_manifest.json" : undefined,

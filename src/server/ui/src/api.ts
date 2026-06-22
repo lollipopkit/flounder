@@ -202,6 +202,10 @@ export interface PrepareSummary {
   runId?: number;
   status?: string;
   quality?: "ready" | "limited" | "preparing" | "needs-review" | "missing" | "invalid" | string;
+  auditReady?: boolean;
+  blocked?: boolean;
+  blockingIssues?: string[];
+  caveats?: string[];
   manifestStatus?: "present" | "missing" | "invalid" | string;
   manifestState?: string;
   manifestArtifact?: string;

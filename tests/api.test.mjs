@@ -766,6 +766,13 @@ test("api: prepare summary normalizes verified deployment evidence", async () =>
     assert.equal(detail.prepareSummary.realTarget.groundTruth[0].kind, "chain");
     assert.equal(detail.prepareSummary.realTarget.groundTruth[0].sourceMatch, "verified_full_sourcify");
     assert.equal(detail.prepareSummary.quality, "limited");
+    assert.equal(detail.prepareSummary.auditReady, true);
+    assert.equal(detail.prepareSummary.blocked, false);
+    assert.deepEqual(detail.prepareSummary.blockingIssues, []);
+    assert.deepEqual(detail.prepareSummary.caveats, [
+      "1 deployed component(s) are unverified and should be treated as trust boundaries",
+      "external-registry-unverified: Registry source is unverified.",
+    ]);
     assert.deepEqual(detail.prepareSummary.issues, ["1 deployed component(s) are unverified and should be treated as trust boundaries"]);
   });
 });
@@ -1006,11 +1013,66 @@ test("api: nonstandard terminal prepare status remains automatable as limited ma
 
     const detail = await json(await fetch(base + `/api/projects/${created.uuid}`));
     assert.equal(detail.prepareSummary.quality, "limited");
+    assert.equal(detail.prepareSummary.auditReady, true);
+    assert.equal(detail.prepareSummary.blocked, false);
+    assert.deepEqual(detail.prepareSummary.blockingIssues, []);
     assert.equal(detail.prepareSummary.manifestState, "verified_with_notes");
     assert.match(detail.prepareSummary.issues.join("\n"), /prepare manifest status is verified_with_notes/);
+    assert.match(detail.prepareSummary.caveats.join("\n"), /prepare manifest status is verified_with_notes/);
 
     const launched = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run" }));
     assert.equal(launched.queued, true);
+  });
+});
+
+test("api: answer-bearing prepare materials are explicit hard blockers", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+    const created = await json(await post("/api/projects", { name: "blocked-answer-material" }));
+    const runDir = path.join(out, "blocked-answer-material-prepare");
+    const workspace = path.join(runDir, "prepare", "workspace");
+    await mkdir(path.join(workspace, "source"), { recursive: true });
+    await writeFile(path.join(workspace, "source", "Target.sol"), "contract Target {}\n");
+    await writeFile(
+      path.join(workspace, "prepare_manifest.json"),
+      JSON.stringify({
+        status: "done",
+        posture: "blind",
+        answer_firewall: "included incident post-mortem that names the exploit",
+        real_target: {
+          requires_confirmation: false,
+          mode: "source-only",
+          reason: "No deployed target is in scope.",
+          ground_truth: [],
+        },
+        components: [
+          {
+            identity: "source/target",
+            platform: "none",
+            revision: "abc123",
+            staged_path: "source",
+            in_scope: true,
+            match: "n/a",
+          },
+        ],
+      }),
+    );
+
+    const store = MetadataStore.openForOutput(out);
+    try {
+      const runId = store.startRun({ projectId: created.id, kind: "prepare", runDir, provider: "openai-codex", model: "gpt-5.5" });
+      store.finishRun(runId, "done");
+    } finally {
+      store.close();
+    }
+
+    const detail = await json(await fetch(base + `/api/projects/${created.uuid}`));
+    assert.equal(detail.prepareSummary.quality, "needs-review");
+    assert.equal(detail.prepareSummary.auditReady, false);
+    assert.equal(detail.prepareSummary.blocked, true);
+    assert.match(detail.prepareSummary.blockingIssues.join("\n"), /answer firewall is included incident post-mortem/);
   });
 });
 

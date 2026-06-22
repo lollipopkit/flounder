@@ -160,9 +160,11 @@ confirm the skill is discoverable before installing.
    - live activity: `GET /api/runs/:id/log`
    - project state: `GET /api/projects/:uuid`
    - prepare quality: `prepareSummary.quality` is `ready`, `limited`,
-     `preparing`, `needs-review`, `missing`, or `invalid`; `limited` means the
+     `preparing`, `needs-review`, `missing`, or `invalid`; use
+     `prepareSummary.auditReady` as the automation gate. `limited` means the
      audit can continue automatically while recorded trust boundaries or
-     material gaps stay visible for later confirm/report decisions
+     material gaps stay visible for later confirm/report decisions. Stop only
+     for `prepareSummary.blockingIssues`, `invalid`, or missing usable source.
    - findings: `GET /api/projects/:uuid/findings`
    - confirm decisions: `GET /api/projects/:uuid/confirm-decisions`
 
@@ -213,9 +215,14 @@ Open only the references needed for the current task:
 - Run is queued and no daemon can claim it: check the project's selected daemon.
 - Run is running: watch `GET /api/runs/:id/log` and the project phase, not only
   aggregate counts.
+- Prepare quality is `limited`: continue automatically unless the user asked to
+  perfect materials first; preserve `prepareSummary.caveats`, `gaps`, and
+  `realTarget` for verify, confirm, and reports.
 - Prepare quality is `needs-review`, `missing`, or `invalid`: read
-  `prepareSummary.issues`, `gaps`, and `realTarget` before trusting the source
-  set or launching more expensive work.
+  `prepareSummary.blockingIssues`, `issues`, `gaps`, and `realTarget`. Repair
+  only hard blockers such as contaminated answer-bearing material, invalid
+  output, empty prepared source, or no usable source; otherwise continue with
+  caveats instead of requiring manual review.
 - Map is done but many high-score scopes are pending: continue the audit or
   prioritize scopes.
 - Findings are only `suspected`: make the target buildable and run verify or
@@ -257,8 +264,8 @@ The task is not complete until the agent can report:
 - Every selected provider profile is authenticated on the daemon.
 - The project has source paths, a build root, and corpus paths appropriate for
   the requested audit.
-- Prepared materials are `ready`, or every `needs-review` issue/gap is called
-  out as a known limitation.
+- Prepared materials are `ready` or `limited`; if limited, every caveat needed
+  for verify, confirm, or report decisions is called out as a known limitation.
 - The audit run reached a terminal state or a meaningful blocker.
 - Scope coverage is summarized: mapped, audited, pending, deferred.
 - Findings are grouped by status.

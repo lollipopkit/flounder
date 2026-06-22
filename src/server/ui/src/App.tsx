@@ -1828,22 +1828,26 @@ function prepareMaterialsAttention(summary?: PrepareSummary | null): { tone: "wa
   if (summary.quality === "preparing") {
     return { tone: "pending", label: "Prepared materials are still being resolved" };
   }
-  const issues = summary.issues?.length ?? 0;
-  const gaps = summary.gaps?.length ?? 0;
+  const blocking = summary.blockingIssues?.length ?? 0;
+  const caveats = summary.caveats?.length ?? ((summary.issues?.length ?? 0) + (summary.gaps?.length ?? 0));
   const manifestMissing = summary.manifestStatus && summary.manifestStatus !== "present" ? 1 : 0;
   const manifestState = summary.manifestState?.toLowerCase();
   const manifestPartial = manifestState && !["complete", "ready", "ok"].includes(manifestState) ? 1 : 0;
-  const count = issues + gaps + manifestMissing + manifestPartial;
+  const count = blocking + caveats + manifestMissing + manifestPartial;
   if (count <= 0) return null;
-  if (summary.quality === "limited") {
+  if (summary.auditReady || summary.quality === "limited") {
     return { tone: "warn", label: `Prepared materials are usable with caveats: ${plural(count, "note")}` };
   }
   return {
     tone: summary.quality === "missing" ? "pending" : "warn",
-    label: summary.quality === "needs-review"
-      ? `Prepared materials are blocked: ${plural(count, "issue")}`
+    label: summary.blocked || summary.quality === "needs-review" || summary.quality === "invalid"
+      ? `Prepared materials need repair: ${plural(count, "issue")}`
       : `Prepared materials need attention: ${plural(count, "issue")}`,
   };
+}
+
+function uniqueText(values: string[]): string[] {
+  return [...new Set(values.filter(Boolean))];
 }
 
 function ProjectSetupDisclosure({ items }: { items: Array<{ label: string; state: string; ok: boolean }> }) {
@@ -2109,9 +2113,11 @@ function PrepareMaterialsCard({ summary }: { summary: PrepareSummary }) {
   const components = summary.components ?? [];
   const issues = summary.issues ?? [];
   const gaps = summary.gaps ?? [];
+  const blockingIssues = summary.blockingIssues ?? [];
+  const caveats = summary.caveats ?? uniqueText([...issues, ...gaps]);
   const realTarget = summary.realTarget;
   const manifestReady = summary.manifestStatus === "present";
-  const needsReview = summary.quality === "needs-review";
+  const blocked = summary.blocked || summary.quality === "needs-review" || summary.quality === "invalid";
   const quality = summary.quality === "ready" ? "ok" : summary.quality === "preparing" || summary.quality === "missing" ? "pending" : "warn";
   const qualityLabel = summary.quality === "ready"
     ? "Ready for sealed audit"
@@ -2123,8 +2129,8 @@ function PrepareMaterialsCard({ summary }: { summary: PrepareSummary }) {
           ? "Prepare output missing"
           : summary.quality === "invalid"
             ? "Prepare output invalid"
-            : needsReview
-              ? "Blocked materials"
+            : blocked
+              ? "Materials need repair"
               : manifestReady
                 ? "Ready for sealed audit"
                 : "Preparing materials";
@@ -2182,10 +2188,10 @@ function PrepareMaterialsCard({ summary }: { summary: PrepareSummary }) {
         ) : (
           <EmptyInline>No prepared components have been reported yet.</EmptyInline>
         )}
-        {issues.length || gaps.length ? (
+        {blockingIssues.length || caveats.length ? (
           <div className="prepare-lists">
-            {issues.length ? <PrepareList title="Issues" items={issues} tone="warn" /> : null}
-            {gaps.length ? <PrepareList title="Gaps" items={gaps} /> : null}
+            {blockingIssues.length ? <PrepareList title="Blocking issues" items={blockingIssues} tone="warn" /> : null}
+            {caveats.length ? <PrepareList title={summary.auditReady ? "Caveats" : "Notes"} items={caveats} /> : null}
           </div>
         ) : null}
       </div>

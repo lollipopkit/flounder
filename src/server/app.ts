@@ -164,7 +164,7 @@ const ROUTES: Route[] = [
       sourcePaths: "string[] — code paths relative to dir",
       buildRoot: "string? — buildable root relative to dir",
       corpusPaths: "string[]? — specs/docs relative to dir",
-      config: "object? — { phaseProviders, scopeCoverageMode, maxScopes, mapSteps, digSteps, digSamples, digConcurrency, sandbox... }",
+      config: "object? — { phaseProviders, scopeCoverageMode, maxScopes, mapSteps, digSteps, digSamples, digConcurrency, sandbox... }. Default coverage is cumulative: Standard audits until 30 project scopes are done, not 30 extra scopes per launch.",
     },
     handler: projectCreate,
   }),
@@ -203,8 +203,8 @@ const ROUTES: Route[] = [
       remap: "boolean? — re-enumerate scopes (restart)", fresh: "boolean? — confirm: ignore a prior interrupted confirm",
       quick: "boolean? — run: single breadth pass", mockLlm: "boolean? — offline mock model",
       region: "string? — audit: pinned region e.g. src/Foo.sol:120-180", scope: "string? — audit: scope id(s)", verifyFindings: "object|array? — audit: inline suspected finding(s) to confirm-or-refute by execution; project finding rows with id are linked back to that original row",
-      scopeCoverageMode: "focused|standard|half|full|custom? — one-off coverage mode for this run",
-      maxScopes: "number? — one-off scope cap for this dig batch", mapSteps: "number? — one-off map turn cap", digSteps: "number? — one-off per-scope dig turn cap",
+      scopeCoverageMode: "focused|standard|half|full|custom? — one-off coverage mode for this run; standard means audit until the project has 30 audited scopes",
+      maxScopes: "number? — one-off per-run scope cap, or the custom target when scopeCoverageMode=custom", mapSteps: "number? — one-off map turn cap", digSteps: "number? — one-off per-scope dig turn cap",
       maxSteps: "number? — one-off global turn cap", digSamples: "number? — one-off samples per scope", digConcurrency: "number? — one-off parallel scopes",
       findingId: "number? — confirm/report: reproduce or report one selected finding",
       findingIds: "number[]? — confirm/report: reproduce selected pending audit-confirmed findings, or generate formal reports for selected reproduced findings",
@@ -348,7 +348,7 @@ const ROUTES: Route[] = [
       verb: "'run' | 'map' | 'audit' | 'confirm' | 'prepare' (required)", target: "string (required) — run/project name",
       sourcePaths: "string[] — ABSOLUTE code paths the daemon reads", corpusPaths: "string[]? — ABSOLUTE design/reference paths", buildRoot: "string? — ABSOLUTE buildable root",
       provider: "string?", model: "string?", thinking: "string?",
-      scopeCoverageMode: "focused|standard|half|full|custom?", maxScopes: "number?", mapSteps: "number?", digSteps: "number?", maxSteps: "number?", digSamples: "number?", digConcurrency: "number?",
+      scopeCoverageMode: "focused|standard|half|full|custom? — standard/focused are cumulative project targets, not per-run additions", maxScopes: "number?", mapSteps: "number?", digSteps: "number?", maxSteps: "number?", digSamples: "number?", digConcurrency: "number?",
       sandboxBackend: "'auto'|'oci'|'host'?", sandboxImage: "string?", sandboxAllowHostFallback: "boolean?", sandboxPrepareNetwork: "'none'|'enabled'?", sandboxConfirmNetwork: "'none'|'enabled'?",
       remap: "boolean?", quick: "boolean?", mockLlm: "boolean?", region: "string?", scope: "string?", scopeNote: "string? — map/audit: 'authorized scope note' that focuses map on the in-scope target (the pipeline auto-derives it from prepare's manifest)", verifyFindings: "object|array? — audit: inline suspected finding(s) to confirm-or-refute by execution",
       inputRunDir: "string? — confirm", fresh: "boolean? — confirm",
@@ -1309,9 +1309,21 @@ async function runLaunch(c: Ctx): Promise<void> {
   const phaseProfiles = phaseProviderProfiles(project, c.store);
   const projectId = Number(project.id);
   const runs = c.store.listRuns(projectId, 50);
-  const spec = launchSpec(project, body, c.out, profile, c.store.scopeProgress(projectId), phaseProfiles);
+  const progress = c.store.scopeProgress(projectId);
+  const spec = launchSpec(project, body, c.out, profile, progress, phaseProfiles);
   const prepared = applyPreparedWorkspaceIfNeeded(spec, runs);
   if (!prepared.ok) return sendJson(c.res, 400, { error: prepared.error });
+  if (coverageTargetReached(spec)) {
+    const target = spec.coverageTarget;
+    const denominator = target ? Math.min(target, progress.total || target) : progress.total;
+    const nextAction = spec.coverageMode === "full" ? "Select specific scopes to re-audit." : "Choose Full, Custom, or select specific scopes to continue.";
+    return sendJson(c.res, 409, {
+      error: `${coverageModeLabel(spec.coverageMode)} coverage is already complete for this project (${progress.audited}/${denominator} audited scopes). ${nextAction}`,
+      coverageMode: spec.coverageMode,
+      coverageTarget: spec.coverageTarget,
+      progress,
+    });
+  }
   // Confirm is FINDING-grained + resumable: when no explicit run dir is given, resolve the work set
   // from finding STATUS — selected findings (body.findingId/body.findingIds) or all
   // pending-confirmable findings
@@ -2429,6 +2441,8 @@ function launchSpec(project: Record<string, unknown>, body: Record<string, unkno
   }
   const legacyRoles = profile && Object.keys(profile.roles).length > 0 ? profile.roles : undefined;
   const primaryProfile = phaseProfile(primaryPhase as "prepare" | "map" | "dig" | "confirm");
+  const autoCoverage = usesAutoCoverage(verb, body);
+  const coverage = resolveCoverage(merged, autoCoverage ? progress : undefined, explicitRunMaxScopes);
   return {
     verb,
     target: String(project.name),
@@ -2440,7 +2454,9 @@ function launchSpec(project: Record<string, unknown>, body: Record<string, unkno
     model: phaseModel(primaryPhase) ?? str(primaryProfile?.model) ?? str(merged.model),
     thinking: phaseThinking(primaryPhase) ?? str(primaryProfile?.thinking) ?? str(merged.thinking),
     models: Object.keys(roles).length > 0 ? roles : legacyRoles,
-    maxScopes: resolveMaxScopes(merged, progress, explicitRunMaxScopes),
+    coverageMode: coverage.mode,
+    coverageTarget: coverage.target,
+    maxScopes: coverage.maxScopes,
     mapSteps: num(merged.mapSteps),
     digSteps: num(merged.digSteps),
     maxSteps: num(merged.maxSteps),
@@ -2502,19 +2518,67 @@ function runBodyConfigOverrides(body: Record<string, unknown>): Record<string, u
   return out;
 }
 
-function resolveMaxScopes(cfg: Record<string, unknown>, progress?: Coverage, explicitFirst = false): number | undefined {
+type CoverageMode = "focused" | "standard" | "half" | "full" | "custom" | "";
+interface ResolvedCoverage {
+  mode?: string | undefined;
+  target?: number | undefined;
+  maxScopes?: number | undefined;
+}
+
+function resolveCoverage(cfg: Record<string, unknown>, progress?: Coverage, explicitFirst = false): ResolvedCoverage {
   const num = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? Math.max(1, Math.floor(v)) : undefined);
   const explicit = num(cfg.maxScopes);
-  if (explicitFirst && explicit !== undefined) return explicit;
-  const mode = typeof cfg.scopeCoverageMode === "string" ? cfg.scopeCoverageMode : "";
+  if (explicitFirst && explicit !== undefined) return { mode: "custom", maxScopes: explicit };
+  const mode = normalizeCoverageMode(cfg.scopeCoverageMode, explicit);
   const total = Math.max(0, Math.floor(progress?.total ?? 0));
   const pending = Math.max(0, Math.floor(progress?.pending ?? 0));
-  if (mode === "focused") return 10;
-  if (mode === "standard") return 30;
-  if (mode === "half") return total > 0 ? Math.max(1, Math.ceil(pending / 2)) : 30;
-  if (mode === "full") return total > 0 ? Math.max(1, pending) : 1_000_000;
-  if (mode === "custom") return explicit;
-  return explicit;
+  if (mode === "focused") return { mode, target: 10, maxScopes: cumulativeCoverageLimit(10, progress) };
+  if (mode === "standard") return { mode, target: 30, maxScopes: cumulativeCoverageLimit(30, progress) };
+  if (mode === "half") return { mode, maxScopes: total > 0 ? Math.max(0, Math.ceil(pending / 2)) : 30 };
+  if (mode === "full") return { mode, maxScopes: total > 0 ? pending : 1_000_000 };
+  if (mode === "custom") return { mode, maxScopes: explicit };
+  return { mode, maxScopes: explicit };
+}
+
+function normalizeCoverageMode(input: unknown, explicit?: number): CoverageMode {
+  if (input === "focused" || input === "standard" || input === "half" || input === "full" || input === "custom") return input;
+  if (explicit === 10) return "focused";
+  if (explicit === undefined || explicit === 30) return "standard";
+  return "custom";
+}
+
+function cumulativeCoverageLimit(target: number, progress?: Coverage): number {
+  const total = Math.max(0, Math.floor(progress?.total ?? 0));
+  if (total <= 0) return target;
+  const audited = Math.max(0, Math.floor(progress?.audited ?? 0));
+  const pending = Math.max(0, Math.floor(progress?.pending ?? 0));
+  const projectTarget = Math.min(target, total);
+  const remaining = Math.max(0, projectTarget - audited);
+  return Math.min(pending, remaining);
+}
+
+function usesAutoCoverage(verb: RunKind, body: Record<string, unknown>): boolean {
+  if (verb !== "run" && verb !== "audit") return false;
+  if (typeof body.scope === "string" && body.scope.trim()) return false;
+  if (typeof body.region === "string" && body.region.trim()) return false;
+  if (body.verifyFindings !== undefined) return false;
+  return true;
+}
+
+function coverageTargetReached(spec: LaunchSpec): boolean {
+  if (spec.maxScopes !== 0) return false;
+  if (spec.verb !== "run" && spec.verb !== "audit") return false;
+  if (spec.scope || spec.region || spec.verifyFindings !== undefined) return false;
+  return true;
+}
+
+function coverageModeLabel(mode: string | undefined): string {
+  if (mode === "focused") return "Focused";
+  if (mode === "standard") return "Standard";
+  if (mode === "half") return "Half";
+  if (mode === "full") return "Full";
+  if (mode === "custom") return "Custom";
+  return "Selected";
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {

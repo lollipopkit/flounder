@@ -72,11 +72,11 @@ interface LaunchResult {
 const ONLINE_MS = 90_000;
 const RECENT_MS = 24 * 60 * 60 * 1000;
 const COVERAGE_MODES = [
-  { value: "standard", label: "Standard - 30 scopes per run" },
+  { value: "standard", label: "Standard - until 30 audited scopes" },
   { value: "full", label: "Full - finish every pending scope" },
   { value: "half", label: "Half - finish half of pending scopes" },
-  { value: "focused", label: "Focused - 10 scopes per run" },
-  { value: "custom", label: "Custom cap" },
+  { value: "focused", label: "Focused - until 10 audited scopes" },
+  { value: "custom", label: "Custom per-run cap" },
 ] as const;
 type CoverageMode = (typeof COVERAGE_MODES)[number]["value"];
 
@@ -334,16 +334,16 @@ function coverageConfig(mode: CoverageMode, maxScopes: string): ProjectConfig {
 
 function coverageLabel(cfg: { scopeCoverageMode?: string; maxScopes?: number }): string {
   const mode = coverageModeFromConfig(cfg);
-  if (mode === "focused") return "Focused - 10 scopes";
-  if (mode === "standard") return "Standard - 30 scopes";
+  if (mode === "focused") return "Focused - until 10 scopes";
+  if (mode === "standard") return "Standard - until 30 scopes";
   if (mode === "half") return "Half of pending";
   if (mode === "full") return "Full pending coverage";
-  return `Custom - ${cfg.maxScopes ?? 30} scopes`;
+  return `Custom - ${cfg.maxScopes ?? 30} scopes per run`;
 }
 
 function coverageCapText(mode: CoverageMode, maxScopes: string): string {
-  if (mode === "focused") return "10";
-  if (mode === "standard") return "30";
+  if (mode === "focused") return "until 10 audited scopes";
+  if (mode === "standard") return "until 30 audited scopes";
   if (mode === "half") return "half pending";
   if (mode === "full") return "all pending";
   return maxScopes;
@@ -3306,7 +3306,7 @@ function NewProjectModal({ providers, daemons, onClose, onCreated, onError }: { 
         <FormSection title="Coverage">
           <div className="form-grid two">
             <Field label="Mode"><select value={form.coverageMode} onChange={(event) => setForm({ ...form, coverageMode: event.target.value as CoverageMode })}>{COVERAGE_MODES.map((mode) => <option key={mode.value} value={mode.value}>{mode.label}</option>)}</select></Field>
-            <Field label="Scopes per run" help="How many mapped scopes the next dig batch audits.">
+            <Field label="Target" help="Standard and Focused stop at a project-level audited-scope target. Custom is a one-run cap.">
               {form.coverageMode === "custom" ? <input value={form.maxScopes} onChange={(event) => setForm({ ...form, maxScopes: event.target.value })} /> : <span className="readonly-field">{coverageCapText(form.coverageMode, form.maxScopes)}</span>}
             </Field>
           </div>
@@ -3400,7 +3400,7 @@ function EditProjectModal({ detail, providers, daemons, onClose, onSaved, onErro
         <FormSection title="Coverage">
           <div className="form-grid two">
             <Field label="Mode"><select value={form.coverageMode} onChange={(event) => setForm({ ...form, coverageMode: event.target.value as CoverageMode })}>{COVERAGE_MODES.map((mode) => <option key={mode.value} value={mode.value}>{mode.label}</option>)}</select></Field>
-            <Field label="Scopes per run" help="How many mapped scopes the next dig batch audits.">
+            <Field label="Target" help="Standard and Focused stop at a project-level audited-scope target. Custom is a one-run cap.">
               {form.coverageMode === "custom" ? <input value={form.maxScopes} onChange={(event) => setForm({ ...form, maxScopes: event.target.value })} /> : <span className="readonly-field">{coverageCapText(form.coverageMode, form.maxScopes)}</span>}
             </Field>
           </div>

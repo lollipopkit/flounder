@@ -52,6 +52,8 @@ export interface LaunchSpec {
   provider?: string | undefined;
   model?: string | undefined;
   thinking?: string | undefined;
+  coverageMode?: string | undefined;
+  coverageTarget?: number | undefined;
   maxScopes?: number | undefined;
   mapSteps?: number | undefined;
   digSteps?: number | undefined;

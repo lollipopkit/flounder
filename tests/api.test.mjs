@@ -49,7 +49,7 @@ test("api: GET /api is a self-describing catalog of every resource + operation",
     const projectRun = cat.endpoints.find((e) => e.method === "POST" && e.path === "/api/projects/:uuid/runs");
     assert.match(projectRun.body.verb, /report/);
     assert.match(projectRun.body.scopeCoverageMode, /one-off coverage mode/);
-    assert.match(projectRun.body.maxScopes, /one-off scope cap/);
+    assert.match(projectRun.body.maxScopes, /per-run scope cap/);
     assert.match(projectRun.body.mapSteps, /one-off map turn cap/);
     assert.match(projectRun.body.digSteps, /one-off per-scope dig turn cap/);
     assert.match(projectRun.body.verifyFindings, /original row/);
@@ -89,6 +89,72 @@ test("api: project run defaults leave map/dig turns unbounded while standard cov
     assert.equal(spec.mapSteps, undefined);
     assert.equal(spec.digSteps, undefined);
     assert.equal(spec.maxSteps, undefined);
+  });
+});
+
+test("api: standard coverage fills the project up to 30 audited scopes instead of adding 30 per run", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const created = await json(await post("/api/projects", {
+      name: "standard-cumulative-run-budget",
+      sourcePaths: ["./src"],
+      config: { maxScopes: 30 },
+    }));
+
+    const store = MetadataStore.openForOutput(out);
+    try {
+      store.upsertScopes(created.id, [
+        ...Array.from({ length: 20 }, (_, i) => ({ scopeId: `audited-${i}`, title: `Audited ${i}`, status: "audited", score: 10 - i })),
+        ...Array.from({ length: 20 }, (_, i) => ({ scopeId: `pending-${i}`, title: `Pending ${i}`, status: "pending", score: 20 - i })),
+      ]);
+    } finally {
+      store.close();
+    }
+
+    const launched = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run" }));
+    assert.equal(launched.queued, true);
+    const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
+    const spec = JSON.parse(job.spec_json);
+
+    assert.equal(spec.coverageMode, "standard");
+    assert.equal(spec.coverageTarget, 30);
+    assert.equal(spec.maxScopes, 10);
+  });
+});
+
+test("api: standard coverage stops default runs after 30 audited scopes but allows explicit scopes", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const created = await json(await post("/api/projects", {
+      name: "standard-cumulative-complete",
+      sourcePaths: ["./src"],
+      config: { scopeCoverageMode: "standard" },
+    }));
+
+    const store = MetadataStore.openForOutput(out);
+    try {
+      store.upsertScopes(created.id, [
+        ...Array.from({ length: 30 }, (_, i) => ({ scopeId: `audited-${i}`, title: `Audited ${i}`, status: "audited", score: 30 - i })),
+        ...Array.from({ length: 5 }, (_, i) => ({ scopeId: `pending-${i}`, title: `Pending ${i}`, status: "pending", score: 5 - i })),
+      ]);
+    } finally {
+      store.close();
+    }
+
+    const stopped = await post(`/api/projects/${created.uuid}/runs`, { verb: "run" });
+    assert.equal(stopped.status, 409);
+    const stoppedBody = await json(stopped);
+    assert.match(stoppedBody.error, /Standard coverage is already complete/);
+    assert.equal(stoppedBody.coverageTarget, 30);
+
+    const launched = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "audit", scope: "pending-0" }));
+    assert.equal(launched.queued, true);
+    const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
+    const spec = JSON.parse(job.spec_json);
+    assert.equal(spec.scope, "pending-0");
+    assert.equal(spec.maxScopes, 30);
   });
 });
 

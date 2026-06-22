@@ -303,7 +303,7 @@ export const api = {
   renameDaemon: (id: number, name: string) => patchJson<unknown>(`/api/daemons/${id}`, { name }),
   deleteDaemon: (id: number) => fetchJson<unknown>(`/api/daemons/${id}`, { method: "DELETE" }),
   bugs: (params: URLSearchParams) =>
-    fetchJson<{ findings: FindingRow[]; stats: { total: number; byStatus: Record<string, number>; byTracking: Record<string, number> } }>(`/api/bugs?${params.toString()}`),
+    fetchJson<{ findings: FindingRow[]; total: number; limit: number; offset: number; stats: { total: number; byStatus: Record<string, number>; byTracking: Record<string, number> } }>(`/api/bugs?${params.toString()}`),
   trackFinding: (id: number, status: string) => patchJson<unknown>(`/api/findings/${id}/tracking`, { status }),
   artifact: (runId: number, name: string) => fetch(`/api/runs/${runId}/artifact?name=${encodeURIComponent(name)}`),
 };

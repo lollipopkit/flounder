@@ -60,6 +60,7 @@ test("api: GET /api is a self-describing catalog of every resource + operation",
     assert.match(projectFindings.query.status, /execution-confirmed/);
     const globalFindings = cat.endpoints.find((e) => e.method === "GET" && e.path === "/api/bugs");
     assert.match(globalFindings.summary, /execution-confirmed/);
+    assert.match(globalFindings.query.limit, /default 200/);
     const runLog = cat.endpoints.find((e) => e.method === "GET" && e.path === "/api/runs/:id/log");
     assert.match(runLog.query.tail, /JSON/);
   });
@@ -677,6 +678,40 @@ test("api: project findings endpoint paginates detailed rows", async () => {
     assert.equal(page.findings.length, 2);
     assert.deepEqual(page.findings.map((finding) => finding.title), ["B", "A"]);
     assert.ok(page.findings.every((finding) => typeof finding.evidence === "string"));
+  });
+});
+
+test("api: global findings endpoint paginates without changing global stats", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+    const created = await json(await post("/api/projects", { name: "global-finding-pages", sourcePaths: ["./src"] }));
+    const runDir = await mkdtemp(path.join(out, "global-finding-pages-run-"));
+    const store = MetadataStore.openForOutput(out);
+    try {
+      const runId = store.startRun({ projectId: created.id, kind: "audit", runDir });
+      store.upsertFindings(created.id, runId, [
+        { findingKey: "a", title: "A", location: "src/A.sol:1", severity: "low", status: "suspected" },
+        { findingKey: "b", title: "B", location: "src/B.sol:1", severity: "medium", status: "confirmed-executable" },
+        { findingKey: "c", title: "C", location: "src/C.sol:1", severity: "high", status: "suspected" },
+      ]);
+    } finally {
+      store.close();
+    }
+
+    const page = await json(await fetch(base + "/api/bugs?limit=2&offset=1"));
+    assert.equal(page.total, 3);
+    assert.equal(page.limit, 2);
+    assert.equal(page.offset, 1);
+    assert.equal(page.findings.length, 2);
+    assert.equal(page.stats.total, 3);
+
+    const confirmed = await json(await fetch(base + "/api/bugs?status=execution-confirmed&limit=1"));
+    assert.equal(confirmed.total, 1);
+    assert.equal(confirmed.findings[0].status, "confirmed-executable");
+    assert.equal(confirmed.stats.total, 3, "saved-view stats remain global when the table is filtered");
+    assert.equal(confirmed.stats.byStatus.suspected, 2);
   });
 });
 

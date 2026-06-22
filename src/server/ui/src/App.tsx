@@ -842,9 +842,15 @@ export function App() {
   const [providers, setProviders] = useState<ProviderProfile[]>([]);
   const [daemons, setDaemons] = useState<DaemonRow[]>([]);
   const [bugs, setBugs] = useState<FindingRow[]>([]);
+  const [bugsTotal, setBugsTotal] = useState(0);
   const [bugStats, setBugStats] = useState<BugStats>({ total: 0, byStatus: {}, byTracking: {} });
   const [bugStatus, setBugStatus] = useState("");
   const [bugTracking, setBugTracking] = useState("");
+  const [bugPage, setBugPage] = useState(1);
+  const [bugPageSize, setBugPageSize] = useState(DEFAULT_PAGE_SIZE);
+  const [bugLoading, setBugLoading] = useState(false);
+  const [bugError, setBugError] = useState("");
+  const [bugReloadKey, setBugReloadKey] = useState(0);
   const [projectTab, setProjectTab] = useState<ProjectTab>("overview");
   const [projectFindingQuery, setProjectFindingQuery] = useState("");
   const [projectFindingStatus, setProjectFindingStatus] = useState("");
@@ -921,17 +927,36 @@ export function App() {
 
   useEffect(() => {
     if (route.view !== "findings") return;
-    const params = new URLSearchParams({ limit: "1000" });
+    const params = new URLSearchParams({
+      limit: String(bugPageSize),
+      offset: String((bugPage - 1) * bugPageSize),
+    });
     if (bugStatus) params.set("status", bugStatus);
     if (bugTracking) params.set("tracking", bugTracking);
+    setBugLoading(true);
+    setBugError("");
     void api
       .bugs(params)
       .then((res) => {
         setBugs(res.findings);
+        setBugsTotal(res.total);
         setBugStats(res.stats);
       })
-      .catch((error: unknown) => setToast({ tone: "error", message: String(error instanceof Error ? error.message : error) }));
-  }, [route.view, bugStatus, bugTracking]);
+      .catch((error: unknown) => {
+        setBugError(String(error instanceof Error ? error.message : error));
+        setBugs([]);
+      })
+      .finally(() => setBugLoading(false));
+  }, [route.view, bugStatus, bugTracking, bugPage, bugPageSize, bugReloadKey]);
+
+  useEffect(() => {
+    setBugPage(1);
+  }, [bugStatus, bugTracking]);
+
+  const bugPageCount = Math.max(1, Math.ceil(bugsTotal / bugPageSize));
+  useEffect(() => {
+    if (bugPage > bugPageCount) setBugPage(bugPageCount);
+  }, [bugPage, bugPageCount]);
 
   const selectedProject = route.projectUuid ? projects.find((p) => p.uuid === route.projectUuid) : undefined;
   const onlineDaemons = daemons.filter((daemon) => daemonHealth(daemon) === "online");
@@ -1057,12 +1082,7 @@ export function App() {
     try {
       await api.trackFinding(finding.id, status);
       if (route.view === "findings") {
-        const params = new URLSearchParams({ limit: "1000" });
-        if (bugStatus) params.set("status", bugStatus);
-        if (bugTracking) params.set("tracking", bugTracking);
-        const res = await api.bugs(params);
-        setBugs(res.findings);
-        setBugStats(res.stats);
+        setBugReloadKey((key) => key + 1);
       } else if (route.projectUuid) {
         setDetail(await api.project(route.projectUuid));
       }
@@ -1182,10 +1202,17 @@ export function App() {
           <GlobalFindingsView
             stats={bugStats}
             findings={bugs}
+            total={bugsTotal}
+            page={Math.min(bugPage, bugPageCount)}
+            pageSize={bugPageSize}
+            loading={bugLoading}
+            error={bugError}
             status={bugStatus}
             tracking={bugTracking}
             setStatus={setBugStatus}
             setTracking={setBugTracking}
+            setPage={setBugPage}
+            setPageSize={setBugPageSize}
             onTracking={updateTracking}
             onOpenProject={(uuid) => go(projectHash(uuid))}
             onOpenReport={(finding) => {
@@ -2117,10 +2144,17 @@ function RunsView({ detail, onStopRun, onOpenLog }: { detail: ProjectDetail; onS
 function GlobalFindingsView(props: {
   stats: BugStats;
   findings: FindingRow[];
+  total: number;
+  page: number;
+  pageSize: number;
+  loading: boolean;
+  error: string;
   status: string;
   tracking: string;
   setStatus: (status: string) => void;
   setTracking: (tracking: string) => void;
+  setPage: (page: number) => void;
+  setPageSize: (pageSize: number) => void;
   onTracking: (finding: FindingRow, status: string) => void;
   onOpenProject: (uuid: string) => void;
   onOpenReport: (finding: FindingRow) => void;
@@ -2167,12 +2201,28 @@ function GlobalFindingsView(props: {
           </select>
         </div>
       </Card>
-      {props.findings.length ? (
+      {props.error ? (
+        <EmptyInline>{props.error}</EmptyInline>
+      ) : props.loading && props.findings.length === 0 ? (
+        <EmptyInline>Loading findings...</EmptyInline>
+      ) : props.findings.length ? (
         <Card>
-          <FindingTable rows={props.findings} paginationKey={`${props.status}:${props.tracking}`} global onOpenProject={props.onOpenProject} onOpenReport={props.onOpenReport} onTracking={props.onTracking} />
+          <FindingTable
+            rows={props.findings}
+            total={props.total}
+            page={props.page}
+            pageSize={props.pageSize}
+            paginationKey={`${props.status}:${props.tracking}`}
+            global
+            onPage={props.setPage}
+            onPageSize={props.setPageSize}
+            onOpenProject={props.onOpenProject}
+            onOpenReport={props.onOpenReport}
+            onTracking={props.onTracking}
+          />
         </Card>
       ) : (
-        <EmptyInline>No findings yet. Suspected and confirmed issues appear here after a project runs.</EmptyInline>
+        <EmptyInline>{props.stats.total > 0 ? "No findings match the current filters." : "No findings yet. Suspected and confirmed issues appear here after a project runs."}</EmptyInline>
       )}
     </main>
   );

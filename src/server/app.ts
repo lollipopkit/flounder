@@ -306,18 +306,18 @@ const ROUTES: Route[] = [
 
   route({
     method: "GET", path: "/api/bugs",
-    summary: "Every finding across ALL projects (joined with project name) plus aggregate stats — the cross-project Bugs dashboard. Optional ?status= (exact or execution-confirmed) and ?tracking= filters; ?limit/&offset paginate.",
+    summary: "Every finding across ALL projects (joined with project name) plus global aggregate stats — the cross-project Bugs dashboard. Optional ?status= (exact or execution-confirmed) and ?tracking= filters; ?limit/&offset paginate.",
+    query: { status: "string? — exact status or execution-confirmed alias", tracking: "string? — tracking state", limit: "number? (default 200)", offset: "number? (default 0)" },
     handler: (c) => {
       const status = c.url.searchParams.get("status") || undefined;
       const exactStatus = status === "execution-confirmed" ? undefined : status;
       const tracking = c.url.searchParams.get("tracking") || undefined;
-      const limit = Number(c.url.searchParams.get("limit")) || undefined;
-      const offset = Number(c.url.searchParams.get("offset")) || undefined;
+      const limit = clampInt(c.url.searchParams.get("limit"), 200, 1, 500);
+      const offset = clampInt(c.url.searchParams.get("offset"), 0, 0, 1_000_000);
+      const statsRows = reportableFindings(c.store.listGlobalFindings({ limit: 10_000, offset: 0 }));
       const all = reportableFindings(c.store.listGlobalFindings({ status: exactStatus, tracking, limit: 10_000, offset: 0 }))
         .filter((finding) => findingStatusMatches(finding, status));
-      const start = Math.max(0, Math.floor(offset ?? 0));
-      const end = start + Math.max(1, Math.floor(limit ?? 200));
-      sendJson(c.res, 200, { findings: all.slice(start, end).map(findingSummaryRow), stats: globalFindingStats(all) });
+      sendJson(c.res, 200, { findings: all.slice(offset, offset + limit).map(findingSummaryRow), total: all.length, limit, offset, stats: globalFindingStats(statsRows) });
     },
   }),
   route({

@@ -1125,11 +1125,16 @@ async function runLaunch(c: Ctx): Promise<void> {
 }
 
 function applyPreparedWorkspaceIfNeeded(spec: LaunchSpec, runs: Array<Record<string, unknown>>): { ok: true } | { ok: false; error: string } {
-  if (spec.verb === "prepare" || spec.verb === "confirm") return { ok: true };
+  if (spec.verb === "prepare") return { ok: true };
   if (spec.sourcePaths.length > 0) return { ok: true };
   const prepared = latestPreparedWorkspace(runs);
   if (!prepared) {
-    return { ok: false, error: "this project has no source paths and no prepared workspace yet. Run Prepare first, or configure source paths." };
+    return {
+      ok: false,
+      error: spec.verb === "confirm"
+        ? "this project has no source paths and no prepared workspace to reproduce against. Run Prepare first, or configure source paths."
+        : "this project has no source paths and no prepared workspace yet. Run Prepare first, or configure source paths.",
+    };
   }
   spec.dir = undefined;
   spec.sourcePaths = [prepared.workspaceDir];

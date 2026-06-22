@@ -340,6 +340,35 @@ test("api: project detail summarizes the latest prepare manifest and workspace q
     assert.equal(spec.buildRoot, workspace);
     assert.equal(spec.dir, undefined);
     assert.match(spec.scopeNote, /PRIMARY AUDIT TARGET/);
+
+    const auditRunDir = path.join(out, "prepared-target-audit-test");
+    const confirmStore = MetadataStore.openForOutput(out);
+    try {
+      const auditRunId = confirmStore.startRun({ projectId: created.id, kind: "audit", runDir: auditRunDir, provider: "openai-codex", model: "gpt-5.5" });
+      confirmStore.upsertFindings(created.id, auditRunId, [
+        {
+          findingKey: "confirmed-bug",
+          title: "Prepared source bug",
+          location: "src/Target.sol:1",
+          severity: "high",
+          status: "confirmed-executable",
+          confidence: 0.9,
+        },
+      ]);
+    } finally {
+      confirmStore.close();
+    }
+
+    const confirmLaunch = await json(await post(projectPath + "/runs", { verb: "confirm" }));
+    assert.equal(confirmLaunch.queued, true);
+    const confirmJob = (await json(await fetch(base + "/api/jobs/" + confirmLaunch.jobId))).job;
+    const confirmSpec = JSON.parse(confirmJob.spec_json);
+    assert.deepEqual(confirmSpec.sourcePaths, [workspace]);
+    assert.equal(confirmSpec.buildRoot, workspace);
+    assert.equal(confirmSpec.dir, undefined);
+    assert.equal(confirmSpec.inputRunDir, auditRunDir);
+    assert.deepEqual(confirmSpec.inputRunDirs, [auditRunDir]);
+    assert.deepEqual(confirmSpec.confirmKeys, ["confirmed-bug"]);
   });
 });
 

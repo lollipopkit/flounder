@@ -37,7 +37,8 @@ import { Icon, type IconName } from "./icons";
 type View = "projects" | "findings" | "settings";
 type SettingsPane = "providers" | "daemons";
 type ProjectTab = "overview" | "findings" | "scopes" | "runs" | "setup";
-type ModalName = "new-project" | "run" | "edit-project" | "report" | "run-log" | null;
+type ModalName = "new-project" | "run" | "edit-project" | "report" | "run-log" | "artifact" | null;
+type ArtifactPreview = { title: string; runId: number; name: string };
 type ProjectPhase = "prepare" | "map" | "dig" | "confirm";
 type LaunchAction = "run" | "map" | "audit" | "confirm" | "verify";
 
@@ -886,6 +887,7 @@ export function App() {
   const [projectFindingStatus, setProjectFindingStatus] = useState("");
   const [modal, setModal] = useState<ModalName>(null);
   const [reportFinding, setReportFinding] = useState<FindingRow | null>(null);
+  const [artifactPreview, setArtifactPreview] = useState<ArtifactPreview | null>(null);
   const [logRun, setLogRun] = useState<RunRow | null>(null);
   const [stopConfirmRun, setStopConfirmRun] = useState<RunRow | null>(null);
   const [launchConfirmAction, setLaunchConfirmAction] = useState<LaunchAction | null>(null);
@@ -1210,6 +1212,10 @@ export function App() {
                     setReportFinding(finding);
                     setModal("report");
                   }}
+                  onOpenArtifact={(artifact) => {
+                    setArtifactPreview(artifact);
+                    setModal("artifact");
+                  }}
                   onTracking={updateTracking}
                   onPatchScope={patchScope}
                   onStopRun={setStopConfirmRun}
@@ -1270,6 +1276,7 @@ export function App() {
       {modal === "run" && detail ? <RunModal detail={detail} busy={busy} onClose={() => setModal(null)} onLaunch={requestLaunch} onUpdateRunTarget={(run, target) => void updateRunTarget(run, target)} onError={(message) => setToast({ tone: "error", message })} /> : null}
       {modal === "edit-project" && detail ? <EditProjectModal detail={detail} providers={providers} daemons={daemons} onClose={() => setModal(null)} onSaved={async () => { setDetail(await api.project(detail.project.uuid)); setModal(null); }} onError={(message) => setToast({ tone: "error", message })} /> : null}
       {modal === "report" && reportFinding ? <ReportModal finding={reportFinding} onClose={() => setModal(null)} /> : null}
+      {modal === "artifact" && artifactPreview ? <ArtifactModal artifact={artifactPreview} onClose={() => { setModal(null); setArtifactPreview(null); }} /> : null}
       {modal === "run-log" && logRun ? <RunLogModal run={logRun} onClose={() => { setModal(null); setLogRun(null); }} /> : null}
       {stopConfirmRun ? (
         <StopRunConfirmModal
@@ -1414,6 +1421,7 @@ function ProjectDetailView(props: {
   onOpenRunModal: () => void;
   onOpenEdit: () => void;
   onOpenReport: (finding: FindingRow) => void;
+  onOpenArtifact: (artifact: ArtifactPreview) => void;
   onTracking: (finding: FindingRow, status: string) => void;
   onPatchScope: (scopeId: string, body: unknown) => Promise<void> | void;
   onStopRun: (run: RunRow) => void;
@@ -1600,7 +1608,7 @@ function ProjectDetailView(props: {
           </button>
         ))}
       </div>
-      {tab === "overview" ? <ProjectOverview detail={detail} candidates={overviewCandidates} verifyCount={pendingVerify} verifyLocked={launchLocked || pendingVerify === 0} onVerifyCandidates={() => props.onLaunch("verify")} onOpenReport={props.onOpenReport} /> : null}
+      {tab === "overview" ? <ProjectOverview detail={detail} candidates={overviewCandidates} verifyCount={pendingVerify} verifyLocked={launchLocked || pendingVerify === 0} onVerifyCandidates={() => props.onLaunch("verify")} onOpenReport={props.onOpenReport} onOpenArtifact={props.onOpenArtifact} /> : null}
       {tab === "findings" ? (
         <ProjectFindings
           detail={detail}
@@ -1682,6 +1690,7 @@ function ProjectOverview({
   verifyLocked,
   onVerifyCandidates,
   onOpenReport,
+  onOpenArtifact,
 }: {
   detail: ProjectDetail;
   candidates: FindingRow[];
@@ -1689,6 +1698,7 @@ function ProjectOverview({
   verifyLocked: boolean;
   onVerifyCandidates: () => void;
   onOpenReport: (finding: FindingRow) => void;
+  onOpenArtifact: (artifact: ArtifactPreview) => void;
 }) {
   const current = detail.runs.find((run) => run.status === "running") ?? detail.runs[0];
   const runningRun = detail.runs.find((run) => run.status === "running");
@@ -1764,7 +1774,44 @@ function ProjectOverview({
           <QueueItem label="Real-target proof" value={plural(reproduced, "reproduced finding")} detail={proofDetail} />
         </div>
       </Card>
+      <ConfirmDecisionsCard decisions={detail.confirmDecisions} onOpenArtifact={onOpenArtifact} />
     </>
+  );
+}
+
+function decisionLabel(decision: ConfirmDecision): string {
+  if (decision.reproduced === "yes") return "reproduced";
+  if (decision.reproduced === "no") return "not reproduced";
+  return decision.reproduced || "undecided";
+}
+
+function recommendationLabel(decision: ConfirmDecision): string {
+  return decision.recommendation ? decision.recommendation.replace(/-/g, " ") : "no recommendation";
+}
+
+function ConfirmDecisionsCard({ decisions, onOpenArtifact }: { decisions: ConfirmDecision[]; onOpenArtifact: (artifact: ArtifactPreview) => void }) {
+  if (!decisions.length) return null;
+  return (
+    <Card title={<span>Real-target decisions <Counter>{decisions.length}</Counter></span>}>
+      <div className="decision-list">
+        {decisions.map((decision) => (
+          <div className="decision-row" key={decision.id ?? `${decision.run_id}-${decision.bug}`}>
+            <div className="decision-main">
+              <span className={`label ${decision.reproduced === "yes" ? "s-confirmed-executable" : decision.reproduced === "no" ? "s-refuted" : "s-suspected"}`}>
+                {decisionLabel(decision)}
+              </span>
+              <strong>{decision.bug}</strong>
+              <small>{recommendationLabel(decision)}</small>
+            </div>
+            {decision.run_id ? (
+              <Button size="sm" icon="shieldcheck" onClick={() => onOpenArtifact({ title: `Confirm report - #${decision.run_id}`, runId: decision.run_id!, name: "confirm_report.md" })}>
+                Report
+              </Button>
+            ) : null}
+          </div>
+        ))}
+      </div>
+    </Card>
   );
 }
 
@@ -3229,6 +3276,44 @@ function ReportModal({ finding, onClose }: { finding: FindingRow; onClose: () =>
         {finding.evidence ? <pre>{finding.evidence}</pre> : null}
         {finding.exploit_sketch ? <p><strong>Exploit:</strong> {finding.exploit_sketch}</p> : null}
         {finding.fix ? <p><strong>Fix:</strong> {finding.fix}</p> : null}
+      </article>
+    </Modal>
+  );
+}
+
+function ArtifactModal({ artifact, onClose }: { artifact: ArtifactPreview; onClose: () => void }) {
+  const [body, setBody] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    setBody("");
+    setError("");
+    setLoading(true);
+    void api
+      .artifact(artifact.runId, artifact.name)
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+        const text = await response.text();
+        if (!cancelled) setBody(text);
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) setError(String(err instanceof Error ? err.message : err));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [artifact.runId, artifact.name]);
+  return (
+    <Modal title={artifact.title} wide onClose={onClose}>
+      <article className="report-preview artifact-preview">
+        <p><strong>Artifact:</strong> <code>{artifact.name}</code></p>
+        {loading ? <EmptyInline>Loading artifact...</EmptyInline> : null}
+        {error ? <div className="inline-error">{error}</div> : null}
+        {!loading && !error ? <pre>{body || "Artifact is empty."}</pre> : null}
       </article>
     </Modal>
   );

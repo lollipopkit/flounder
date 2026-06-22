@@ -2150,6 +2150,44 @@ small {
   border-color: var(--border);
 }
 
+.decision-list {
+  display: grid;
+  gap: 8px;
+}
+
+.decision-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  min-height: 72px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--canvas-subtle);
+  padding: 11px 12px;
+}
+
+.decision-main {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.decision-main .label {
+  width: fit-content;
+}
+
+.decision-main strong {
+  color: var(--fg);
+  font-size: 13.5px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.decision-main small {
+  color: var(--fg-muted);
+}
+
 .report-preview h2 {
   margin-top: 12px;
 }
@@ -2160,6 +2198,11 @@ small {
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 12px;
+}
+
+.artifact-preview pre {
+  max-height: 62vh;
+  overflow: auto;
 }
 
 .command-back {

@@ -99,6 +99,9 @@ class ControlPlane {
     }
     return bus;
   }
+  lastActivityAt(runId: number): string | undefined {
+    return this.buses.get(runId)?.snapshot(1)[0]?.ts;
+  }
 }
 
 interface Ctx {
@@ -1827,6 +1830,7 @@ async function daemonRunUpdate(c: Ctx): Promise<void> {
   if (body.findings) c.store.upsertFindings(projectId, runId, body.findings, body.reason);
   if (body.confirmDecisions) c.store.upsertConfirmDecisions(projectId, runId, body.confirmDecisions, body.decisionPath);
   if (body.finish) c.store.finishRun(runId, body.finish.status, body.finish.coverage, body.finish.findingsTotal);
+  c.store.touchJobByRun(runId);
   sendJson(c.res, 200, { ok: true });
 }
 
@@ -1875,6 +1879,8 @@ function activeRuns(store: MetadataStore, plane?: ControlPlane): Array<Record<st
     const daemonId = typeof job.daemon_id === "number" ? job.daemon_id : undefined;
     const onlineDaemons = daemonId !== undefined && plane ? plane.daemonCount(daemonId) : undefined;
     const blockedReason = daemonId !== undefined && onlineDaemons === 0 ? "selected-daemon-offline" : undefined;
+    const lastActivityAt = typeof job.run_id === "number" && plane ? plane.lastActivityAt(Number(job.run_id)) : undefined;
+    const updatedAt = maxIsoTimestamp(String(job.updated_at ?? ""), lastActivityAt);
     return {
       jobId: job.id,
       runId: job.run_id ?? null,
@@ -1882,11 +1888,17 @@ function activeRuns(store: MetadataStore, plane?: ControlPlane): Array<Record<st
       status: job.status,
       verb: spec?.verb ?? "run",
       startedAt: job.created_at,
+      updatedAt,
+      ...(lastActivityAt ? { lastActivityAt } : {}),
       daemonId: daemonId ?? null,
       ...(onlineDaemons !== undefined ? { onlineDaemons } : {}),
       ...(blockedReason ? { blockedReason } : {}),
     };
   });
+}
+
+function maxIsoTimestamp(...values: Array<string | undefined>): string | undefined {
+  return values.filter((v): v is string => Boolean(v)).sort().at(-1);
 }
 
 function daemonRows(c: Ctx): Array<Record<string, unknown>> {

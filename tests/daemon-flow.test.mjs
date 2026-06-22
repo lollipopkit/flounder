@@ -225,6 +225,12 @@ test("daemon: activity POSTs surface on the run's live SSE log", async () => {
     assert.ok(ev, "expected an activity event on the SSE log");
     assert.equal(ev.kind, "thinking_delta");
     assert.equal(ev.delta, "weighing the invariant");
+
+    const active = await j(await ui(base, "GET", "/api/active"));
+    const row = active.active.find((item) => item.jobId === jobId);
+    assert.equal(row.runId, runId);
+    assert.match(row.lastActivityAt, /^\d{4}-\d{2}-\d{2}T/);
+    assert.equal(row.updatedAt >= row.lastActivityAt, true);
   });
 });
 

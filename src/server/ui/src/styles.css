@@ -461,7 +461,7 @@ select {
 .mini-progress span {
   display: block;
   height: 100%;
-  background: linear-gradient(90deg, var(--project-color, var(--accent)), color-mix(in srgb, var(--project-color, var(--accent)) 78%, var(--success)));
+  background: var(--success);
 }
 
 .project-progress-line {

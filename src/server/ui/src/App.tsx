@@ -141,14 +141,6 @@ function projectPathFor(project: Pick<ProjectSnapshot, "uuid">): string {
   return projectPath(project.uuid);
 }
 
-const PROJECT_ACCENTS = ["#2563eb", "#059669", "#d97706", "#dc2626", "#0891b2", "#7c3aed", "#475569", "#be123c"];
-
-function projectAccent(uuid: string): string {
-  let hash = 0;
-  for (let i = 0; i < uuid.length; i += 1) hash = ((hash << 5) - hash + uuid.charCodeAt(i)) | 0;
-  return PROJECT_ACCENTS[Math.abs(hash) % PROJECT_ACCENTS.length] ?? PROJECT_ACCENTS[0]!;
-}
-
 function plural(n: number, word: string, pluralWord = `${word}s`): string {
   return `${n} ${n === 1 ? word : pluralWord}`;
 }
@@ -367,11 +359,12 @@ function topCandidateFindings(rows: FindingRow[] | undefined): FindingRow[] {
 function projectBadgeStatus(project: ProjectSnapshot): string | null | undefined {
   const latest = project.latestRun?.status;
   if ((project.activeRuns ?? 0) > 0 || latest === "running") return "running";
-  if (latest === "error" || latest === "killed") return latest;
   const total = project.progress?.total ?? 0;
   const pending = project.progress?.pending ?? 0;
   if (total > 0 && pending > 0) return "partial";
   if ((project.verifyPendingFindings ?? 0) > 0 || (project.confirmPendingFindings ?? 0) > 0) return "partial";
+  if (total > 0 || (project.findingsTotal ?? 0) > 0 || (project.reproducedBugs ?? 0) > 0 || (project.confirmedBugs ?? 0) > 0) return "done";
+  if (latest === "error" || latest === "killed") return latest;
   return latest ?? (total > 0 ? "done" : undefined);
 }
 
@@ -423,9 +416,11 @@ function phaseStatusIcon(status: string): IconName {
 function projectStatusTitle(project: ProjectSnapshot): string {
   const status = projectBadgeStatus(project);
   const label = phaseStatusLabel(status ?? "none");
+  const latest = project.latestRun?.status;
+  const latestContext = latest === "error" ? " The latest run failed; inspect its log if this was unexpected." : latest === "killed" ? " The latest run was stopped; recorded progress is kept." : "";
   if (status === "running") return `${label}: a run is active for this project.`;
-  if (status === "partial") return `${label}: coverage, verification, or confirmation work remains.`;
-  if (status === "done") return `${label}: no active run and current workflow has completed.`;
+  if (status === "partial") return `${label}: coverage, verification, or confirmation work remains.${latestContext}`;
+  if (status === "done") return `${label}: no active run and current workflow has completed.${latestContext}`;
   if (status === "error") return `${label}: the latest run failed.`;
   if (status === "killed") return `${label}: the latest run was stopped.`;
   return "No runs yet.";
@@ -1508,7 +1503,6 @@ function ProjectSidebar({ projects, selected, onSelect, onNew }: { projects: Pro
             <button
               type="button"
               className={`project-row${selected === project.uuid ? " sel" : ""}`}
-              style={{ "--project-color": projectAccent(project.uuid) } as React.CSSProperties}
               aria-current={selected === project.uuid ? "page" : undefined}
               aria-label={`Open project ${project.name}. ${projectStatusTitle(project)}`}
               onClick={() => onSelect(project.uuid)}

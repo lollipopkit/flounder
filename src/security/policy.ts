@@ -104,7 +104,7 @@ export function isAgentConfirmCommand(command: StructuredReproductionCommand): b
 
 /**
  * True for an allowlisted build / dependency-resolution command (cargo build,
- * npm install, go mod download, forge build, pip install, …). These are the
+ * cmake -S/-B/--build, ninja, npm install, go mod download, forge build, pip install, …). These are the
  * "prepare/build phase": they may need a package registry to fetch dependencies,
  * which is categorically different from the exploit/confirm run. They are NOT
  * confirmation-eligible — a build can never upgrade a finding (only isAgentConfirmCommand can).
@@ -283,6 +283,7 @@ function isAllowedLocalTestCommand(program: string, args: string[]): boolean {
   if (name === "node") return first === "--test";
   if (name === "python" || name === "python3") return first === "-m" && (second === "pytest" || second === "unittest");
   if (name === "pytest") return true;
+  if (name === "ctest") return true;
   if (name === "deno") return first === "test";
   if (name === "dotnet") return first === "test";
   if (name === "mvn") return first === "test" || first === "-q" && second === "test";
@@ -311,6 +312,9 @@ function isAllowedBuildCommand(program: string, args: string[]): boolean {
   if (name === "pip" || name === "pip3") return first === "install";
   if (name === "python" || name === "python3") return first === "-m" && second === "pip" && (lower[2] === "install");
   if (name === "forge") return ["build", "install", "compile", "update"].includes(first ?? "");
+  if (name === "cmake") return isAllowedCmakeBuild(args);
+  if (name === "ninja") return true;
+  if (name === "make" || name === "gmake") return true;
   if (name === "dotnet") return first === "build" || first === "restore";
   if (name === "deno") return first === "cache";
   if (name === "mvn") return lower.some((arg) => ["compile", "package", "install", "dependency:resolve", "dependency:go-offline"].includes(arg));
@@ -322,6 +326,7 @@ function isAllowedBuildCommand(program: string, args: string[]): boolean {
 function isAllowedLocalInspectionCommand(program: string, args: string[]): boolean {
   const name = program.toLowerCase();
   if (name === "pwd") return args.length === 0;
+  if (name === "cmake" || name === "ninja" || name === "make" || name === "gmake") return args.length === 1 && args[0] === "--version";
   if (name === "ls") return args.every((arg) => isSafeInspectionArg(name, arg));
   if (name === "find") return args.every((arg) => isSafeInspectionArg(name, arg));
   if (name === "rg" || name === "grep") return args.every((arg) => isSafeInspectionArg(name, arg));
@@ -338,6 +343,14 @@ function isSafeInspectionArg(program: string, arg: string): boolean {
   if (program === "sed" && (lowered === "-i" || lowered.startsWith("-i." ) || lowered === "--in-place" || lowered.startsWith("--in-place="))) return false;
   if (arg.includes("\0") || /[\r\n]/.test(arg)) return false;
   return true;
+}
+
+function isAllowedCmakeBuild(args: string[]): boolean {
+  const lower = args.map((arg) => arg.toLowerCase());
+  if (lower.includes("--build")) return true;
+  if (lower.includes("--install")) return false;
+  if (lower.includes("-p") || lower.includes("--script")) return false;
+  return lower.includes("-s") || lower.some((arg) => arg.startsWith("-s")) || lower.includes("-b") || lower.some((arg) => arg.startsWith("-b"));
 }
 
 function isRpcFlag(input: string): boolean {

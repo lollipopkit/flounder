@@ -316,7 +316,7 @@ const editTool: AgentTool = {
 const bashTool: AgentTool = {
   name: "bash",
   description:
-    'Run one local command in the copied sandbox workspace. args: {"cmd": string, "purpose"?: "inspect"|"build"|"confirm" (default inspect), "cwd"?: relative, "expected_exit_code"?: int, "success_patterns"?: [string], "timeout_ms"?: int}. Shell control operators, remote networks, destructive commands, and paths outside the workspace are blocked. purpose=inspect is for exploration (ls/find/rg/cat/sed and reads) and never confirms anything. purpose=build is for dependency resolution and compilation (cargo build/fetch, npm install, go mod download, forge build, pip install, …) to make the workspace buildable; it has side effects but is NOT confirmation-eligible. purpose=confirm must be a real local test runner (cargo test, forge test, go test, node --test, pytest, …) with success_patterns; only a confirm command that exits as expected with every success_pattern present becomes confirmation-eligible and citable as command_id for confirmed-executable.',
+    'Run one local command in the copied sandbox workspace. args: {"cmd": string, "purpose"?: "inspect"|"build"|"confirm" (default inspect), "cwd"?: relative, "expected_exit_code"?: int, "success_patterns"?: [string], "timeout_ms"?: int}. Shell control operators, remote networks, destructive commands, and paths outside the workspace are blocked. purpose=inspect is for exploration (ls/find/rg/cat/sed and reads) and never confirms anything. purpose=build is for dependency resolution and compilation (cargo build/fetch, cmake -S/-B/--build, ninja, make, npm install, go mod download, forge build, pip install, …) to make the workspace buildable; it has side effects but is NOT confirmation-eligible. purpose=confirm must be a real local test runner (cargo test, ctest, forge test, go test, node --test, pytest, …) with success_patterns; only a confirm command that exits as expected with every success_pattern present becomes confirmation-eligible and citable as command_id for confirmed-executable.',
   async run(args, ctx) {
     const normalized = normalizeBashCommand(args, ctx.cfg);
     if ("error" in normalized) return { observation: normalized.error };
@@ -398,7 +398,7 @@ function confirmFailureReason(
   patternCheck: { matched: string[]; missing: string[] },
 ): string {
   if (!eligibleByType) {
-    return `purpose=confirm requires a local test/build runner (cargo test, forge test, go test, node --test, pytest, …); "${normalized.command.program}" is an inspection command, so it cannot confirm a finding`;
+    return `purpose=confirm requires a local test/build runner (cargo test, ctest, forge test, go test, node --test, pytest, …); "${normalized.command.program}" is an inspection command, so it cannot confirm a finding`;
   }
   if (normalized.successPatterns.length === 0) return "purpose=confirm requires success_patterns describing the invariant break or patched regression";
   if (!exitMatched) return `exit=${result.exitCode} expected=${result.expectedExitCode} timedOut=${result.timedOut}`;

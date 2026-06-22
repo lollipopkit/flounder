@@ -5,7 +5,18 @@ import { analyzeCommandSafety, analyzeReproductionCommandSafety, analyzeAgentBas
 const cmd = (program, ...args) => ({ program, args });
 
 test("agent bash allows build/dependency commands (the build phase) across ecosystems", () => {
-  for (const c of [cmd("cargo", "build"), cmd("cargo", "fetch"), cmd("npm", "install"), cmd("go", "mod", "download"), cmd("forge", "build"), cmd("pip", "install", "-r", "requirements.txt")]) {
+  for (const c of [
+    cmd("cargo", "build"),
+    cmd("cargo", "fetch"),
+    cmd("npm", "install"),
+    cmd("go", "mod", "download"),
+    cmd("forge", "build"),
+    cmd("pip", "install", "-r", "requirements.txt"),
+    cmd("cmake", "-S", "source/aztec-packages/barretenberg/cpp", "-B", "build/bbapi-poc", "-DMOBILE=ON"),
+    cmd("cmake", "--build", "build/bbapi-poc"),
+    cmd("ninja", "-C", "build/bbapi-poc"),
+    cmd("make", "-C", "build/bbapi-poc"),
+  ]) {
     assert.equal(analyzeAgentBashCommandSafety(c).blocked, false, `${c.program} ${c.args.join(" ")} should be allowed`);
     assert.equal(isAgentBuildCommand(c), true, `${c.program} ${c.args.join(" ")} should be a build command`);
   }
@@ -14,14 +25,20 @@ test("agent bash allows build/dependency commands (the build phase) across ecosy
 test("a build command is NOT confirmation-eligible (build cannot mint a finding)", () => {
   assert.equal(isAgentConfirmCommand(cmd("cargo", "build")), false);
   assert.equal(isAgentConfirmCommand(cmd("npm", "install")), false);
+  assert.equal(isAgentConfirmCommand(cmd("cmake", "--build", "build/bbapi-poc")), false);
+  assert.equal(isAgentConfirmCommand(cmd("ninja", "-C", "build/bbapi-poc")), false);
   // and a test runner is a confirm command, not a build command
   assert.equal(isAgentBuildCommand(cmd("cargo", "test")), false);
   assert.equal(isAgentConfirmCommand(cmd("cargo", "test")), true);
+  assert.equal(isAgentBuildCommand(cmd("ctest", "--test-dir", "build/bbapi-poc")), false);
+  assert.equal(isAgentConfirmCommand(cmd("ctest", "--test-dir", "build/bbapi-poc")), true);
 });
 
 test("a build command still cannot smuggle a remote/mainnet target in its argv", () => {
   assert.equal(analyzeAgentBashCommandSafety(cmd("cargo", "build", "--target-dir", "https://evil.example/x")).blocked, true);
   assert.equal(analyzeAgentBashCommandSafety(cmd("forge", "build", "--fork-url", "https://mainnet.example")).blocked, true);
+  assert.equal(analyzeAgentBashCommandSafety(cmd("cmake", "-S", "https://evil.example/project", "-B", "build")).blocked, true);
+  assert.equal(analyzeAgentBashCommandSafety(cmd("cmake", "-P", "script.cmake")).blocked, true);
 });
 
 test("arbitrary non-build, non-test, non-inspection commands stay blocked", () => {
@@ -46,6 +63,7 @@ test("reproduction command policy allows only structured local test commands", (
   assert.equal(analyzeReproductionCommandSafety({ program: "cargo", args: ["test", "local_regtest_poc"] }).blocked, false);
   assert.equal(analyzeReproductionCommandSafety({ program: "node", args: ["--test", "repro.test.mjs"] }).blocked, false);
   assert.equal(analyzeReproductionCommandSafety({ program: "forge", args: ["test", "--match-test", "testLocalRepro"] }).blocked, false);
+  assert.equal(analyzeReproductionCommandSafety({ program: "ctest", args: ["--test-dir", "build/bbapi-poc", "-R", "noncanonical"] }).blocked, false);
   assert.equal(analyzeReproductionCommandSafety({ program: "npx", args: ["hardhat", "test", "test/repro.ts"] }).blocked, false);
   assert.equal(analyzeReproductionCommandSafety({ program: "zcash-cli", args: ["-testnet", "sendrawtransaction", "poc"] }).blocked, true);
   assert.equal(analyzeReproductionCommandSafety({ program: "bash", args: ["-lc", "cargo test"] }).blocked, true);

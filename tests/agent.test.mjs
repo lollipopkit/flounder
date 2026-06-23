@@ -11,7 +11,7 @@ import { buildTools, describeAction, ingestFindingsFromScratch, newSession, dedu
 import { runAudit } from "../dist/agent/audit.js";
 import { normalizePrepareManifest, prepareValidationBlockingIssues, readPrepareManifest } from "../dist/agent/acquire.js";
 import { runAuditLoop, isTransientError } from "../dist/agent/loop.js";
-import { buildConfirmKickoff, buildDeepKickoff, buildMapKickoff, AUDIT_CONFIRM_SYSTEM, AUDIT_DEEP_SYSTEM, AUDIT_SYSTEM, AUDIT_VERIFY_SYSTEM, MAP_GRANULARITY_RULES, MAP_SYSTEM, POC_TRUST_RULE } from "../dist/agent/prompts.js";
+import { buildConfirmKickoff, buildDeepKickoff, buildMapKickoff, buildVerifyKickoff, AUDIT_CONFIRM_SYSTEM, AUDIT_DEEP_SYSTEM, AUDIT_SYSTEM, AUDIT_VERIFY_SYSTEM, MAP_GRANULARITY_RULES, MAP_SYSTEM, POC_TRUST_RULE } from "../dist/agent/prompts.js";
 import { runDifferentialConfirmation } from "../dist/agent/differential.js";
 import { runRefutation } from "../dist/agent/refutation.js";
 import { renderReportFileManifest } from "../dist/agent/report.js";
@@ -157,6 +157,20 @@ test("prompt contract keeps attacker-faithful PoC rule on legacy and pi-session 
   const deepPrompt = buildSessionPrompt({ cfg: defaultConfig(), fileManifest: "x.rs", deep: true });
   assert.ok(!deepPrompt.includes("Record every obligation and its status to findings.json"), "deep prompt should not put discharged obligations into findings");
   assert.ok(deepPrompt.includes("discharged obligations are not findings"), "deep prompt should keep safe obligation notes out of findings");
+
+  const verifyPrompts = [
+    AUDIT_VERIFY_SYSTEM,
+    buildVerifyKickoff({ target: "t", tools: [], fileManifest: "x.rs", maxSteps: Number.POSITIVE_INFINITY, verify: "claim" }),
+    buildSessionPrompt({ cfg: defaultConfig(), fileManifest: "x.rs", verify: "claim" }),
+  ];
+  for (const prompt of verifyPrompts) {
+    assert.ok(prompt.includes("native build root") || prompt.includes("native workspace"), "verify should prefer native target workspaces over standalone harnesses");
+    assert.ok(prompt.includes("standalone PoC package"), "verify should constrain standalone PoC package use");
+    assert.ok(prompt.includes("purpose=build"), "verify should own dependency fetch/compile setup instead of requiring prepare to pre-warm everything");
+    assert.ok(prompt.includes("missing-registry-package"), "verify should avoid repeating missing registry-package failures");
+    assert.ok(prompt.includes("DNS failure"), "verify should avoid repeating network setup failures");
+    assert.ok(prompt.includes("setup blocker"), "verify should distinguish environment setup failures from false-positive refutations");
+  }
 
   const preparePrompt = buildSessionPrompt({ cfg: defaultConfig(), fileManifest: "(empty)", prepare: "Clue: official source" });
   assert.ok(preparePrompt.includes("Write prepare_manifest.json EARLY"), "prepare should persist a usable manifest before chasing long-tail dependencies");

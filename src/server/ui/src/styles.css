@@ -601,11 +601,9 @@ small {
 .pipeline {
   position: relative;
   display: grid;
-  grid-template-columns: repeat(7, minmax(150px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
   gap: 8px;
   margin-top: 18px;
-  overflow-x: auto;
-  overflow-y: hidden;
   padding-bottom: 2px;
   scroll-padding-inline: 2px;
   border: 0;
@@ -616,7 +614,7 @@ small {
   position: relative;
   z-index: 1;
   min-height: 162px;
-  min-width: 150px;
+  min-width: 0;
   padding: 13px 12px 13px;
   border: 1px solid var(--border);
   border-radius: 9px;
@@ -1065,6 +1063,10 @@ small {
   min-width: 0;
 }
 
+.prepare-quality > span {
+  min-width: 0;
+}
+
 .prepare-quality .dot {
   width: 9px;
   height: 9px;
@@ -1106,8 +1108,7 @@ small {
   min-width: 0;
 }
 
-.prepare-kpis span,
-.prepare-meta span {
+.prepare-kpis span {
   min-height: 28px;
   display: inline-flex;
   align-items: center;
@@ -1122,10 +1123,29 @@ small {
   max-width: 100%;
 }
 
+.prepare-meta span {
+  min-height: 28px;
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 5px;
+  flex: 1 1 260px;
+  min-width: 0;
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 5px 10px;
+  background: var(--canvas-subtle);
+  color: var(--fg-muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
 .prepare-kpis strong,
 .prepare-meta strong {
   color: var(--fg);
   font-weight: 650;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .prepare-scope {
@@ -1149,6 +1169,10 @@ small {
   border-radius: 8px;
   padding: 10px 12px;
   background: var(--canvas-subtle);
+}
+
+.prepare-real-target > div {
+  min-width: 0;
 }
 
 .prepare-real-target.warn {
@@ -1187,6 +1211,7 @@ small {
   align-items: center;
   gap: 6px;
   max-width: 100%;
+  min-width: 0;
   min-height: 28px;
   border: 1px solid var(--border);
   border-radius: 999px;
@@ -1204,7 +1229,9 @@ small {
 }
 
 .prepare-real-target-issues {
+  display: block;
   color: var(--warning-strong, var(--warning));
+  overflow-wrap: anywhere;
 }
 
 .prepare-components {
@@ -1223,6 +1250,10 @@ small {
   border-radius: 8px;
   padding: 9px 10px;
   background: var(--canvas-subtle);
+  min-width: 0;
+}
+
+.prepare-component > div {
   min-width: 0;
 }
 
@@ -1263,6 +1294,11 @@ small {
   padding-left: 18px;
   color: var(--fg-muted);
   overflow-wrap: anywhere;
+}
+
+.prepare-list li {
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .prepare-list li + li {

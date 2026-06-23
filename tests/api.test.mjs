@@ -1843,7 +1843,7 @@ test("api: project findings endpoint paginates detailed rows", async () => {
       const runId = store.startRun({ projectId: created.id, kind: "audit", runDir });
       store.upsertFindings(created.id, runId, [
         { findingKey: "a", title: "A", location: "src/A.sol:1", severity: "low", status: "suspected", evidence: "detail-a" },
-        { findingKey: "b", title: "B", location: "src/B.sol:1", severity: "medium", status: "suspected", evidence: "detail-b" },
+        { findingKey: "b", title: "B", location: "src/B.sol:1", severity: "medium", status: "suspected", evidence: "detail-b", reportPath: path.join(runDir, "report_b.md"), reportMarkdown: "# Report B\n" },
         { findingKey: "c", title: "C", location: "src/C.sol:1", severity: "high", status: "suspected", evidence: "detail-c" },
       ]);
     } finally {
@@ -1857,6 +1857,9 @@ test("api: project findings endpoint paginates detailed rows", async () => {
     assert.equal(page.findings.length, 2);
     assert.deepEqual(page.findings.map((finding) => finding.title), ["B", "A"]);
     assert.ok(page.findings.every((finding) => typeof finding.evidence === "string"));
+    assert.equal(page.findings[0].has_report, true);
+    assert.equal("report_path" in page.findings[0], false);
+    assert.equal("report_markdown" in page.findings[0], false);
   });
 });
 

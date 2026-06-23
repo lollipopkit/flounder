@@ -1923,7 +1923,7 @@ function findingsList(c: Ctx): void {
       .filter((finding) => findingStatusMatches(finding, status))
       .filter((finding) => !search || `${finding.title ?? ""} ${finding.location ?? ""}`.toLowerCase().includes(search.toLowerCase()))
       .sort((a, b) => findingSeverityScore(b) - findingSeverityScore(a) || String(b.updated_at ?? "").localeCompare(String(a.updated_at ?? "")));
-    const findings = rows.slice(offset, offset + limit).map((finding) => findingDisplayRow({ ...finding, timeline: c.store.findingTimeline(Number(finding.id)) }));
+    const findings = rows.slice(offset, offset + limit).map((finding) => findingDetailRow({ ...finding, timeline: c.store.findingTimeline(Number(finding.id)) }));
     sendJson(c.res, 200, { findings, total: rows.length, limit, offset });
   });
 }
@@ -1975,6 +1975,15 @@ function findingSummaryRow(row: Record<string, unknown>): Record<string, unknown
     if (key in row) out[key] = row[key];
   }
   const reportMarkdown = stringValue(row.report_markdown).trimStart();
+  out.has_report = Boolean(reportMarkdown && !reportMarkdown.startsWith("# Security disclosure:"));
+  return findingDisplayRow(out);
+}
+
+function findingDetailRow(row: Record<string, unknown>): Record<string, unknown> {
+  const out = { ...row };
+  delete out.report_path;
+  const reportMarkdown = stringValue(out.report_markdown).trimStart();
+  delete out.report_markdown;
   out.has_report = Boolean(reportMarkdown && !reportMarkdown.startsWith("# Security disclosure:"));
   return findingDisplayRow(out);
 }

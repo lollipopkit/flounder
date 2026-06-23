@@ -42,6 +42,14 @@ export interface PhaseInfo {
 
 export type PhaseState = Record<(typeof PHASES)[number], PhaseInfo>;
 
+function needsRealTargetConfirmation(detail: ProjectDetail): boolean {
+  return detail.prepareSummary?.realTarget?.requiresConfirmation !== false;
+}
+
+function isExecutionConfirmedFinding(finding: FindingRow): boolean {
+  return finding.status === "confirmed-executable" || finding.status === "confirmed-differential";
+}
+
 export function rankCandidates(rows: FindingRow[] | undefined): FindingRow[] {
   return [...(rows ?? [])]
     .filter((f) => (STATUS_RANK[f.status] ?? 0) >= 2 && (SEV_RANK[f.severity ?? ""] ?? 0) >= 2)
@@ -152,11 +160,12 @@ export function phaseState(detail: ProjectDetail, progress: Coverage): PhaseStat
   const repro = confirmedDecisions(detail.confirmDecisions).length;
   const conf = latest("confirm");
   const synthesis = stages(latestRunWithStage(runs, "synthesis")).synthesis;
-  const pendingConfirm = (detail.allFindings ?? []).filter((finding) => {
-    return (finding.status === "confirmed-executable" || finding.status === "confirmed-differential") && !finding.confirm_status;
-  }).length;
+  const requiresConfirmation = needsRealTargetConfirmation(detail);
+  const pendingConfirm = requiresConfirmation
+    ? (detail.allFindings ?? []).filter((finding) => isExecutionConfirmedFinding(finding) && !finding.confirm_status).length
+    : 0;
   const pendingVerify = (detail.allFindings ?? []).filter((finding) => finding.status === "suspected" || finding.status === "confirmed-source").length;
-  const locallyVerified = (detail.allFindings ?? []).filter((finding) => finding.status === "confirmed-executable" || finding.status === "confirmed-differential").length;
+  const locallyVerified = (detail.allFindings ?? []).filter(isExecutionConfirmedFinding).length;
   const audit = runs.find((r) => r.status === "running" && ["run", "audit", "map"].includes(r.kind));
   const auditLatest = latest("run", "audit", "map");
   const verifyLatest = runs.find((run) => isVerifyRun(run));
@@ -198,8 +207,8 @@ export function phaseState(detail: ProjectDetail, progress: Coverage): PhaseStat
     : synthesisStartMs && synthesisEndMs > synthesisStartMs
       ? fmtDur(synthesisEndMs - synthesisStartMs)
       : "";
-  const reproducedFindings = (detail.allFindings ?? []).filter((finding) => finding.confirm_status === "reproduced");
-  const formalReports = reproducedFindings.filter((finding) => finding.has_report);
+  const reportableFindings = (detail.allFindings ?? []).filter((finding) => requiresConfirmation ? finding.confirm_status === "reproduced" : isExecutionConfirmedFinding(finding));
+  const formalReports = reportableFindings.filter((finding) => finding.has_report);
   const submitCandidates = detail.confirmDecisions.filter((row) => row.reproduced === "yes" && row.recommendation === "submit-candidate").length;
 
   return {
@@ -253,12 +262,16 @@ export function phaseState(detail: ProjectDetail, progress: Coverage): PhaseStat
     confirm: {
       status: conf?.status === "running"
         ? "running"
-        : detail.confirmDecisions.length
+        : !requiresConfirmation && locallyVerified > 0
+          ? "done"
+          : detail.confirmDecisions.length
           ? (repro === detail.confirmDecisions.length && pendingConfirm === 0 ? "done" : "partial")
           : pendingConfirm > 0
             ? "pending"
             : "none",
-      stat: detail.confirmDecisions.length
+      stat: !requiresConfirmation && locallyVerified > 0
+        ? "Not required"
+        : detail.confirmDecisions.length
         ? `${repro}/${detail.confirmDecisions.length} reproduced${pendingConfirm ? ` · ${pendingConfirm} waiting` : ""}`
         : pendingConfirm > 0
           ? `${pendingConfirm} waiting for real-target confirmation`
@@ -266,13 +279,13 @@ export function phaseState(detail: ProjectDetail, progress: Coverage): PhaseStat
       dur: runDur(conf, conf?.status === "running"),
     },
     report: {
-      status: reportRunning ? "running" : formalReports.length > 0 ? (formalReports.length === reproducedFindings.length ? "ready" : "partial") : reproducedFindings.length > 0 ? "pending" : detail.confirmDecisions.length > 0 ? "pending" : "none",
+      status: reportRunning ? "running" : formalReports.length > 0 ? (formalReports.length === reportableFindings.length ? "ready" : "partial") : reportableFindings.length > 0 ? "pending" : detail.confirmDecisions.length > 0 ? "pending" : "none",
       stat: reportRunning
         ? "Writing formal reports"
         : formalReports.length > 0
-          ? `${formalReports.length}/${reproducedFindings.length} ${reproducedFindings.length === 1 ? "report" : "reports"} ready${submitCandidates ? ` · ${submitCandidates} submit` : ""}`
-          : reproducedFindings.length > 0
-            ? `${reproducedFindings.length} waiting for formal report`
+          ? `${formalReports.length}/${reportableFindings.length} ${reportableFindings.length === 1 ? "report" : "reports"} ready${submitCandidates ? ` · ${submitCandidates} submit` : ""}`
+          : reportableFindings.length > 0
+            ? `${reportableFindings.length} waiting for formal report`
             : detail.confirmDecisions.length > 0
               ? "No reproduced bug yet"
               : "Not started",

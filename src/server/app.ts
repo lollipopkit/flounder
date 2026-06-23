@@ -2766,10 +2766,13 @@ function projectSnapshots(store: MetadataStore): Array<Record<string, unknown>> 
       : store.listConfirmDecisions(id).filter((row) => rowBelongsToCurrentMaterial(row, currentRunIds, materialBoundary));
     const reproducedBugs = confirmDecisions.filter((row) => row.reproduced === "yes").length;
     const verifyPendingFindings = (counts.suspected ?? 0) + (counts["confirmed-source"] ?? 0);
-    const confirmPendingFindings = findings.filter((finding) => {
-      const status = String(finding.status ?? "");
-      return (status === "confirmed-executable" || status === "confirmed-differential") && !finding.confirm_status;
-    }).length;
+    const requiresRealTargetConfirmation = latestPrepareRequiresRealTargetConfirmation(allRuns);
+    const confirmPendingFindings = requiresRealTargetConfirmation
+      ? findings.filter((finding) => {
+          const status = String(finding.status ?? "");
+          return (status === "confirmed-executable" || status === "confirmed-differential") && !finding.confirm_status;
+        }).length
+      : 0;
     return {
       id,
       uuid: project.uuid,

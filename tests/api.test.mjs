@@ -765,6 +765,12 @@ test("api: report launch accepts source-only execution-confirmed findings withou
     assert.equal(spec.reportFindings[0].evidenceMode, "source-only-local-confirmed");
     assert.deepEqual(spec.reportFindings[0].decisions, []);
 
+    const list = await json(await fetch(base + "/api/projects"));
+    const snapshot = list.projects.find((project) => project.uuid === created.uuid);
+    assert.equal(snapshot.auditConfirmedFindings, 1);
+    assert.equal(snapshot.confirmPendingFindings, 0);
+    assert.equal(snapshot.verifyPendingFindings, 1);
+
     const rejected = await post(`/api/projects/${created.uuid}/runs`, { verb: "report", findingIds: [suspected.id] });
     assert.equal(rejected.status, 400);
     assert.match((await rejected.json()).error, /not locally execution-confirmed/);

@@ -455,12 +455,21 @@ function runKindLabel(kind: string, run?: RunRow): string {
   }[kind] ?? kind;
 }
 
-function pendingConfirmFindings(rows: FindingRow[] | undefined): FindingRow[] {
-  return (rows ?? []).filter((finding) => (finding.status === "confirmed-executable" || finding.status === "confirmed-differential") && !finding.confirm_status);
+function needsRealTargetConfirmation(detail: Pick<ProjectDetail, "prepareSummary"> | null | undefined): boolean {
+  return detail?.prepareSummary?.realTarget?.requiresConfirmation !== false;
+}
+
+function isExecutionConfirmedFinding(finding: FindingRow): boolean {
+  return finding.status === "confirmed-executable" || finding.status === "confirmed-differential";
+}
+
+function pendingConfirmFindings(rows: FindingRow[] | undefined, requiresConfirmation = true): FindingRow[] {
+  if (!requiresConfirmation) return [];
+  return (rows ?? []).filter((finding) => isExecutionConfirmedFinding(finding) && !finding.confirm_status);
 }
 
 function localVerifiedFindings(rows: FindingRow[] | undefined): FindingRow[] {
-  return (rows ?? []).filter((finding) => finding.status === "confirmed-executable" || finding.status === "confirmed-differential");
+  return (rows ?? []).filter(isExecutionConfirmedFinding);
 }
 
 function pendingVerifyFindings(rows: FindingRow[] | undefined): FindingRow[] {
@@ -468,12 +477,12 @@ function pendingVerifyFindings(rows: FindingRow[] | undefined): FindingRow[] {
   return topCandidateFindings(unresolved);
 }
 
-function reportableFindings(rows: FindingRow[] | undefined): FindingRow[] {
-  return (rows ?? []).filter((finding) => finding.confirm_status === "reproduced");
+function reportableFindings(rows: FindingRow[] | undefined, requiresConfirmation = true): FindingRow[] {
+  return (rows ?? []).filter((finding) => requiresConfirmation ? finding.confirm_status === "reproduced" : isExecutionConfirmedFinding(finding));
 }
 
-function pendingFormalReports(rows: FindingRow[] | undefined): FindingRow[] {
-  return reportableFindings(rows).filter((finding) => !finding.has_report);
+function pendingFormalReports(rows: FindingRow[] | undefined, requiresConfirmation = true): FindingRow[] {
+  return reportableFindings(rows, requiresConfirmation).filter((finding) => !finding.has_report);
 }
 
 function verifyButtonLabel(count: number): string {
@@ -1192,13 +1201,14 @@ export function App() {
         setModal(null);
         return;
       }
-      if (action === "confirm" && pendingConfirmFindings(detail.allFindings).length === 0) {
+      const requiresConfirmation = needsRealTargetConfirmation(detail);
+      if (action === "confirm" && pendingConfirmFindings(detail.allFindings, requiresConfirmation).length === 0) {
         setToast({ tone: "warning", message: "There are no audit-confirmed findings waiting for real-target confirmation yet." });
         setModal(null);
         return;
       }
-      if (action === "report" && reportableFindings(detail.allFindings).length === 0) {
-        setToast({ tone: "warning", message: "There are no real-target reproduced findings ready for formal reports yet." });
+      if (action === "report" && reportableFindings(detail.allFindings, requiresConfirmation).length === 0) {
+        setToast({ tone: "warning", message: requiresConfirmation ? "There are no real-target reproduced findings ready for formal reports yet." : "There are no locally execution-confirmed findings ready for formal reports yet." });
         setModal(null);
         return;
       }
@@ -1596,9 +1606,10 @@ function ProjectDetailView(props: {
   const reproduced = confirmedDecisions(detail.confirmDecisions).length;
   const runningRun = currentRuns.find((run) => run.status === "running");
   const runningInactive = runningRun ? runInactiveLabel(runningRun) : null;
-  const pendingConfirm = pendingConfirmFindings(detail.allFindings).length;
+  const requiresConfirmation = needsRealTargetConfirmation(detail);
+  const pendingConfirm = pendingConfirmFindings(detail.allFindings, requiresConfirmation).length;
   const pendingVerify = verifyCandidates.length;
-  const pendingReports = pendingFormalReports(detail.allFindings).length;
+  const pendingReports = pendingFormalReports(detail.allFindings, requiresConfirmation).length;
   const locallyVerified = localVerifiedFindings(detail.allFindings).length;
   const localVerifySummary = verifyStatusSummary(detail.allFindings);
   const setupAttention = prepareMaterialsAttention(detail.prepareSummary);
@@ -1928,7 +1939,7 @@ function ProjectOverview({
   const currentRuns = currentMaterialRuns(detail.runs);
   const current = currentRuns.find((run) => run.status === "running") ?? currentRuns[0];
   const runningRun = currentRuns.find((run) => run.status === "running");
-  const pendingConfirm = pendingConfirmFindings(detail.allFindings).length;
+  const pendingConfirm = pendingConfirmFindings(detail.allFindings, needsRealTargetConfirmation(detail)).length;
   const sourceConfirmed = detail.statusCounts["confirmed-source"] ?? 0;
   const suspectedLeads = detail.statusCounts.suspected ?? 0;
   const unverifiedLeads = sourceConfirmed + suspectedLeads;
@@ -3488,10 +3499,11 @@ function EditProjectModal({ detail, providers, daemons, onClose, onSaved, onErro
 function RunModal({ detail, busy, onClose, onLaunch, onUpdateRunTarget, onError }: { detail: ProjectDetail; busy: boolean; onClose: () => void; onLaunch: (action: LaunchAction) => void; onUpdateRunTarget: (run: RunRow, target: number) => void; onError: (message: string) => void }) {
   const running = detail.runs.find((run) => run.status === "running");
   const pendingScopes = detail.progress.pending ?? 0;
-  const confirmable = pendingConfirmFindings(detail.allFindings).length;
+  const requiresConfirmation = needsRealTargetConfirmation(detail);
+  const confirmable = pendingConfirmFindings(detail.allFindings, requiresConfirmation).length;
   const verifiable = pendingVerifyFindings(detail.allFindings).length;
-  const reportable = reportableFindings(detail.allFindings).length;
-  const missingReports = pendingFormalReports(detail.allFindings).length;
+  const reportable = reportableFindings(detail.allFindings, requiresConfirmation).length;
+  const missingReports = pendingFormalReports(detail.allFindings, requiresConfirmation).length;
   const locked = busy || Boolean(running);
   const [runTargetDraft, setRunTargetDraft] = useState("");
   useEffect(() => {
@@ -3530,8 +3542,8 @@ function RunModal({ detail, busy, onClose, onLaunch, onUpdateRunTarget, onError 
     { verb: "map", label: "Map scopes only", detail: "Build or refresh the scope inventory without digging.", disabled: locked },
     { verb: "audit", label: "Dig pending scopes", detail: pendingScopes ? `Deep-audit the next pending batch from ${plural(pendingScopes, "mapped scope")}.` : "Disabled until Map scopes creates pending scope inventory.", disabled: locked || pendingScopes === 0 },
     { verb: "verify", label: verifyButtonLabel(verifiable), detail: verifiable ? `Confirm-or-refute ${plural(verifiable, "candidate")} by local execution.` : "Disabled until synthesis or dig leaves suspected candidates.", disabled: locked || verifiable === 0 },
-    { verb: "confirm", label: "Confirm", detail: confirmable ? `Reproduce ${plural(confirmable, "execution-confirmed finding")} against the real target.` : "Disabled until local execution confirms a finding.", disabled: locked || confirmable === 0 },
-    { verb: "report", label: missingReports ? `Generate reports (${missingReports})` : "Regenerate reports", detail: reportable ? `Write formal Markdown reports for ${plural(reportable, "real-target reproduced finding")}.` : "Disabled until confirm reproduces at least one finding.", disabled: locked || reportable === 0 },
+    { verb: "confirm", label: "Confirm", detail: requiresConfirmation ? (confirmable ? `Reproduce ${plural(confirmable, "execution-confirmed finding")} against the real target.` : "Disabled until local execution confirms a finding.") : "Not required for this source-only target.", disabled: locked || confirmable === 0 },
+    { verb: "report", label: missingReports ? `Generate reports (${missingReports})` : "Regenerate reports", detail: reportable ? `Write formal Markdown reports for ${plural(reportable, requiresConfirmation ? "real-target reproduced finding" : "locally confirmed finding")}.` : requiresConfirmation ? "Disabled until confirm reproduces at least one finding." : "Disabled until local execution confirms at least one finding.", disabled: locked || reportable === 0 },
   ];
   return (
     <Modal title={`${running ? "Run settings" : "Run audit"} - ${detail.project.name}`} onClose={onClose}>
@@ -3573,8 +3585,10 @@ function RunModal({ detail, busy, onClose, onLaunch, onUpdateRunTarget, onError 
 function LaunchConfirmModal({ action, detail, busy, onCancel, onConfirm }: { action: LaunchAction; detail: ProjectDetail; busy: boolean; onCancel: () => void; onConfirm: (findings: FindingRow[]) => void }) {
   const isConfirm = action === "confirm";
   const isReport = action === "report";
-  const targets = isReport ? reportableFindings(detail.allFindings) : isConfirm ? pendingConfirmFindings(detail.allFindings) : pendingVerifyFindings(detail.allFindings);
-  const defaultTargets = isReport ? (pendingFormalReports(detail.allFindings).length ? pendingFormalReports(detail.allFindings) : targets) : targets;
+  const requiresConfirmation = needsRealTargetConfirmation(detail);
+  const targets = isReport ? reportableFindings(detail.allFindings, requiresConfirmation) : isConfirm ? pendingConfirmFindings(detail.allFindings, requiresConfirmation) : pendingVerifyFindings(detail.allFindings);
+  const defaultReportTargets = pendingFormalReports(detail.allFindings, requiresConfirmation);
+  const defaultTargets = isReport ? (defaultReportTargets.length ? defaultReportTargets : targets) : targets;
   const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set(defaultTargets.map((finding) => finding.id)));
   const selectedTargets = targets.filter((finding) => selectedIds.has(finding.id));
   const count = selectedTargets.length;
@@ -3609,14 +3623,16 @@ function LaunchConfirmModal({ action, detail, busy, onCancel, onConfirm }: { act
       <div className="confirm-copy">
         <strong>
           {isReport
-            ? `${plural(count, "reproduced finding")} will be packaged into formal reports.`
+            ? `${plural(count, requiresConfirmation ? "reproduced finding" : "locally confirmed finding")} will be packaged into formal reports.`
             : isConfirm
               ? `${plural(count, "finding")} will be checked against the real target.`
               : `${plural(count, "candidate")} will be checked by local execution.`}
         </strong>
         <p>
           {isReport
-            ? "The daemon writes one submission-ready Markdown report per selected reproduced bug. It may inspect source and existing evidence for accuracy, but it must not invent missing details."
+            ? requiresConfirmation
+              ? "The daemon writes one submission-ready Markdown report per selected reproduced bug. It may inspect source and existing evidence for accuracy, but it must not invent missing details."
+              : "The daemon writes one submission-ready Markdown report per selected source-only bug using the local execution evidence. It may inspect source and existing evidence for accuracy, but it must not invent missing details."
             : isConfirm
               ? "This may use network reads and local forks to reproduce already audit-confirmed findings. Flounder still keeps the white-hat boundary: no broadcast and no live-system writes."
               : "This starts a local confirm-or-refute run for suspected or source-confirmed candidates. It can take time and will write normal run artifacts, but it does not contact real targets."}

@@ -721,7 +721,7 @@ export async function runAudit(
   // SQLite tracking: final scope coverage, all findings (with their end-of-run status,
   // recorded on the timeline), and the run marked done.
   const finalCoverage = scopeInventory.length > 0 ? scopeProgress(scopeInventory) : undefined;
-  recorder.scopes(scopeInventory);
+  if (!cfg.auditVerify) recorder.scopes(scopeInventory);
   recorder.findings(session.findings, logger.runDir, "run finalize");
   const finalStatus = options.signal?.aborted ? "killed" : stoppedReason === "error" || stoppedReason === "stalled" ? "error" : "done";
   recorder.finish(finalStatus, finalCoverage, confirmed.length);

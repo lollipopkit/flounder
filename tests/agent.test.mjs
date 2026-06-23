@@ -11,6 +11,7 @@ import { buildTools, describeAction, ingestFindingsFromScratch, newSession, dedu
 import { runAudit } from "../dist/agent/audit.js";
 import { normalizePrepareManifest, prepareValidationBlockingIssues, readPrepareManifest } from "../dist/agent/acquire.js";
 import { runAuditLoop, isTransientError } from "../dist/agent/loop.js";
+import { MetadataStore } from "../dist/db/store.js";
 import { buildConfirmKickoff, buildDeepKickoff, buildMapKickoff, buildVerifyKickoff, AUDIT_CONFIRM_SYSTEM, AUDIT_DEEP_SYSTEM, AUDIT_SYSTEM, AUDIT_VERIFY_SYSTEM, MAP_GRANULARITY_RULES, MAP_SYSTEM, POC_TRUST_RULE } from "../dist/agent/prompts.js";
 import { runDifferentialConfirmation } from "../dist/agent/differential.js";
 import { runRefutation } from "../dist/agent/refutation.js";
@@ -1165,10 +1166,25 @@ test("verify mode inherits the original finding scope", async () => {
     cfg.auditDigSteps = 8;
     cfg.auditSynthesize = false;
 
+    const store = MetadataStore.openForOutput(cfg.outputDir);
+    const projectId = store.upsertProject({ name: cfg.targetName, sourcePaths: cfg.sourcePaths, corpusPaths: cfg.corpusPaths, config: {} });
+    store.replaceScopes(projectId, [
+      { scopeId: "SCOPE-7", title: "existing candidate scope", status: "audited" },
+      { scopeId: "SCOPE-8", title: "remaining scope", status: "pending" },
+    ]);
+    store.close();
+
     const { runDir } = await runAudit(cfg, { llm: new MockAuditLlmClient() });
 
     const findings = JSON.parse(await readFile(path.join(runDir, "audit_findings.json"), "utf8"));
     assert.equal(findings[0]?.scopeId, "SCOPE-7", "verify verdict should keep the candidate's scope linkage");
+    const after = MetadataStore.openForOutput(cfg.outputDir);
+    try {
+      const existing = after.getProject(cfg.targetName);
+      assert.deepEqual(after.scopeProgress(Number(existing.id)), { total: 2, audited: 1, pending: 1, deferred: 0 }, "verify must not clear the mapped scope inventory");
+    } finally {
+      after.close();
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

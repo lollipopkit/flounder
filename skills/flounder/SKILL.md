@@ -130,7 +130,7 @@ When a user asks to audit, confirm, verify, report, or inspect Flounder state:
 7. Report the result with project/run ids, phase, evidence status, and next
    action. Include setup blockers distinctly from audit findings.
 
-For repository development or local builds, use Node 22 LTS from `.nvmrc` /
+For repository development or local builds, use Node 24 LTS from `.nvmrc` /
 `.node-version`; do not substitute newer experimental Node versions.
 
 ## Quickstart For Codex Or Claude Code
@@ -446,7 +446,7 @@ Open only the references needed for the current task:
 | Verify rejects selected findings for material drift | New Prepare changed the current material boundary | Re-select current findings or pass the explicit expert override only after checking drift. |
 | Confirm returns `not-reproduced` | PoC was not attacker-real on the real target, or environment is incomplete | Treat as not submission-ready unless the user approves more reproduction work. |
 | Report action says no findings are missing reports | All reportable rows already have formal reports, or selected rows are not reproduced/confirmed | Use `flounder report --project <uuid|name> --all` to regenerate existing reports, select eligible findings, or inspect Active/Ignored tracking filters. |
-| Node native crash during repo tooling | Unsupported Node version | Use Node 22 LTS from `.nvmrc` / `.node-version`. |
+| Node native crash during repo tooling | Unsupported Node version | Use Node 24 LTS from `.nvmrc` / `.node-version`. |
 
 ## Collecting Bugs
 

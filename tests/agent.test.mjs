@@ -42,6 +42,35 @@ function tool(name) {
   return buildTools().find((entry) => entry.name === name);
 }
 
+class VerifyIsolationLlmClient {
+  async complete(input) {
+    const action = (thought, toolName, args) => JSON.stringify({ thought, tool: toolName, args });
+    const user = input.user;
+    if (user.includes("first marker claim")) {
+      if (!user.includes("wrote tests/verify-marker.poc.test.js")) {
+        return action("Leave a marker file that must stay scoped to this verify candidate.", "write", {
+          path: "tests/verify-marker.poc.test.js",
+          content: "marker from first candidate",
+        });
+      }
+      if (!user.includes('"path":"findings.json"')) {
+        return action("Record no verdict for this synthetic candidate.", "write", { path: "findings.json", content: "[]" });
+      }
+      return JSON.stringify({ done: true, summary: "first candidate finished" });
+    }
+    if (user.includes("second isolation claim")) {
+      if (!user.includes('action: read {"path":"tests/verify-marker.poc.test.js"}')) {
+        return action("Check whether the prior candidate's marker leaked into this workspace.", "read", { path: "tests/verify-marker.poc.test.js" });
+      }
+      if (!user.includes('"path":"findings.json"')) {
+        return action("Record no verdict after the isolation check.", "write", { path: "findings.json", content: "[]" });
+      }
+      return JSON.stringify({ done: true, summary: "second candidate finished" });
+    }
+    return JSON.stringify({ done: true, summary: "unexpected verify seed" });
+  }
+}
+
 function tarGz(files) {
   const blocks = [];
   for (const [name, contentText] of Object.entries(files)) {
@@ -1284,6 +1313,37 @@ test("verify mode inherits the original finding scope", async () => {
     } finally {
       after.close();
     }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("verify mode isolates generated PoC files between candidates", async () => {
+  const dir = await tempDir();
+  try {
+    const verifyFile = path.join(dir, "to-verify.json");
+    await writeFile(verifyFile, JSON.stringify([
+      { title: "first marker claim", location: "halo2_missing_constraint.rs:5", severity: "high", description: "write an isolated marker" },
+      { title: "second isolation claim", location: "halo2_missing_constraint.rs:5", severity: "high", description: "try to read the first marker" },
+    ]), "utf8");
+
+    const cfg = defaultConfig();
+    cfg.targetName = "verify-isolation-e2e";
+    cfg.sourcePaths = [fixtures];
+    cfg.corpusPaths = [fixtures];
+    cfg.outputDir = path.join(dir, "runs");
+    cfg.auditVerify = verifyFile;
+    cfg.auditDigSteps = 6;
+    cfg.auditRefute = false;
+    cfg.auditSynthesize = false;
+
+    const { runDir } = await runAudit(cfg, { llm: new VerifyIsolationLlmClient() });
+    const transcript = JSON.parse(await readFile(path.join(runDir, "audit_transcript.json"), "utf8"));
+    const markerReads = transcript.steps.filter((step) => step.tool === "read" && step.args?.path === "tests/verify-marker.poc.test.js");
+    assert.equal(markerReads.length, 1);
+    assert.match(markerReads[0].observation, /no loaded or sandbox file matches "tests\/verify-marker\.poc\.test\.js"/);
+    assert.ok((await stat(path.join(runDir, "audit", "verify-1", "tests", "verify-marker.poc.test.js"))).isFile());
+    await assert.rejects(stat(path.join(runDir, "audit", "verify-2", "tests", "verify-marker.poc.test.js")), /ENOENT/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -26,6 +26,7 @@ import { THINKING_LEVELS } from "../config.js";
 import { projectHistoryDir } from "../trace/history.js";
 import { loadScopeInventory, saveScopeInventory } from "../agent/scope-store.js";
 import { deriveScopeNote } from "../scope-note.js";
+import { confirmSelectorsForFinding } from "../util/confirm-selector.js";
 
 const UI_HTML_PATH = fileURLToPath(new URL("./public/index.html", import.meta.url));
 const UI_PUBLIC_DIR = path.dirname(UI_HTML_PATH);
@@ -1751,6 +1752,12 @@ function stringValue(value: unknown): string {
   }
 }
 
+function confirmableRunDir(row: Record<string, unknown>): string {
+  const reportPath = stringValue(row.report_path);
+  if (reportPath) return path.dirname(reportPath);
+  return stringValue(row.run_dir);
+}
+
 function numberValue(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
@@ -1898,7 +1905,7 @@ async function runLaunch(c: Ctx): Promise<void> {
     const findingIds = selectedFindingIds(body);
     if (findingIds.length > 0) {
       const selected = findingIds.map((id) => ({ id, row: c.store.getConfirmable(Number(project.id), id) }));
-      const missing = selected.filter((entry) => !entry.row || !entry.row.run_dir).map((entry) => entry.id);
+      const missing = selected.filter((entry) => !entry.row || !confirmableRunDir(entry.row as unknown as Record<string, unknown>)).map((entry) => entry.id);
       if (missing.length > 0) return sendJson(c.res, 400, { error: `finding ${missing.join(", ")} is not pending confirm for this project, or has no source run dir` });
       const stale = selected.filter((entry) => entry.row && !rowBelongsToCurrentMaterial(entry.row as unknown as Record<string, unknown>, currentResultRunIds, materialBoundary)).map((entry) => entry.id);
       if (stale.length > 0 && body.allowMaterialDrift !== true) {
@@ -1910,17 +1917,17 @@ async function runLaunch(c: Ctx): Promise<void> {
         });
       }
       const rows = selected.flatMap((entry) => entry.row ? [entry.row] : []);
-      spec.inputRunDirs = [...new Set(rows.map((row) => String(row.run_dir)))];
+      spec.inputRunDirs = [...new Set(rows.map((row) => confirmableRunDir(row as unknown as Record<string, unknown>)).filter(Boolean))];
       spec.inputRunDir = spec.inputRunDirs[0];
-      spec.confirmKeys = rows.map((row) => row.finding_key);
+      spec.confirmKeys = rows.flatMap((row) => confirmSelectorsForFinding(row as unknown as { id?: unknown; finding_key?: unknown }));
     } else {
       const pending = c.store.pendingConfirmable(Number(project.id))
-        .filter((p) => p.run_dir)
+        .filter((p) => confirmableRunDir(p as unknown as Record<string, unknown>))
         .filter((p) => rowBelongsToCurrentMaterial(p as unknown as Record<string, unknown>, currentResultRunIds, materialBoundary));
       if (pending.length === 0) return sendJson(c.res, 400, { error: "nothing to confirm — every audit-confirmed finding already has a real-target decision (use --fresh to redo)" });
-      spec.inputRunDirs = [...new Set(pending.map((p) => String(p.run_dir)))];
+      spec.inputRunDirs = [...new Set(pending.map((p) => confirmableRunDir(p as unknown as Record<string, unknown>)).filter(Boolean))];
       spec.inputRunDir = spec.inputRunDirs[0];
-      spec.confirmKeys = pending.map((p) => p.finding_key);
+      spec.confirmKeys = pending.flatMap((p) => confirmSelectorsForFinding(p as unknown as { id?: unknown; finding_key?: unknown }));
     }
   }
   if (spec.verb === "report") {
@@ -3038,14 +3045,14 @@ async function daemonPipelineWorklist(c: Ctx): Promise<void> {
       return sendJson(c.res, 200, { phase, requiresRealTargetConfirmation, inputRunDirs: [], confirmKeys: [] });
     }
     const pending = c.store.pendingConfirmable(projectId)
-      .filter((row) => row.run_dir)
+      .filter((row) => confirmableRunDir(row as unknown as Record<string, unknown>))
       .filter((row) => rowBelongsToCurrentMaterial(row as unknown as Record<string, unknown>, currentResultRunIds, materialBoundary));
     return sendJson(c.res, 200, {
       phase,
       requiresRealTargetConfirmation,
-      inputRunDirs: [...new Set(pending.map((row) => String(row.run_dir)))],
-      inputRunDir: pending[0]?.run_dir ? String(pending[0].run_dir) : undefined,
-      confirmKeys: pending.map((row) => row.finding_key),
+      inputRunDirs: [...new Set(pending.map((row) => confirmableRunDir(row as unknown as Record<string, unknown>)).filter(Boolean))],
+      inputRunDir: pending[0] ? confirmableRunDir(pending[0] as unknown as Record<string, unknown>) || undefined : undefined,
+      confirmKeys: pending.flatMap((row) => confirmSelectorsForFinding(row as unknown as { id?: unknown; finding_key?: unknown })),
     });
   }
 

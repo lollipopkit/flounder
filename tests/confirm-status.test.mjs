@@ -4,6 +4,7 @@ import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { MetadataStore } from "../dist/db/store.js";
+import { confirmSelectorsForFinding, matchConfirmSelector, parseConfirmSelectors } from "../dist/util/confirm-selector.js";
 import { findingContentKey } from "../dist/util/finding-key.js";
 
 // Confirm is finding-grained + resumable: pendingConfirmable lists audit-confirmed findings with no
@@ -79,4 +80,14 @@ test("getConfirmable is project-scoped and only returns pending audit-confirmed 
   assert.equal(store.getConfirmable(pid, Number(rows[settledKey])), undefined);
   assert.equal(store.getConfirmable(pid, Number(other.id)), undefined, "finding ids are scoped to the project");
   store.close();
+});
+
+test("confirm selectors can address verify artifacts by originId while preserving DB key members", () => {
+  const selectors = confirmSelectorsForFinding({ id: 42, finding_key: "kdb" });
+  assert.deepEqual(selectors, ["kdb", "origin:42:kdb"]);
+
+  const parsed = parseConfirmSelectors(selectors);
+  assert.equal(matchConfirmSelector(parsed, "kartifact", 42), "kdb");
+  assert.equal(matchConfirmSelector(parsed, "kdb", undefined), "kdb");
+  assert.equal(matchConfirmSelector(parsed, "kartifact", 43), undefined);
 });

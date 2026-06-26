@@ -12,6 +12,7 @@ import { publicPath } from "../util/paths.js";
 import { consolidateByFixEquivalence, type FixEquivEdge, type FixEquivItem } from "./consolidate.js";
 import { RunRecorder, type RunTrackerFactory } from "../db/record.js";
 import { findingContentKey } from "../util/finding-key.js";
+import { matchConfirmSelector, parseConfirmSelectors } from "../util/confirm-selector.js";
 import { ProjectMemory } from "./memory.js";
 import { isPiSessionProvider, runAuditSession } from "./pi-session.js";
 import { buildTools, newSession, type AgentSession, type FixPatch, type ToolContext } from "./tools.js";
@@ -78,18 +79,20 @@ export async function runConfirm(
   // SAME content key the DB uses (util/finding-key) so the same bug across batches counts once. When
   // confirmKeys is given (the control plane's pending/target set), keep ONLY those — that is how a
   // project-level confirm skips already-decided findings and a finding-level confirm does just one.
-  // The work-list id IS the content key, so each confirm_decision's members map straight back to the
-  // DB finding whose confirm_status to update.
-  const wantKeys = options.confirmKeys && options.confirmKeys.length > 0 ? new Set(options.confirmKeys) : undefined;
+  // The seed id is the DB finding key selected by the control plane. For verify-origin updates, the
+  // artifact may have a newer content key, so origin selectors map it back to the DB row that needs
+  // confirm_status updated.
+  const selectors = parseConfirmSelectors(options.confirmKeys);
   const seenKeys = new Set<string>();
   const priorFindings: Array<Record<string, unknown>> = [];
   for (const dir of runDirs) {
     for (const finding of await loadConfirmedFindings(dir)) {
       const key = findingContentKey(finding.scopeId, finding.location, finding.title);
-      if (wantKeys && !wantKeys.has(key)) continue;
-      if (seenKeys.has(key)) continue;
-      seenKeys.add(key);
-      finding.id = key;
+      const selectedKey = matchConfirmSelector(selectors, key, finding.originId);
+      if (!selectedKey) continue;
+      if (seenKeys.has(selectedKey)) continue;
+      seenKeys.add(selectedKey);
+      finding.id = selectedKey;
       priorFindings.push(finding);
     }
   }

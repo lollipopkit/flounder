@@ -54,8 +54,9 @@ test("upsertFindings persists rich content + a status-only re-persist keeps it",
 });
 
 // VERIFY maps back: a verdict carrying originId UPDATES the original suspected row in place (across
-// runs) — flipping its status + attaching the PoC — instead of inserting a duplicate. The identity
-// is carried, so even though the verify session renamed the title, the right row is updated.
+// runs) — flipping its status + attaching the PoC — instead of inserting a duplicate. The row id and
+// timeline are preserved, but the evidence provenance moves to the verify run so Confirm can load
+// the PoC/fix artifacts that actually justified the verdict.
 test("upsertFindings with originId flips the ORIGINAL finding in place — no duplicate", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "fl-origin-"));
   const store = new MetadataStore(path.join(dir, "t.db"));
@@ -70,21 +71,26 @@ test("upsertFindings with originId flips the ORIGINAL finding in place — no du
 
   // a later VERIFY run resolves it — note the renamed title + different key, but originId carries identity
   const verifyRun = store.startRun({ projectId: pid, kind: "audit", runDir: "/runs/verify" });
+  const verifyKey = findingContentKey("ESC-1", "RollupProcessor.sol:523-529,611", "CONFIRMED: Escape hatch root not bound");
   store.upsertFindings(pid, verifyRun, [{
-    findingKey: findingContentKey("ESC-1", "RollupProcessor.sol:523-529,611", "CONFIRMED: Escape hatch root not bound"),
+    findingKey: verifyKey,
     title: "CONFIRMED: Escape hatch root not bound", location: "RollupProcessor.sol:523-529,611", severity: "critical",
-    status: "confirmed-differential", scopeId: "ESC-1", evidence: "PoC fails-after-fix", confidence: 0.93, originId: orig.id,
+    status: "confirmed-differential", scopeId: "ESC-1", reportPath: "/runs/verify/report_f1.md", evidence: "PoC fails-after-fix", confidence: 0.93, originId: orig.id,
   }]);
 
   const all = store.listFindings(pid);
   assert.equal(all.length, 1, "the verdict updated the original — NOT a new duplicate row");
   const flipped = all[0];
   assert.equal(flipped.id, orig.id, "same row id");
+  assert.equal(flipped.run_id, verifyRun, "source run moves to the verify run that holds the PoC artifact");
+  assert.equal(flipped.finding_key, verifyKey, "content key follows the verified artifact");
   assert.equal(flipped.status, "confirmed-differential", "status flipped by the verdict");
-  assert.equal(flipped.title, "Escape hatch root not bound", "original title/identity preserved (not the verify rename)");
+  assert.equal(flipped.title, "CONFIRMED: Escape hatch root not bound", "verified title is now the current finding identity");
+  assert.equal(flipped.report_path, "/runs/verify/report_f1.md", "confirm can recover the verify run dir from the report path");
   assert.equal(flipped.evidence, "PoC fails-after-fix", "verify PoC attached");
   assert.equal(flipped.description, "the proof root is not checked against the on-chain root", "original description kept");
   assert.equal(flipped.confidence, 0.93);
+  assert.equal(store.pendingConfirmable(pid)[0].run_dir, "/runs/verify", "pending confirm uses the verify evidence run");
   const tl = store.findingTimeline(orig.id);
   assert.ok(tl.some((e) => e.to_status === "confirmed-differential"), "the flip is on the status timeline");
 

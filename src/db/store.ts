@@ -858,13 +858,31 @@ export class MetadataStore {
           if (orig) {
             this.db
               .prepare(
-                `UPDATE finding SET status = ?, report_path = COALESCE(?, report_path),
+                `UPDATE finding SET run_id = ?, finding_key = ?, title = ?, location = ?, severity = ?, status = ?,
+                   report_path = COALESCE(?, report_path), scope_id = ?,
                    report_markdown = COALESCE(NULLIF(?, ''), report_markdown),
                    description = COALESCE(NULLIF(?, ''), description), evidence = COALESCE(NULLIF(?, ''), evidence),
                    exploit_sketch = COALESCE(NULLIF(?, ''), exploit_sketch), fix = COALESCE(NULLIF(?, ''), fix),
                    confidence = COALESCE(?, confidence), updated_at = ? WHERE id = ?`,
               )
-              .run(f.status, f.reportPath ?? null, f.reportMarkdown ?? null, f.description ?? null, f.evidence ?? null, f.exploitSketch ?? null, f.fix ?? null, f.confidence ?? null, ts, orig.id);
+              .run(
+                runId,
+                f.findingKey,
+                f.title ?? null,
+                f.location ?? null,
+                f.severity ?? null,
+                f.status,
+                f.reportPath ?? null,
+                f.scopeId ?? null,
+                f.reportMarkdown ?? null,
+                f.description ?? null,
+                f.evidence ?? null,
+                f.exploitSketch ?? null,
+                f.fix ?? null,
+                f.confidence ?? null,
+                ts,
+                orig.id,
+              );
             if (orig.status !== f.status) this.recordStatusEvent(orig.id, orig.status, f.status, reason, runId, ts);
             continue;
           }
@@ -961,32 +979,33 @@ export class MetadataStore {
   // --- per-finding confirm (real-target reproduction) -----------------------
 
   /** The project's findings that are confirmed by the audit (source-level) but NOT yet decided on
-   * the real target — the work list for a project-level confirm. Joins the source run dir so the
-   * confirm can load each finding's full PoC/fix data. confirm_status NULL = pending. */
-  pendingConfirmable(projectId: number): Array<{ finding_key: string; title: string; run_id: number | null; run_dir: string | null }> {
+   * the real target — the work list for a project-level confirm. Carries both the original run dir
+   * and the latest report_path so the control plane can route Confirm to the run holding the PoC/fix
+   * artifact. confirm_status NULL = pending. */
+  pendingConfirmable(projectId: number): Array<{ id: number; finding_key: string; title: string; run_id: number | null; run_dir: string | null; report_path: string | null }> {
     return this.db
       .prepare(
-        `SELECT f.finding_key, f.title, f.run_id, r.run_dir
+        `SELECT f.id, f.finding_key, f.title, f.run_id, r.run_dir, f.report_path
            FROM finding f LEFT JOIN run r ON r.id = f.run_id
           WHERE f.project_id = ? AND f.confirm_status IS NULL
             AND COALESCE(f.tracking_status, 'open') <> 'ignored'
             AND f.status IN ('confirmed-differential','confirmed-executable','confirmed-source')
           ORDER BY f.status, f.id`,
       )
-      .all(projectId) as Array<{ finding_key: string; title: string; run_id: number | null; run_dir: string | null }>;
+      .all(projectId) as Array<{ id: number; finding_key: string; title: string; run_id: number | null; run_dir: string | null; report_path: string | null }>;
   }
 
   /** One pending confirmable finding by project + id (for finding-level confirm). */
-  getConfirmable(projectId: number, findingId: number): { finding_key: string; title: string; run_id: number | null; run_dir: string | null } | undefined {
+  getConfirmable(projectId: number, findingId: number): { id: number; finding_key: string; title: string; run_id: number | null; run_dir: string | null; report_path: string | null } | undefined {
     return this.db
       .prepare(
-        `SELECT f.finding_key, f.title, f.run_id, r.run_dir
+        `SELECT f.id, f.finding_key, f.title, f.run_id, r.run_dir, f.report_path
            FROM finding f LEFT JOIN run r ON r.id = f.run_id
           WHERE f.project_id = ? AND f.id = ? AND f.confirm_status IS NULL
             AND COALESCE(f.tracking_status, 'open') <> 'ignored'
             AND f.status IN ('confirmed-differential','confirmed-executable','confirmed-source')`,
       )
-      .get(projectId, findingId) as { finding_key: string; title: string; run_id: number | null; run_dir: string | null } | undefined;
+      .get(projectId, findingId) as { id: number; finding_key: string; title: string; run_id: number | null; run_dir: string | null; report_path: string | null } | undefined;
   }
 
   /** Set a finding's real-target confirm state, addressed by its content key within a project

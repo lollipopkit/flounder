@@ -442,7 +442,8 @@ test("api: daemon pipeline worklist exposes verify candidates before confirm", a
       headers: authHeaders,
       body: JSON.stringify({ project: "pipeline-verify-worklist", phase: "confirm" }),
     }));
-    assert.deepEqual(confirm.confirmKeys, ["confirmed-bug"]);
+    assert.ok(confirm.confirmKeys.includes("confirmed-bug"));
+    assert.ok(confirm.confirmKeys.some((key) => /^origin:\d+:confirmed-bug$/.test(key)), "worklist carries origin selector for verify-artifact recovery");
 
     const detail = await json(await fetch(base + `/api/projects/${created.uuid}`));
     const suspected = detail.allFindings.find((finding) => finding.finding_key === "suspected-bug");
@@ -1499,7 +1500,8 @@ test("api: project detail summarizes the latest prepare manifest and workspace q
     assert.equal(confirmSpec.dir, undefined);
     assert.equal(confirmSpec.inputRunDir, auditRunDir);
     assert.deepEqual(confirmSpec.inputRunDirs, [auditRunDir]);
-    assert.deepEqual(confirmSpec.confirmKeys, ["confirmed-bug"]);
+    assert.ok(confirmSpec.confirmKeys.includes("confirmed-bug"));
+    assert.ok(confirmSpec.confirmKeys.some((key) => /^origin:\d+:confirmed-bug$/.test(key)), "confirm spec carries origin selector for verify-artifact recovery");
   });
 });
 

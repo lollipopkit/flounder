@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { copyFile, lstat, mkdir, readdir, realpath, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { analyzeReproductionCommandSafety } from "./policy.js";
 import type { ReproductionCommand, ReproductionCommandResult, ReproductionFile } from "../types.js";
 
@@ -17,6 +18,7 @@ export interface SandboxWorkspace {
 
 export type SandboxBackend = "auto" | "oci" | "host";
 export type SandboxNetworkMode = "none" | "enabled";
+export const DEFAULT_SANDBOX_IMAGE = "flounder-sandbox:latest";
 
 export interface SandboxExecutionOptions {
   backend?: SandboxBackend;
@@ -33,6 +35,17 @@ export interface SandboxReadiness {
   image: string;
   allowHostFallback: boolean;
   message?: string;
+}
+
+export interface SandboxImageBuildResult {
+  ok: boolean;
+  image: string;
+  dockerfile?: string;
+  message: string;
+  stdout?: string;
+  stderr?: string;
+  exitCode?: number | null;
+  timedOut?: boolean;
 }
 
 interface SandboxProcessOptions extends Required<Pick<SandboxExecutionOptions, "backend" | "image" | "allowHostFallback" | "network">> {
@@ -155,12 +168,16 @@ export async function runSandboxCommand(
 function normalizeSandboxExecutionOptions(input: SandboxExecutionOptions): SandboxProcessOptions {
   return {
     backend: input.backend ?? "auto",
-    image: input.image || "flounder-sandbox:latest",
+    image: input.image || DEFAULT_SANDBOX_IMAGE,
     allowHostFallback: input.allowHostFallback ?? false,
     network: input.network ?? "none",
     ...(input.memoryMb !== undefined ? { memoryMb: input.memoryMb } : {}),
     ...(input.cpus !== undefined ? { cpus: input.cpus } : {}),
   };
+}
+
+export function isDefaultSandboxImage(image: string): boolean {
+  return image === DEFAULT_SANDBOX_IMAGE;
 }
 
 export async function checkSandboxReadiness(input: SandboxExecutionOptions = {}): Promise<SandboxReadiness> {
@@ -194,6 +211,56 @@ export async function checkSandboxReadiness(input: SandboxExecutionOptions = {})
     image: options.image,
     allowHostFallback: false,
     message: `No OCI sandbox is available for image "${options.image}", and host execution fallback is disabled. Install Docker and build or pull the image, or pass --allow-host-execution only for trusted local targets.`,
+  };
+}
+
+export function clearSandboxAvailabilityCache(image?: string): void {
+  if (image) ociAvailability.delete(image);
+  else ociAvailability.clear();
+}
+
+export async function buildDefaultSandboxImage(options: { timeoutMs?: number } = {}): Promise<SandboxImageBuildResult> {
+  const dockerfile = await defaultSandboxDockerfilePath();
+  if (!dockerfile) {
+    return {
+      ok: false,
+      image: DEFAULT_SANDBOX_IMAGE,
+      message: "Default sandbox Dockerfile was not found in this installation.",
+    };
+  }
+  const root = path.dirname(path.dirname(dockerfile));
+  const result = await runSpawnedProcess({
+    program: "docker",
+    args: ["build", "-f", dockerfile, "-t", DEFAULT_SANDBOX_IMAGE, root],
+    cwd: root,
+    env: dockerClientEnv(),
+    timeoutMs: options.timeoutMs ?? 30 * 60_000,
+    maxLogBytes: 12_000,
+  });
+  clearSandboxAvailabilityCache(DEFAULT_SANDBOX_IMAGE);
+  if (result.exitCode === 0 && !result.timedOut) {
+    return {
+      ok: true,
+      image: DEFAULT_SANDBOX_IMAGE,
+      dockerfile,
+      message: `Built ${DEFAULT_SANDBOX_IMAGE}.`,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      exitCode: result.exitCode,
+      timedOut: result.timedOut,
+    };
+  }
+  return {
+    ok: false,
+    image: DEFAULT_SANDBOX_IMAGE,
+    dockerfile,
+    message: result.timedOut
+      ? `Timed out while building ${DEFAULT_SANDBOX_IMAGE}.`
+      : `Failed to build ${DEFAULT_SANDBOX_IMAGE}.`,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    exitCode: result.exitCode,
+    timedOut: result.timedOut,
   };
 }
 
@@ -506,6 +573,23 @@ async function checkOciSandboxAvailable(image: string): Promise<boolean> {
     maxLogBytes: 2000,
   });
   return result.exitCode === 0 && !result.timedOut;
+}
+
+async function defaultSandboxDockerfilePath(): Promise<string | undefined> {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    path.resolve(here, "../../docker/flounder-sandbox.Dockerfile"),
+    path.resolve(process.cwd(), "docker/flounder-sandbox.Dockerfile"),
+  ];
+  for (const candidate of candidates) {
+    try {
+      const info = await stat(candidate);
+      if (info.isFile()) return candidate;
+    } catch {
+      // try the next installation layout
+    }
+  }
+  return undefined;
 }
 
 async function forceRemoveContainer(name: string): Promise<void> {

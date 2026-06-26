@@ -20,7 +20,7 @@ import { defaultConfig, defaultOutputDir, defaultWorkspaceDir, sandboxExecutionO
 import type { Coverage, RunKind, RunStatus } from "../db/store.js";
 import type { AgentFinding, AuditScope } from "../agent/tools.js";
 import { assertProviderAuthenticated, knownRuntimeProviders, providerAuthStatus } from "../provider-auth.js";
-import { checkSandboxReadiness } from "../security/sandbox.js";
+import { buildDefaultSandboxImage, checkSandboxReadiness, DEFAULT_SANDBOX_IMAGE, isDefaultSandboxImage, type SandboxImageBuildResult, type SandboxReadiness } from "../security/sandbox.js";
 import { RunLogger } from "../trace/logger.js";
 
 export interface DaemonOptions {
@@ -33,6 +33,8 @@ export interface DaemonOptions {
 }
 
 type Activity = { kind: string; delta?: string; tool?: string; step?: number };
+
+let defaultSandboxBuild: Promise<SandboxImageBuildResult> | undefined;
 
 export async function runDaemon(opts: DaemonOptions): Promise<void> {
   const base = opts.server.replace(/\/$/, "");
@@ -368,16 +370,69 @@ async function requireSandboxReady(
     onActivity: (event: Activity) => void;
   },
 ): Promise<void> {
-  const readiness = await checkSandboxReadiness(sandboxExecutionOptions(cfg, "none"));
+  let readiness = await checkSandboxReadiness(sandboxExecutionOptions(cfg, "none"));
   if (readiness.ok) return;
-  const message = readiness.message ?? "Sandbox execution is not available.";
+  if (shouldAutoBuildDefaultSandbox(readiness)) {
+    const build = await buildDefaultSandboxOnce();
+    readiness = await checkSandboxReadiness(sandboxExecutionOptions(cfg, "none"));
+    if (readiness.ok) return;
+    await writeSandboxBlockedRun(cfg, kind, ctx, {
+      readiness,
+      message: `${readiness.message ?? "Sandbox execution is not available."} Automatic build failed: ${build.message}`,
+      build,
+    });
+    return;
+  }
+  await writeSandboxBlockedRun(cfg, kind, ctx, {
+    readiness,
+    message: readiness.message ?? "Sandbox execution is not available.",
+  });
+}
+
+function shouldAutoBuildDefaultSandbox(readiness: SandboxReadiness): boolean {
+  return !readiness.ok
+    && readiness.backend !== "host"
+    && !readiness.allowHostFallback
+    && isDefaultSandboxImage(readiness.image);
+}
+
+async function buildDefaultSandboxOnce(): Promise<SandboxImageBuildResult> {
+  if (!defaultSandboxBuild) {
+    defaultSandboxBuild = buildDefaultSandboxImage().finally(() => {
+      defaultSandboxBuild = undefined;
+    });
+  }
+  return defaultSandboxBuild;
+}
+
+async function writeSandboxBlockedRun(
+  cfg: AuditorConfig,
+  kind: RunKind,
+  ctx: {
+    makeTracker: (cfg: AuditorConfig, runDir: string, kind: RunKind) => RunTracker;
+    flushTracker: () => Promise<void>;
+    onActivity: (event: Activity) => void;
+  },
+  input: { readiness: SandboxReadiness; message: string; build?: SandboxImageBuildResult },
+): Promise<never> {
+  const message = input.message;
   const logger = new RunLogger(cfg.outputDir, blockedRunTarget(cfg.targetName, kind), new Date());
   await logger.init();
   await logger.event("sandbox_unavailable", {
-    backend: readiness.backend,
-    image: readiness.image,
-    allowHostFallback: readiness.allowHostFallback,
+    backend: input.readiness.backend,
+    image: input.readiness.image,
+    allowHostFallback: input.readiness.allowHostFallback,
     message,
+    ...(input.build ? {
+      autoBuild: {
+        ok: input.build.ok,
+        image: input.build.image,
+        dockerfile: input.build.dockerfile,
+        exitCode: input.build.exitCode,
+        timedOut: input.build.timedOut,
+        stderr: input.build.stderr,
+      },
+    } : {}),
   });
   const tracker = ctx.makeTracker(cfg, logger.runDir, kind);
   ctx.onActivity({ kind: "event", delta: message });
@@ -394,7 +449,7 @@ function blockedRunTarget(targetName: string, kind: RunKind): string {
 }
 
 async function daemonCapabilities(): Promise<Record<string, unknown>> {
-  const sandbox = await checkSandboxReadiness(sandboxExecutionOptions(defaultConfig(), "none"));
+  const sandbox = daemonVisibleSandboxReadiness(await checkSandboxReadiness(sandboxExecutionOptions(defaultConfig(), "none")));
   const providers = await Promise.all(
     knownRuntimeProviders().map(async (provider) => {
       try {
@@ -412,6 +467,18 @@ async function daemonCapabilities(): Promise<Record<string, unknown>> {
     }),
   );
   return { providers, sandbox };
+}
+
+export function daemonVisibleSandboxReadiness(readiness: SandboxReadiness): SandboxReadiness & { autoBuild?: boolean } {
+  if (shouldAutoBuildDefaultSandbox(readiness)) {
+    return {
+      ...readiness,
+      ok: true,
+      autoBuild: true,
+      message: `Default sandbox image ${DEFAULT_SANDBOX_IMAGE} will be built automatically before the next audit phase if it is still missing.`,
+    };
+  }
+  return readiness;
 }
 
 // Reports a run's progress to the server. Serializes calls on one chain so the run is

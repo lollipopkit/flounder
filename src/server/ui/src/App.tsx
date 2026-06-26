@@ -456,8 +456,9 @@ function daemonSandboxStatus(daemon: DaemonRow | undefined): { ok: boolean; stat
       signature: JSON.stringify({ ok: false, reason: "not-reported" }),
     };
   }
-  const read = sandbox as { ok?: unknown; backend?: unknown; image?: unknown; allowHostFallback?: unknown; message?: unknown };
+  const read = sandbox as { ok?: unknown; backend?: unknown; image?: unknown; allowHostFallback?: unknown; autoBuild?: unknown; message?: unknown };
   const ok = read.ok === true;
+  const autoBuild = read.autoBuild === true;
   const backend = typeof read.backend === "string" ? read.backend : "auto";
   const image = typeof read.image === "string" && read.image.trim() ? read.image : "flounder-sandbox:latest";
   const allowHostFallback = read.allowHostFallback === true;
@@ -468,9 +469,9 @@ function daemonSandboxStatus(daemon: DaemonRow | undefined): { ok: boolean; stat
       : `Sandbox is not ready for image ${image}.`;
   return {
     ok,
-    state: ok ? `Sandbox ready (${backend})` : `Sandbox missing (${image})`,
+    state: ok ? (autoBuild ? "Sandbox auto-setup" : `Sandbox ready (${backend})`) : `Sandbox missing (${image})`,
     message,
-    signature: JSON.stringify({ ok, backend, image, allowHostFallback, message }),
+    signature: JSON.stringify({ ok, backend, image, allowHostFallback, autoBuild, message }),
   };
 }
 

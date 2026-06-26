@@ -1328,10 +1328,6 @@ small {
   gap: 6px;
 }
 
-.tabs button.tab-push {
-  margin-left: auto;
-}
-
 .tab-alert-dot {
   width: 7px;
   height: 7px;
@@ -3206,18 +3202,18 @@ small {
   font-weight: 650;
 }
 
+.markdown-report {
+  display: grid;
+  gap: 12px;
+}
+
 .report-document-head {
-  position: sticky;
-  top: 0;
-  z-index: 2;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 14px;
   align-items: start;
   padding-bottom: 12px;
-  margin-bottom: 12px;
   border-bottom: 1px solid var(--border-muted);
-  background: var(--canvas);
 }
 
 .report-document-head h1 {
@@ -3743,10 +3739,6 @@ small {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
     width: 100%;
-  }
-
-  .tabs button.tab-push {
-    margin-left: 0;
   }
 
   .tabs button {

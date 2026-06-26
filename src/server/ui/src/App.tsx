@@ -57,13 +57,13 @@ type ModalName = "new-project" | "run" | "edit-project" | "report" | "run-log" |
 type ArtifactPreview = { title: string; runId: number; name: string };
 type LaunchAction = "run" | "prepare" | "map" | "audit" | "confirm" | "verify" | "report";
 
-const PROJECT_TABS: Array<{ id: ProjectTab; label: string; side?: "right" }> = [
+const PROJECT_TABS: Array<{ id: ProjectTab; label: string }> = [
   { id: "overview", label: "Overview" },
+  { id: "activity", label: "Activity" },
   { id: "decisions", label: "Decisions" },
   { id: "findings", label: "Findings" },
   { id: "scopes", label: "Scopes" },
   { id: "runs", label: "Runs" },
-  { id: "activity", label: "Activity", side: "right" },
   { id: "setup", label: "Setup" },
 ];
 
@@ -2622,13 +2622,13 @@ function ProjectDetailView(props: {
             key={t.id}
             role="tab"
             aria-selected={tab === t.id}
-            className={`${tab === t.id ? "sel" : ""}${t.side === "right" ? " tab-push" : ""}`}
+            className={tab === t.id ? "sel" : ""}
             title={t.id === "setup" && setupAttention ? setupAttention.label : t.id === "activity" && runningRun ? `${runKindLabel(runningRun.kind, runningRun)} is running` : undefined}
             onClick={() => setTab(t.id)}
           >
             <span>{t.label}</span>
             {t.id === "decisions" && confirmDecisions.length ? <Counter>{confirmDecisions.length}</Counter> : null}
-            {t.id === "activity" && runningRun ? <span className="tab-alert-dot pending" aria-hidden="true" /> : null}
+            {t.id === "activity" && runningRun && tab !== "activity" ? <span className="tab-alert-dot pending" aria-hidden="true" /> : null}
             {t.id === "setup" && setupAttention ? <span className={`tab-alert-dot ${setupAttention.tone}`} aria-hidden="true" /> : null}
           </button>
         ))}

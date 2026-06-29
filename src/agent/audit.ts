@@ -16,7 +16,7 @@ import { runDischargeChallenge, runRefutation } from "./refutation.js";
 import { runAuditLoop } from "./loop.js";
 import { ProjectMemory } from "./memory.js";
 import { loadScopeInventory, saveScopeInventory, scopeProgress } from "./scope-store.js";
-import { RunRecorder, type RunTrackerFactory } from "../db/record.js";
+import { RunRecorder, toDiscoveryBacklogRows, type RunTrackerFactory } from "../db/record.js";
 import type { RunKind } from "../db/store.js";
 import { isPiSessionProvider, runAuditSession, SessionLlmClient } from "./pi-session.js";
 import type { TranscriptStep } from "./prompts.js";
@@ -745,6 +745,8 @@ export async function runAudit(
   });
   await logger.artifact(RUN_HEALTH_FILE, runHealth);
   recorder.stage("run-health", { status: runHealth.status, ...runHealth.signals });
+  recorder.health?.(runHealth);
+  recorder.backlog?.(toDiscoveryBacklogRows({ coverageGaps, resourceRequests, followupScopes }));
 
   await logger.artifact("audit_transcript.json", { stoppedReason, steps });
   await logger.artifact("audit_findings.json", confirmed);

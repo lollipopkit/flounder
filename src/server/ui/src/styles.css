@@ -2045,6 +2045,13 @@ small {
   grid-template-columns: auto minmax(0, 1fr) auto auto;
 }
 
+.scope-label-stack {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
 .run-row {
   grid-template-columns: auto minmax(0, 1fr) minmax(180px, auto) auto auto;
 }
@@ -2127,6 +2134,10 @@ small {
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: 8px;
+}
+
+.backlog-card {
+  align-items: flex-start;
 }
 
 .resource-list-more {

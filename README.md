@@ -341,7 +341,7 @@ A finding's status is the framework's verdict from execution:
 
 A run produces private artifacts under the output directory. By default, Flounder keeps local state under `~/.flounder`:
 
-- `~/.flounder/flounder.db`: local tracking database for projects, runs, findings, daemon tokens, and jobs.
+- `~/.flounder/flounder.db`: local tracking database for projects, runs, scopes, findings, discovery backlog, daemon tokens, and jobs.
 - `~/.flounder/<target>-<timestamp>/`: run artifacts, copied workspaces, logs, transcripts, findings, and reports.
 - `~/.flounder/history/<target>/`: durable memory, scope inventory, build cache, and project history.
 - `~/.flounder/workspace/`: default daemon workspace for project directories.
@@ -354,21 +354,22 @@ A run artifact directory contains:
 - scope inventory and coverage (`audit_scopes.json`, `summary.json`)
 - findings and hypotheses (`audit_findings.json`, `audit_hypotheses.json`)
 - command evidence (`audit_command_runs.json`)
+- discovery health and backlog (`run_health.json`, `coverage_gaps.json`, `resource_requests.json`, `followup_scopes.json`)
 - live/replay trace (`events.jsonl`, `audit_transcript.json`, `calls/*.json`)
 - private report drafts (`audit_report.md`, `report_<id>.md`)
 - confirm decision sheets (`confirm_decision.json`, `confirm_report.md`, `confirm_equivalence.json`)
 
-The dashboard stores metadata and artifact paths in SQLite so an agent can inspect progress without scraping run directories.
+The dashboard stores metadata, run health, discovery backlog rows, and artifact paths in SQLite so an agent can inspect progress without scraping run directories.
 
 ## Dashboard
 
 `flounder ui` is a local control plane and dashboard for projects, daemons, provider profiles, runs, scopes, findings, reports, and live activity. A project is pinned to an execution daemon and a default provider profile, with optional per-phase provider overrides for prepare, map, dig, and confirm. The selected daemon must be authenticated for every provider profile the project can use. New projects start from a prominent task/clue input, can run immediately after creation, and default their daemon workspace directory to the project UUID.
 
-The project view shows the prepare -> map -> dig -> confirm -> report workflow, current phase, scope coverage, live model activity, findings as they land, per-finding confirm actions, real-target reproduction status, and reports. The primary action is **Run** before the first pipeline run and **Continue** after one exists; finer-grained Prepare, Map, Dig, Verify, Confirm, and Report actions live under More actions. The project list can pin projects, archive them to Settings, unarchive them later, and drag active projects into a manual order.
+The project view shows the prepare -> map -> dig -> confirm -> report workflow, current phase, scope coverage, run health, discovery backlog, live model activity, findings as they land, per-finding confirm actions, real-target reproduction status, and reports. The primary action is **Run** before the first pipeline run and **Continue** after one exists; finer-grained Prepare, Map, Dig, Verify, Confirm, and Report actions live under More actions. The project list can pin projects, archive them to Settings, unarchive them later, and drag active projects into a manual order.
 
 A cross-project Findings view tracks every finding through submission states. It supports project, audit-status, and tracking filters; the default Active view hides findings marked `ignored`, and the Ignored view lets an operator recover machine-reported false positives later by changing them back to `open`.
 
-Every UI operation is also a REST call. `GET /api` returns the API catalog, and `GET /api/runs/:id/log` streams the executing daemon's live model output, tool calls, and milestones.
+Every UI operation is also a REST call. `GET /api` returns the API catalog, `GET /api/projects/:uuid/backlog` lists discovery backlog rows, `PATCH /api/backlog/:id` updates their operator state, and `GET /api/runs/:id/log` streams the executing daemon's live model output, tool calls, and milestones.
 
 ## White-Hat Boundary
 

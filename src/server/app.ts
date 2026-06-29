@@ -863,6 +863,7 @@ function runApiRow(store: MetadataStore, run: Record<string, unknown>, plane?: C
 }
 
 const RUN_STALE_ACTIVITY_MS = 15 * 60 * 1000;
+const DAEMON_LOST_JOB_GRACE_MS = 30 * 1000;
 
 function runActivityFields(store: MetadataStore, plane: ControlPlane | undefined, run: Record<string, unknown>): Record<string, unknown> {
   if (run.status !== "running") return {};
@@ -3522,7 +3523,9 @@ function reconcileLostExecutorJobs(store: MetadataStore, plane: ControlPlane): n
       ? latestRunActivityAt(store, plane, runId)
       : stringValue(job.updated_at) || stringValue(job.created_at);
     const activity = runInactivity(lastActivityAt);
-    if (!activity?.staleActivity) continue;
+    const jobTouchedAt = stringValue(job.updated_at) || stringValue(job.created_at);
+    const freshDaemonLostJob = daemonHasFreshHeartbeat && timestampOlderThan(jobTouchedAt, DAEMON_LOST_JOB_GRACE_MS);
+    if (!freshDaemonLostJob && !activity?.staleActivity) continue;
 
     store.setJobStatus(jobId, "canceled", daemonOnline ? "executor no longer holds this job" : "executor offline before completion");
     if (runId !== undefined) {
@@ -3586,6 +3589,13 @@ function runInactivity(lastActivityAt: string | undefined): { inactiveSeconds: n
   if (!Number.isFinite(last)) return undefined;
   const inactiveSeconds = Math.max(0, Math.floor((Date.now() - last) / 1000));
   return { inactiveSeconds, staleActivity: inactiveSeconds * 1000 >= RUN_STALE_ACTIVITY_MS };
+}
+
+function timestampOlderThan(value: string | undefined, ageMs: number): boolean {
+  if (!value) return false;
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return false;
+  return Date.now() - parsed >= ageMs;
 }
 
 function daemonRows(c: Ctx): Array<Record<string, unknown>> {

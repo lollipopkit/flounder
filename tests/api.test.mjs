@@ -3346,6 +3346,54 @@ test("api: stale jobs not held by daemon heartbeat are reconciled automatically"
   });
 });
 
+test("api: daemon heartbeat reconciles recently active jobs lost across executor restart", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body, token) => fetch(base + p, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify(body),
+    });
+    const daemon = await json(await post("/api/daemons", { name: "heartbeat-restart-lost" }));
+    const created = await json(await post("/api/projects", { name: "heartbeat-restart-lost-project", sourcePaths: ["./src"], daemonId: daemon.id }));
+    const runDir = path.join(out, "heartbeat-restart-lost-run");
+    const recentActivity = new Date(Date.now() - 60_000).toISOString();
+    await mkdir(runDir, { recursive: true });
+    await writeFile(path.join(runDir, "events.jsonl"), `${JSON.stringify({ ts: recentActivity, kind: "audit_action", detail: "recent activity before machine restart" })}\n`);
+
+    let jobId;
+    let runId;
+    let store = MetadataStore.openForOutput(out);
+    try {
+      jobId = store.enqueueJob(created.name, { verb: "run" }, daemon.id);
+      runId = store.startRun({ projectId: created.id, kind: "run", runDir });
+      store.setJobRun(jobId, runId);
+      store.db.prepare("UPDATE job SET updated_at = ? WHERE id = ?").run(new Date(Date.now() - 60_000).toISOString(), jobId);
+    } finally {
+      store.close();
+    }
+
+    const before = await json(await fetch(base + "/api/active"));
+    const row = before.active.find((entry) => entry.jobId === jobId);
+    assert.equal(row.status, "running");
+    assert.equal(row.staleActivity, false);
+
+    const heartbeat = await json(await post("/api/daemon/heartbeat", { instanceId: "new-worker-after-restart", activeJobIds: [] }, daemon.token));
+    assert.equal(heartbeat.reconciled, 1);
+    const active = await json(await fetch(base + "/api/active"));
+    assert.equal(active.active.some((entry) => entry.jobId === jobId), false);
+
+    store = MetadataStore.openForOutput(out);
+    try {
+      assert.equal(store.getJob(jobId).status, "canceled");
+      assert.equal(store.getJob(jobId).error, "executor no longer holds this job");
+      assert.equal(store.getRun(runId).status, "killed");
+    } finally {
+      store.close();
+    }
+  });
+});
+
 test("api: empty killed runs do not replace the latest material project snapshot", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();

@@ -6,6 +6,7 @@ cache/
 .npm-cache/
 .gstack/
 .codex/
+.flounder/
 .DS_Store
 *.log
 *.pdf

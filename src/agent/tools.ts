@@ -503,7 +503,22 @@ function confirmCommandTargetLink(command: ReproductionCommand, session: AgentSe
 
 function commandFileArgs(command: ReproductionCommand, session: AgentSession): string[] {
   const out: string[] = [];
-  const skipValueAfter = new Set(["--test-dir", "-C", "--config", "--manifest-path", "--package", "-p", "--match-test", "--match-path", "-R"]);
+  const skipValueAfter = new Set([
+    "--test-dir",
+    "-C",
+    "--config",
+    "--manifest-path",
+    "--package",
+    "-p",
+    "--match-test",
+    "--match-path",
+    "-R",
+    "--root",
+    "--contracts",
+    "--lib-paths",
+    "--cache-path",
+    "--out",
+  ]);
   for (let idx = 0; idx < command.args.length; idx += 1) {
     const arg = command.args[idx] ?? "";
     if (skipValueAfter.has(arg)) {
@@ -518,6 +533,10 @@ function commandFileArgs(command: ReproductionCommand, session: AgentSession): s
     }
   }
   return out;
+}
+
+export function commandFileArgsForTest(command: ReproductionCommand, session: Pick<AgentSession, "scratchFiles" | "baselineFiles">): string[] {
+  return commandFileArgs(command, session as AgentSession);
 }
 
 function scratchLinksToBaseline(filePath: string, content: string, baseline: Set<string>): boolean {

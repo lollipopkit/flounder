@@ -7,7 +7,7 @@ import test from "node:test";
 import { gzipSync } from "node:zlib";
 import { defaultConfig, resolveRole, withRole, normalizeRoleModels } from "../dist/config.js";
 import { ProjectMemory } from "../dist/agent/memory.js";
-import { buildTools, describeAction, ingestFindingsFromScratch, newSession, dedupeFindings, readScratchScopes, isReportFile, scratchHasFindings, scratchHasFindingsArtifact } from "../dist/agent/tools.js";
+import { buildTools, describeAction, ingestFindingsFromScratch, newSession, dedupeFindings, readScratchScopes, isReportFile, scratchHasFindings, scratchHasFindingsArtifact, commandFileArgsForTest } from "../dist/agent/tools.js";
 import { buildRunHealth, mergeFollowupScopes, readScratchCoverageGaps, readScratchFollowupScopes, readScratchResourceRequests } from "../dist/agent/discovery-artifacts.js";
 import { runAudit } from "../dist/agent/audit.js";
 import { normalizePrepareManifest, prepareValidationBlockingIssues, readPrepareManifest } from "../dist/agent/acquire.js";
@@ -780,6 +780,35 @@ test("confirmed executable commands must link model-written tests to pristine ta
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("confirm target-link parsing ignores Foundry project root flags but keeps explicit files", () => {
+  const session = {
+    scratchFiles: new Map([["poc/standalone.t.sol", "contract Standalone {}"]]),
+    baselineFiles: new Set(["sources/silo-contracts-v3-3.5.0/silo-core/contracts/Silo.sol"]),
+  };
+
+  const projectRunnerArgs = commandFileArgsForTest({
+    program: "forge",
+    args: [
+      "test",
+      "--root",
+      "sources/silo-contracts-v3-3.5.0",
+      "--contracts",
+      "silo-core/contracts",
+      "--match-contract",
+      "SiloConfirmCoreRel",
+      "--via-ir",
+      "-vv",
+    ],
+  }, session);
+  assert.deepEqual(projectRunnerArgs, []);
+
+  const explicitFileArgs = commandFileArgsForTest({
+    program: "forge",
+    args: ["test", "poc/standalone.t.sol", "--match-contract", "Standalone"],
+  }, session);
+  assert.deepEqual(explicitFileArgs, ["poc/standalone.t.sol"]);
 });
 
 test("failed bash command events include an output preview for the UI", async () => {

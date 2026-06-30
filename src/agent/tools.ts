@@ -119,6 +119,7 @@ export interface ToolContext {
   memory: ProjectMemory;
   logger: RunLogger;
   session: AgentSession;
+  onCommandRun?: (record: CommandRunRecord) => void;
 }
 
 export interface ToolResult {
@@ -405,6 +406,11 @@ const bashTool: AgentTool = {
       missing: patternCheck.missing.length,
       ...(includeOutput && output ? { output } : {}),
     });
+    try {
+      ctx.onCommandRun?.(record);
+    } catch {
+      // live progress projection is best-effort
+    }
 
     const tail = (text: string): string => (text.length > 1600 ? `...${text.slice(-1600)}` : text);
     const verdict = !isConfirm

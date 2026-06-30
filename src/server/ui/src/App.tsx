@@ -43,6 +43,7 @@ import {
   rankCandidates,
   runProgress,
   runScopeBatchComplete,
+  sortConfirmDecisionsForSubmission,
   STATUSES,
   THINKING_LEVELS,
   TRACKING,
@@ -831,7 +832,7 @@ function pendingFormalReports(rows: FindingRow[] | undefined, requiresConfirmati
 }
 
 function reportableDecisions(decisions: ConfirmDecision[] | undefined): ConfirmDecision[] {
-  return (decisions ?? []).filter((decision) => decision.reproduced === "yes" && decision.recommendation !== "drop");
+  return sortConfirmDecisionsForSubmission(decisions).filter((decision) => decision.reproduced === "yes" && decision.recommendation !== "drop");
 }
 
 function pendingDecisionReports(decisions: ConfirmDecision[] | undefined): ConfirmDecision[] {
@@ -1150,6 +1151,21 @@ function eventSummary(event: ActivityRecord, fallbackBody: string): { label: str
         label: payloadBoolean(payload, "hasDecision") === false ? "Decision sheet missing" : "Decision sheet ready",
         body: payloadBoolean(payload, "hasDecision") === false ? "The confirm run finished without a decision sheet." : "The confirm run produced its decision sheet.",
       };
+    case "audit_confirm_checkpoint": {
+      const rows = payloadNumber(payload, "rows");
+      const reproduced = payloadNumber(payload, "reproducedYes");
+      const needsHuman = payloadNumber(payload, "needsHuman");
+      const submit = payloadNumber(payload, "submitCandidates");
+      return {
+        label: "Decision checkpoint",
+        body: [
+          rows !== undefined ? `${rows} decisions` : undefined,
+          reproduced !== undefined ? `${reproduced} reproduced` : undefined,
+          needsHuman ? `${needsHuman} need human` : undefined,
+          submit ? `${submit} submit candidates` : undefined,
+        ].filter(Boolean).join(" · ") || fallbackBody,
+      };
+    }
     case "audit_confirm_equiv_skipped": {
       const items = payloadNumber(payload, "items");
       const maxItems = payloadNumber(payload, "maxItems");
@@ -3455,9 +3471,10 @@ function isSubmitCandidateDecision(decision: ConfirmDecision): boolean {
 }
 
 function overviewDecisionPreview(decisions: ConfirmDecision[]): ConfirmDecision[] {
-  const submitCandidates = decisions.filter(isSubmitCandidateDecision);
-  const reproduced = decisions.filter((decision) => decision.reproduced === "yes" && !isSubmitCandidateDecision(decision));
-  const unresolved = decisions.filter((decision) => decision.reproduced !== "yes");
+  const ordered = sortConfirmDecisionsForSubmission(decisions);
+  const submitCandidates = ordered.filter(isSubmitCandidateDecision);
+  const reproduced = ordered.filter((decision) => decision.reproduced === "yes" && !isSubmitCandidateDecision(decision));
+  const unresolved = ordered.filter((decision) => decision.reproduced !== "yes");
   return [...submitCandidates, ...reproduced, ...unresolved].slice(0, 5);
 }
 
@@ -3584,11 +3601,12 @@ function ConfirmDecisionsCard({
       </div>
     );
   }
+  const orderedDecisions = sortConfirmDecisionsForSubmission(decisions);
   return (
     <div id="project-real-target-decisions" className="section-anchor">
       <Card title={<span>Real-target decisions <Counter>{decisions.length}</Counter></span>}>
         <div className="decision-list">
-          {decisions.map((decision) => {
+          {orderedDecisions.map((decision) => {
             const linkedFindings = decisionFindings(decision, findings);
             const metaChips = decisionMetaChips(decision);
             return (

@@ -2,6 +2,7 @@ import { complete, getModel, getProviders, type KnownProvider } from "@earendil-
 import type { LlmClient } from "../types.js";
 import type { RunLogger } from "../trace/logger.js";
 import type { ThinkingLevel } from "../config.js";
+import { configureOpenAICompatibleEnv, getOpenAICompatibleModel } from "./openai-compatible.js";
 
 export class PiAiClient implements LlmClient {
   constructor(
@@ -19,7 +20,8 @@ export class PiAiClient implements LlmClient {
   }): Promise<string> {
     if (!input.model) throw new Error("model is required");
     const provider = normalizeProvider(this.provider);
-    const model = getModel(provider, input.model as never);
+    configureOpenAICompatibleEnv();
+    const model = getOpenAICompatibleModel(provider, input.model) ?? getModel(provider, input.model as never);
     if (!model) throw new Error(`Unknown pi-ai model: provider=${this.provider} model=${input.model}`);
 
     const options: { maxTokens?: number; reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" } = {};

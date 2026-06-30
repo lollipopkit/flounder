@@ -6,6 +6,7 @@ import { createInterface } from "node:readline";
 import { findEnvKeys, getEnvApiKey, getProviders } from "@earendil-works/pi-ai/compat";
 import { getOAuthProvider, getOAuthProviders, type OAuthPrompt, type OAuthSelectPrompt } from "@earendil-works/pi-ai/oauth";
 import { flounderHomeDir } from "./config.js";
+import { openAICompatibleConfigured, OPENAI_COMPAT_PROVIDER } from "./llm/openai-compatible.js";
 
 const LOCAL_FALLBACK_PROVIDERS = new Set(["mock", "codex-cli", "claude-code"]);
 
@@ -31,7 +32,7 @@ const EXPECTED_ENV: Record<string, string[]> = {
   moonshotai: ["MOONSHOT_API_KEY"],
   "moonshotai-cn": ["MOONSHOT_API_KEY"],
   nvidia: ["NVIDIA_API_KEY"],
-  openai: ["OPENAI_API_KEY"],
+  openai: ["OPENAI_API_KEY", "or FLOUNDER_OPENAI_COMPAT_API_KEY + FLOUNDER_OPENAI_COMPAT_BASE_URL + FLOUNDER_OPENAI_COMPAT_MODEL"],
   openrouter: ["OPENROUTER_API_KEY"],
   opencode: ["OPENCODE_API_KEY"],
   "opencode-go": ["OPENCODE_API_KEY"],
@@ -104,6 +105,16 @@ export async function providerAuthStatus(provider: string): Promise<ProviderAuth
 
   const importedFrom = await importDefaultPiAuth(normalized, authPath);
   if (importedFrom) return { ...base, required: true, configured: true, source: "stored", sourceLabel: `${authPath} (imported from ${importedFrom})` };
+
+  if (normalized === OPENAI_COMPAT_PROVIDER && openAICompatibleConfigured() && (process.env.FLOUNDER_OPENAI_COMPAT_API_KEY || process.env.OPENAI_API_KEY)) {
+    return {
+      ...base,
+      required: true,
+      configured: true,
+      source: "environment",
+      sourceLabel: process.env.FLOUNDER_OPENAI_COMPAT_API_KEY ? "FLOUNDER_OPENAI_COMPAT_*" : "OPENAI_API_KEY + FLOUNDER_OPENAI_COMPAT_*",
+    };
+  }
 
   const envKeys = findEnvKeys(normalized);
   if (envKeys?.length) {

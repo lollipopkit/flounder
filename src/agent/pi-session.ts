@@ -9,6 +9,7 @@ import type { LlmClient } from "../types.js";
 import { AUDIT_CONFIRM_SYSTEM, AUDIT_PREPARE_SYSTEM, MAP_GRANULARITY_RULES, MAP_SCORING_RULES, POC_TRUST_RULE, type TranscriptStep } from "./prompts.js";
 import { describeAction, readScratchScopes, scratchHasFindings, scratchHasFindingsArtifact, type AgentTool, type ToolContext } from "./tools.js";
 import { flounderAgentDir } from "../provider-auth.js";
+import { configureOpenAICompatibleEnv, getOpenAICompatibleModel } from "../llm/openai-compatible.js";
 
 // Continuous-session driver (point 5). Instead of re-driving a stateless
 // complete() once per step — which re-sends the whole transcript every turn and
@@ -938,7 +939,9 @@ function extractMessageText(content: unknown): string {
 
 function getModelSafe(provider: string, modelId?: string): ReturnType<typeof getModel> | undefined {
   try {
-    return getModel(provider as never, (modelId ?? "") as never) ?? undefined;
+    configureOpenAICompatibleEnv();
+    const compat = getOpenAICompatibleModel(provider, modelId) as ReturnType<typeof getModel> | undefined;
+    return compat ?? getModel(provider as never, (modelId ?? "") as never) ?? undefined;
   } catch {
     return undefined;
   }

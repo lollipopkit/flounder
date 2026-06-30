@@ -27,6 +27,7 @@ import { projectHistoryDir } from "../trace/history.js";
 import { loadScopeInventory, saveScopeInventory } from "../agent/scope-store.js";
 import { deriveScopeNote } from "../scope-note.js";
 import { confirmSelectorsForFinding } from "../util/confirm-selector.js";
+import { getOpenAICompatibleModel, openAICompatibleModelId, OPENAI_COMPAT_PROVIDER } from "../llm/openai-compatible.js";
 
 const UI_HTML_PATH = fileURLToPath(new URL("./public/index.html", import.meta.url));
 const UI_PUBLIC_DIR = path.dirname(UI_HTML_PATH);
@@ -1947,9 +1948,13 @@ async function runLaunch(c: Ctx): Promise<void> {
   const progress = scopeView.hasInventory ? scopeView.progress : emptyProgress();
   const spec = launchSpec(project, body, c.out, profile, progress, phaseProfiles);
   if (spec.verb === "run") {
-    applyProjectPrepareDefaults(spec, project, runs);
-    spec.pipeline = true;
-    const prepared = latestPreparedWorkspace(runs);
+    const hasConfiguredSource = spec.sourcePaths.length > 0 || Boolean(spec.buildRoot);
+    const prepared = hasConfiguredSource ? undefined : latestPreparedWorkspace(runs);
+    const shouldRunPipeline = body.pipeline === true || (!hasConfiguredSource && !prepared);
+    if (shouldRunPipeline) {
+      applyProjectPrepareDefaults(spec, project, runs);
+      spec.pipeline = true;
+    }
     if (prepared) {
       spec.dir = undefined;
       spec.sourcePaths = [prepared.workspaceDir];
@@ -2968,12 +2973,23 @@ function availableModels(provider: string): Array<{ id: string; name: string; re
   }
   try {
     const models = getModels(provider as never);
-    return (models ?? []).map((m) => ({
+    const out = (models ?? []).map((m) => ({
       id: String((m as { id: unknown }).id),
       name: String((m as { name?: unknown; id: unknown }).name ?? (m as { id: unknown }).id),
       reasoning: Boolean((m as { reasoning?: unknown }).reasoning),
       thinkingLevels: getSupportedThinkingLevels(m),
     }));
+    const compatId = openAICompatibleModelId();
+    const compat = compatId ? getOpenAICompatibleModel(provider, compatId) : undefined;
+    if (provider === OPENAI_COMPAT_PROVIDER && compat && !out.some((m) => m.id === compat.id)) {
+      out.unshift({
+        id: compat.id,
+        name: compat.name,
+        reasoning: Boolean(compat.reasoning),
+        thinkingLevels: getSupportedThinkingLevels(compat),
+      });
+    }
+    return out;
   } catch {
     return [];
   }

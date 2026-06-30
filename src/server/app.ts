@@ -1460,7 +1460,7 @@ function readPrepareSummary(run: Record<string, unknown>): Record<string, unknow
 
   const posture = stringValue(manifest?.posture);
   const answerFirewall = describeAnswerFirewall(manifest?.answer_firewall, posture);
-  if (answerFirewall !== "clean" && answerFirewall !== "not reported" && !answerFirewall.startsWith("clean ")) {
+  if (!isNonBlockingAnswerFirewall(answerFirewall)) {
     issues.push(`answer firewall is ${answerFirewall}`);
   }
   const realTarget = summarizePrepareRealTarget(manifest?.real_target ?? manifest?.realTarget);
@@ -1546,13 +1546,16 @@ function prepareSummaryQuality(input: {
 
 function isBlockingPrepareIssue(issue: string): boolean {
   const raw = issue.toLowerCase();
+  if (raw.includes("answer firewall is")) {
+    const firewall = issue.replace(/^.*?\banswer firewall is\b/i, "").trim();
+    return !isNonBlockingAnswerFirewall(firewall);
+  }
   return raw.includes("prepare_manifest.json has not been written")
     || raw.includes("prepare_manifest.json could not be parsed")
     || raw.includes("prepare_manifest.json is not a json object")
     || raw.includes("manifest lists no components")
     || raw.includes("prepared workspace is empty")
-    || raw.includes("prepare run ended with status")
-    || raw.includes("answer firewall is");
+    || raw.includes("prepare run ended with status");
 }
 
 function summarizePrepareComponent(component: Record<string, unknown>): Record<string, unknown> {
@@ -1855,13 +1858,33 @@ function describeAnswerFirewall(value: unknown, posture = ""): string {
   return "not reported";
 }
 
+function isNonBlockingAnswerFirewall(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed === "not reported") return true;
+  return isCleanFirewallNote(trimmed);
+}
+
 function isCleanFirewallNote(text: string): boolean {
   const lower = text.toLowerCase();
+  if (lower === "clean" || lower.startsWith("clean ")) return true;
+  if (hasUnnegatedAnswerFirewallInclusion(lower)) return false;
   if (lower.includes("blind")) return true;
-  if (lower.includes("included")) return false;
-  if ((lower.includes("not fetched") || lower.includes("not staged") || lower.includes("skipped") || lower.includes("excluded")) && !lower.includes("included")) return true;
-  if ((lower.includes("no material") || lower.includes("no vulnerability") || lower.includes("not copied") || lower.includes("removed")) && !lower.includes("included")) return true;
-  return lower === "clean" || lower.startsWith("clean ");
+  if (/(^|[.;:]\s*)(no|not|never|without)\b[^.;:]*(material|vulnerability|exploit|poc|proof|incident|post-mortem|bug writeup|opened|staged|fetched|copied|included)/.test(lower)) return true;
+  if (lower.includes("not fetched") || lower.includes("not staged") || lower.includes("not copied")) return true;
+  if (lower.includes("skipped") || lower.includes("excluded") || lower.includes("removed")) return true;
+  return false;
+}
+
+function hasUnnegatedAnswerFirewallInclusion(lower: string): boolean {
+  return lower
+    .split(/[.;]\s*/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .some((part) => {
+      if (!part.includes("included")) return false;
+      return !/\b(no|not|never|without)\b[^.;:]*\bincluded\b/.test(part)
+        && !/\bincluded\b[^.;:]*\b(no|not|never|without)\b/.test(part);
+    });
 }
 
 function summarizePrepareGaps(value: unknown): string[] {

@@ -214,6 +214,9 @@ test("confirm prompt makes bounty adjudication platform-neutral and conservative
   assert.match(AUDIT_CONFIRM_SYSTEM, /engagement_profile/i);
   assert.match(AUDIT_CONFIRM_SYSTEM, /adjudication/i);
   assert.match(AUDIT_CONFIRM_SYSTEM, /payout_estimate/i);
+  assert.match(AUDIT_CONFIRM_SYSTEM, /impact_inventory\.json/i);
+  assert.match(AUDIT_CONFIRM_SYSTEM, /live exposure/i);
+  assert.match(AUDIT_CONFIRM_SYSTEM, /write that gate as unknown\/needs-human/i);
   assert.match(AUDIT_CONFIRM_SYSTEM, /Never invent a collectible bounty/i);
   assert.doesNotMatch(AUDIT_CONFIRM_SYSTEM, /Immunefi/i);
 });

@@ -497,7 +497,7 @@ const ROUTES: Route[] = [
   route({
     method: "GET", path: "/api/runs/:id/artifact",
     summary: "Read a run's report artifact (text) from its run dir — the detailed report behind a run/decision. Allowlisted names only.",
-    params: { id: "run id" }, query: { name: "artifact filename (audit_report.md | confirm_report.md | report_<finding>.md | prepare_manifest.json | confirm_decision.json | confirm_provenance.json)" },
+    params: { id: "run id" }, query: { name: "artifact filename (audit_report.md | confirm_report.md | report_<finding>.md | prepare_manifest.json | confirm_decision.json | impact_inventory.json | confirm_provenance.json)" },
     handler: runArtifact,
   }),
   route({
@@ -3188,7 +3188,7 @@ async function findingTracking(c: Ctx): Promise<void> {
 
 // Serve a run's raw artifact (text) from its run dir. Allowlisted filenames only (no slashes,
 // so no path traversal); the file must resolve directly inside the run dir.
-const ALLOWED_ARTIFACT = /^(audit_report\.md|confirm_report\.md|report_[a-z0-9_.-]+\.md|prepare_manifest\.json|confirm_decision\.json|confirm_provenance\.json|audit_findings\.json|run_health\.json|coverage_gaps\.json|resource_requests\.json|followup_scopes\.json)$/;
+const ALLOWED_ARTIFACT = /^(audit_report\.md|confirm_report\.md|report_[a-z0-9_.-]+\.md|prepare_manifest\.json|confirm_decision\.json|impact_inventory\.json|confirm_provenance\.json|audit_findings\.json|run_health\.json|coverage_gaps\.json|resource_requests\.json|followup_scopes\.json)$/;
 function runArtifact(c: Ctx): void {
   const run = c.store.getRun(Number(c.params.id));
   if (!run || !run.run_dir) return sendJson(c.res, 404, { error: "no such run, or it has no run dir" });

@@ -38,6 +38,8 @@ interface ConfirmProvenance {
 
 type ConfirmStructuredValue = Record<string, unknown> | unknown[];
 
+export const IMPACT_INVENTORY_FILE = "impact_inventory.json";
+
 export async function runConfirm(
   cfg: AuditorConfig,
   options: { inputRunDir: string; inputRunDirs?: string[]; confirmKeys?: string[]; settledDecisions?: ConfirmDecisionRow[]; maxSteps?: number; fresh?: boolean; streamEvents?: boolean; signal?: AbortSignal; onRun?: (runId: number) => void; onActivity?: (event: { kind: string; delta?: string; tool?: string; step?: number }) => void; makeTracker?: RunTrackerFactory },
@@ -184,7 +186,7 @@ export async function runConfirm(
     // Project the decision rows to SQLite each turn so a UI shows live reproduction
     // progress (reproduced X / N) during the run, not only at the end.
     onConfirmCheckpoint: (raw) => {
-      const liveRows = toLiveConfirmRows(raw);
+      const liveRows = enforceBountySubmitReadiness(toLiveConfirmRows(raw), { impactInventory: readImpactInventory(session) });
       recorder.confirmDecisions(liveRows);
       confirmProgress.rows = liveRows.length;
       confirmProgress.reproducedYes = liveRows.filter((row) => row.reproduced === "yes").length;
@@ -207,6 +209,7 @@ export async function runConfirm(
   // PoC) and merge rows a single fix neutralizes. This is the framework's call, not the
   // model's — "distinct bugs" is decided by execution, not by the model's grouping alone.
   let rows = readConfirmDecision(session);
+  const impactInventory = readImpactInventory(session);
   // Resume safety net: guarantee every prior-settled row survives even if the model
   // dropped it from confirm_decision.json (it was told to carry them verbatim).
   if (settled.length > 0) {
@@ -234,12 +237,23 @@ export async function runConfirm(
     });
     rows = mergeRowsByClusters(rows, equivalence.clusters);
   }
+  rows = enforceBountySubmitReadiness(rows, { impactInventory });
   await logger.artifact("confirm_equivalence.json", equivalence);
   await logger.artifact("confirm_decision.json", rows);
+  if (impactInventory) await logger.artifact(IMPACT_INVENTORY_FILE, impactInventory);
   await logger.artifact("confirm_transcript.json", { stoppedReason: result.stoppedReason, steps: result.steps });
   await logger.artifact(
     "confirm_report.md",
-    renderConfirmReport({ target: confirmCfg.targetName, provider: confirmCfg.provider, model: confirmCfg.auditModel, inputRunDir, provenance, priorFindings: priorFindings.length, rows }),
+    renderConfirmReport({
+      target: confirmCfg.targetName,
+      provider: confirmCfg.provider,
+      model: confirmCfg.auditModel,
+      inputRunDir,
+      provenance,
+      priorFindings: priorFindings.length,
+      rows,
+      ...(impactInventory ? { impactInventory } : {}),
+    }),
   );
   await logger.event("audit_confirm_done", {
     stoppedReason: result.stoppedReason,
@@ -529,6 +543,175 @@ function readConfirmDecision(session: AgentSession): ConfirmDecisionRow[] {
   return items.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item)).map(normalizeDecisionRow);
 }
 
+function readImpactInventory(session: AgentSession): ConfirmStructuredValue | undefined {
+  let entry = session.scratchFiles.get(IMPACT_INVENTORY_FILE);
+  if (entry === undefined) {
+    for (const [key, value] of session.scratchFiles) {
+      if (key.endsWith(`/${IMPACT_INVENTORY_FILE}`)) {
+        entry = value;
+        break;
+      }
+    }
+  }
+  return entry === undefined ? undefined : normalizeStructuredValue(entry);
+}
+
+type ConfirmDecisionLike = {
+  bug: string;
+  members?: string[];
+  reproduced?: string;
+  recommendation?: string;
+  humanGates?: string;
+  engagementProfile?: unknown;
+  adjudication?: unknown;
+};
+
+export function enforceBountySubmitReadiness<T extends ConfirmDecisionLike>(rows: T[], options: { impactInventory?: unknown } = {}): T[] {
+  return rows.map((row) => {
+    if (row.recommendation !== "submit-candidate") return row;
+    const blocker = bountySubmitBlocker(row, options.impactInventory);
+    if (!blocker) return row;
+    const humanGates = appendHumanGate(row.humanGates, `Framework blocked submit-candidate: ${blocker}`);
+    return { ...row, recommendation: "needs-human", humanGates } as T;
+  });
+}
+
+function bountySubmitBlocker(row: ConfirmDecisionLike, impactInventory: unknown): string | undefined {
+  if (!isBountyLikePolicy(row.engagementProfile, row.adjudication)) return undefined;
+  if (row.reproduced !== "yes") return "the row is not reproduced on the real target";
+  if (!impactInventoryCoversRow(row, impactInventory)) return `${IMPACT_INVENTORY_FILE} has no entry covering this reproduced bounty-like row`;
+  for (const gate of ["scope", "live_impact", "known_issue", "payout"] as const) {
+    const status = bountyGateStatus(row.adjudication, gate);
+    if (!isPassingBountyGateStatus(status, gate)) return `${gate} gate is ${status ? JSON.stringify(status) : "missing"}`;
+  }
+  return undefined;
+}
+
+function isBountyLikePolicy(engagementProfile: unknown, adjudication: unknown): boolean {
+  const profile = asRecord(engagementProfile);
+  const adjudicationRecord = asRecord(adjudication);
+  const policyKind = normalizedWord(stringValue(profile?.policy_kind ?? profile?.policyKind ?? profile?.kind));
+  if (policyKind.includes("bug_bounty") || policyKind.includes("bounty") || policyKind.includes("contest")) return true;
+  const requiredRaw = profile?.required_gates ?? profile?.requiredGates;
+  const requiredGates = Array.isArray(requiredRaw) ? requiredRaw.map((entry) => normalizedWord(stringValue(entry))) : [];
+  const adjudicationHasPayout = Boolean(adjudicationRecord && ("payout_estimate" in adjudicationRecord || "payoutEstimate" in adjudicationRecord));
+  if (policyKind === "custom" && (requiredGates.some((gate) => gate.includes("payout") || gate.includes("reward")) || adjudicationHasPayout)) return true;
+  return requiredGates.some((gate) => gate.includes("payout") || gate.includes("reward")) && adjudicationHasPayout;
+}
+
+function bountyGateStatus(adjudication: unknown, gate: "scope" | "live_impact" | "known_issue" | "payout"): string | undefined {
+  const record = asRecord(adjudication);
+  if (!record) return undefined;
+  const direct = directGateStatus(record, gate);
+  if (direct) return direct;
+  const gates = Array.isArray(record.gates) ? record.gates.map(asRecord).filter((entry): entry is Record<string, unknown> => Boolean(entry)) : [];
+  const needles = gateNeedles(gate);
+  for (const entry of gates) {
+    const id = normalizedWord(stringValue(entry.id ?? entry.key ?? entry.name ?? entry.gate));
+    if (needles.some((needle) => id.includes(needle))) {
+      const status = stringValue(entry.status ?? entry.result ?? entry.state);
+      if (status) return status;
+    }
+  }
+  return undefined;
+}
+
+function directGateStatus(record: Record<string, unknown>, gate: "scope" | "live_impact" | "known_issue" | "payout"): string | undefined {
+  const keys: Record<typeof gate, string[]> = {
+    scope: ["scope_status", "scopeStatus", "asset_status", "assetStatus", "eligibility_status", "eligibilityStatus"],
+    live_impact: ["live_impact_status", "liveImpactStatus", "funds_status", "fundsStatus", "exposure_status", "exposureStatus"],
+    known_issue: ["known_issue_status", "knownIssueStatus", "novelty_status", "noveltyStatus", "duplicate_status", "duplicateStatus"],
+    payout: ["payout_status", "payoutStatus", "reward_status", "rewardStatus"],
+  };
+  for (const key of keys[gate]) {
+    const status = stringValue(record[key]);
+    if (status) return status;
+  }
+  if (gate === "payout") {
+    const payout = asRecord(record.payout_estimate ?? record.payoutEstimate ?? record.reward_estimate ?? record.rewardEstimate);
+    const status = stringValue(payout?.status);
+    if (status) return status;
+  }
+  return undefined;
+}
+
+function gateNeedles(gate: "scope" | "live_impact" | "known_issue" | "payout"): string[] {
+  switch (gate) {
+    case "scope": return ["scope", "venue", "eligib", "asset"];
+    case "live_impact": return ["live", "impact", "fund", "exposure", "deployment"];
+    case "known_issue": return ["known", "novel", "duplicate", "disclos"];
+    case "payout": return ["payout", "reward", "collectible", "bounty"];
+  }
+}
+
+function isPassingBountyGateStatus(status: string | undefined, gate: "scope" | "live_impact" | "known_issue" | "payout"): boolean {
+  const normalized = normalizedWord(status);
+  if (!normalized) return false;
+  if (isNegativeGateStatus(normalized)) return false;
+  if (matchesStatus(normalized, ["pass", "passed", "satisfied", "confirmed", "established", "eligible", "ok", "yes"])) return true;
+  if (gate === "scope" && matchesStatus(normalized, ["in_scope", "eligible"])) return true;
+  if (gate === "live_impact" && matchesStatus(normalized, ["funded", "live", "live_funded", "affected_live_deployment"])) return true;
+  if (gate === "known_issue" && matchesStatus(normalized, ["novel", "not_duplicate", "not_disclosed", "no_known_issue", "not_known"])) return true;
+  if (gate === "payout" && matchesStatus(normalized, ["estimated", "collectible"])) return true;
+  return false;
+}
+
+function isNegativeGateStatus(normalized: string): boolean {
+  return matchesStatus(normalized, [
+    "fail",
+    "failed",
+    "unknown",
+    "needs_human",
+    "blocked",
+    "missing",
+    "unsettled",
+    "not_applicable",
+    "unfunded",
+    "not_funded",
+    "not_live",
+    "no_live",
+    "no_funds",
+    "not_novel",
+    "not_estimated",
+    "already_disclosed",
+    "duplicate",
+    "disclosed",
+  ]);
+}
+
+function matchesStatus(normalized: string, tokens: string[]): boolean {
+  return tokens.some((token) => normalized === token || normalized.startsWith(`${token}_`));
+}
+
+function impactInventoryCoversRow(row: ConfirmDecisionLike, impactInventory: unknown): boolean {
+  const inventory = asRecord(impactInventory);
+  const inventoryItems = inventory?.items;
+  const itemsRaw = Array.isArray(inventoryItems)
+    ? inventoryItems
+    : Array.isArray(impactInventory)
+      ? impactInventory
+      : [];
+  if (itemsRaw.length === 0) return false;
+  const rowMembers = new Set((row.members ?? []).map((member) => normalizedWord(member)).filter(Boolean));
+  const rowBug = normalizedWord(row.bug);
+  for (const raw of itemsRaw) {
+    const item = asRecord(raw);
+    if (!item) continue;
+    const bug = normalizedWord(stringValue(item.bug ?? item.title));
+    if (bug && rowBug && bug === rowBug) return true;
+    const members = Array.isArray(item.members) ? item.members.map((member) => normalizedWord(stringValue(member))).filter(Boolean) : [];
+    if (members.some((member) => rowMembers.has(member))) return true;
+  }
+  return false;
+}
+
+function appendHumanGate(existing: string | undefined, note: string): string {
+  const trimmed = existing?.trim();
+  if (!trimmed) return note;
+  if (trimmed.includes(note)) return trimmed;
+  return `${trimmed} ${note}`;
+}
+
 function normalizeDecisionRow(raw: Record<string, unknown>): ConfirmDecisionRow {
   const str = (value: unknown): string => (typeof value === "string" ? value.trim() : value === undefined || value === null ? "" : JSON.stringify(value));
   const members = Array.isArray(raw.members) ? raw.members.map((m) => str(m)).filter(Boolean) : str(raw.members) ? [str(raw.members)] : [];
@@ -587,6 +770,24 @@ function normalizeStructuredValue(value: unknown): ConfirmStructuredValue | unde
   }
   const normalized = sanitizeJsonValue(raw);
   return normalized && typeof normalized === "object" ? (normalized as ConfirmStructuredValue) : undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === "string"
+    ? value.trim()
+    : value === undefined || value === null
+      ? ""
+      : typeof value === "number" || typeof value === "boolean"
+        ? String(value)
+        : "";
+}
+
+function normalizedWord(value: unknown): string {
+  return stringValue(value).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
 }
 
 function sanitizeJsonValue(value: unknown, depth = 0): unknown {
@@ -695,6 +896,7 @@ function renderConfirmReport(input: {
   provenance: ConfirmProvenance;
   priorFindings: number;
   rows: ConfirmDecisionRow[];
+  impactInventory?: unknown;
 }): string {
   const out: string[] = [];
   out.push(`# Confirm results: ${input.target}`, "");
@@ -712,6 +914,16 @@ function renderConfirmReport(input: {
     out.push(`Fingerprinted at ${input.provenance.frozenAt}:`, "");
     for (const file of input.provenance.frozenFiles) out.push(`- \`${file.path}\` — sha256 \`${file.sha256}\` (${file.bytes} bytes)`);
     out.push("");
+  }
+  const bountyLikeRows = input.rows.filter((row) => isBountyLikePolicy(row.engagementProfile, row.adjudication));
+  if (input.impactInventory) {
+    out.push("## Impact / Exposure Inventory", "");
+    out.push(`- Artifact: \`${IMPACT_INVENTORY_FILE}\``);
+    out.push(`- Summary: ${formatStructuredSummary(input.impactInventory)}`);
+    out.push("");
+  } else if (bountyLikeRows.length > 0) {
+    out.push("## Impact / Exposure Inventory", "");
+    out.push(`_${IMPACT_INVENTORY_FILE} was not written; bounty-like reproduced rows cannot be treated as submit-ready until live exposure is established or explicitly ruled out._`, "");
   }
   out.push("## Decision sheet", "");
   if (input.rows.length === 0) {

@@ -884,6 +884,12 @@ test("prepare/confirm report files may cite public URLs while generated PoC file
     }, ctx);
     assert.match(confirm.observation, /wrote confirm_decision\.json/);
 
+    const impact = await tool("write").run({
+      path: "impact_inventory.json",
+      content: JSON.stringify({ items: [{ bug: "x", status: "unknown", blockers: ["needs live balance sizing"] }] }),
+    }, ctx);
+    assert.match(impact.observation, /wrote impact_inventory\.json/);
+
     const poc = await tool("write").run({
       path: "exploit.test.mjs",
       content: "fetch('https://mainnet.example/rpc');\n",

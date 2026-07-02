@@ -603,6 +603,7 @@ export function isReportFile(normalizedPath: string): boolean {
     || normalizedPath === "followup_scopes.json"
     || normalizedPath === "prepare_manifest.json"
     || normalizedPath === "confirm_decision.json"
+    || normalizedPath === "impact_inventory.json"
     || /^report_[a-z0-9_.-]+\.md$/.test(normalizedPath);
 }
 

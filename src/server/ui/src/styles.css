@@ -2160,7 +2160,35 @@ small {
 }
 
 .backlog-card {
-  align-items: flex-start;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+}
+
+.backlog-card .grow {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.backlog-card strong {
+  display: block;
+  line-height: 1.35;
+}
+
+.backlog-card small {
+  display: -webkit-box;
+  overflow: hidden;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.backlog-card .resource-actions {
+  align-self: start;
+  flex-wrap: nowrap;
 }
 
 .resource-list-more {
@@ -4045,6 +4073,15 @@ small {
 
   .candidate-row {
     grid-template-columns: 22px minmax(0, 1fr);
+  }
+
+  .backlog-card {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .backlog-card .resource-actions {
+    grid-column: 1;
+    justify-content: flex-start;
   }
 
   .activity-head {

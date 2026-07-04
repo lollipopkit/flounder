@@ -267,7 +267,7 @@ const ROUTES: Route[] = [
       region: "string? — audit: pinned region e.g. src/Foo.sol:120-180", scope: "string? — audit: scope id(s)", verifyFindings: "object|array? — audit: inline suspected finding(s) to confirm-or-refute by execution; project finding rows with id are linked back to that original row",
       allowMaterialDrift: "boolean? — expert override for verifyFindings when a newer Prepare run changed project materials after the selected findings were produced",
       regenerateReports: "boolean? — report: include findings that already have formal reports; selected findingIds are always regenerated",
-      scopeCoverageMode: "focused|standard|half|full|custom? — one-off coverage mode for this run; standard means audit until the project has 30 audited scopes",
+      scopeCoverageMode: "focused|standard|half|full|custom? — one-off coverage mode for this run; standard means audit until the project has 30 audited scopes, then pipeline Continue starts the next 30-scope batch after verify/confirm/report are settled",
       maxScopes: "number? — one-off scope cap for this run, or the custom target when scopeCoverageMode=custom", mapSteps: "number? — one-off map turn cap", digSteps: "number? — one-off per-scope dig turn cap",
       maxSteps: "number? — one-off global turn cap", digSamples: "number? — one-off samples per scope", digConcurrency: "number? — one-off parallel scopes",
       findingId: "number? — confirm/report: reproduce or report one selected finding",
@@ -2126,6 +2126,7 @@ async function runLaunch(c: Ctx): Promise<void> {
   }
   const prepared = applyPreparedWorkspaceIfNeeded(spec, runs);
   if (!prepared.ok) return sendJson(c.res, 400, { error: prepared.error });
+  promoteSettledPipelineCoverageBatch(spec, c.store, projectId, progress, currentResultRunIds, materialBoundary, runs);
   const materialDrift = verifyMaterialDrift(c.store, projectId, spec.verifyFindings, body.allowMaterialDrift === true);
   if (materialDrift) return sendJson(c.res, 409, materialDrift);
   if (coverageTargetReached(spec) && !(spec.verb === "run" && spec.pipeline)) {
@@ -2234,6 +2235,43 @@ function resetPipelineCoverageForUnknownInventory(spec: LaunchSpec): void {
     spec.coverageTarget = undefined;
     spec.maxScopes = undefined;
   }
+}
+
+function promoteSettledPipelineCoverageBatch(
+  spec: LaunchSpec,
+  store: MetadataStore,
+  projectId: number,
+  progress: Coverage,
+  currentResultRunIds: Set<number>,
+  materialBoundary: Record<string, unknown> | undefined,
+  runs: Array<Record<string, unknown>>,
+): void {
+  if (spec.verb !== "run" || !spec.pipeline) return;
+  if (spec.coverageMode !== "standard" || spec.coverageTarget !== 30 || spec.maxScopes !== 0) return;
+  if (progress.pending <= 0) return;
+  if (pipelinePostAuditWorkPending(store, projectId, currentResultRunIds, materialBoundary, runs)) return;
+  spec.maxScopes = Math.min(30, progress.pending);
+}
+
+function pipelinePostAuditWorkPending(
+  store: MetadataStore,
+  projectId: number,
+  currentResultRunIds: Set<number>,
+  materialBoundary: Record<string, unknown> | undefined,
+  runs: Array<Record<string, unknown>>,
+): boolean {
+  if (verifyWorklist(store, projectId, currentResultRunIds, materialBoundary).length > 0) return true;
+  const requiresRealTargetConfirmation = latestPrepareRequiresRealTargetConfirmation(runs);
+  if (requiresRealTargetConfirmation) {
+    const currentDecisions = currentConfirmDecisions(store.listConfirmDecisions(projectId).filter((row) => rowBelongsToCurrentMaterial(row, currentResultRunIds, materialBoundary)));
+    const submissionWorkKeys = new Set(currentDecisions.filter((row) => needsSubmissionReadinessWork(row)).flatMap(confirmDecisionMemberKeys));
+    const pending = store.pendingConfirmable(projectId)
+      .filter((row) => confirmableRunDir(row as unknown as Record<string, unknown>))
+      .filter((row) => rowBelongsToCurrentMaterial(row as unknown as Record<string, unknown>, currentResultRunIds, materialBoundary));
+    if (pending.length > 0 || submissionWorkKeys.size > 0) return true;
+  }
+  const reports = reportWorklist(store, projectId, [], currentResultRunIds, materialBoundary, requiresRealTargetConfirmation);
+  return Array.isArray(reports.findings) && reports.findings.length > 0;
 }
 
 function selectedFindingIds(body: Record<string, unknown>): number[] {

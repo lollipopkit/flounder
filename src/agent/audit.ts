@@ -228,6 +228,19 @@ export async function runAudit(
       const phase = await runPhase(verifyCfg, { mode: "verify", verifySeed: buildVerifySeed(finding), maxSteps: cfg.auditDigSteps }, { ctx: verifyCtx, cwd: verifyWorkspace.absolute });
       aggregatedSteps.push(...phase.steps);
       ingestFindingsFromScratch(verifySession);
+      const claimLabel = String(finding.title ?? "").slice(0, 90);
+      const missingVerdict = verifySession.findings.length === 0;
+      if (missingVerdict) {
+        if (!phaseFailureReason) phaseFailureReason = "error";
+        await logger.event("audit_verify_no_verdict", {
+          index: idx + 1,
+          of: toVerify.length,
+          claim: claimLabel,
+          stoppedReason: phase.stoppedReason,
+          steps: phase.steps.length,
+          commandRuns: verifySession.commandRuns.length,
+        });
+      }
       // Carry the original suspected finding's identity onto THIS claim's verdict so it flips that
       // row (status + PoC) rather than inserting a duplicate. The link is positional — claim N is
       // seeded from input finding N — so it survives the verify session renaming the title. Only the
@@ -252,8 +265,9 @@ export async function runAudit(
       for (const [scratchPath, content] of verifySession.scratchFiles) session.scratchFiles.set(`${verifyLabel}/${scratchPath}`, content);
       for (const produced of verifySession.findings) aggregated.push(produced);
       recorder.findings(verifySession.findings, logger.runDir, `verify ${idx + 1}/${toVerify.length}`); // persist this verdict live (flips the original when originId is set)
-      recorder.runScopes(idx + 1, toVerify.length); // live progress for the UI
-      await logger.event("audit_verify_done", { index: idx + 1, of: toVerify.length, claim: String(finding.title ?? "").slice(0, 90), produced: verifySession.findings.length });
+      recorder.runScopes(missingVerdict ? idx : idx + 1, toVerify.length); // live progress for the UI; no verdict means this claim is not complete
+      await logger.event("audit_verify_done", { index: idx + 1, of: toVerify.length, claim: claimLabel, produced: verifySession.findings.length, stoppedReason: phase.stoppedReason });
+      if (missingVerdict && phase.stoppedReason === "error" && phase.steps.length === 0 && verifySession.commandRuns.length === 0) break;
     }
     aggregated.forEach((produced, i) => {
       produced.id = `f${i + 1}`;

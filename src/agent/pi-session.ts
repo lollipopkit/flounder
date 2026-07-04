@@ -68,6 +68,13 @@ export function resolveFinalizePromptTimeoutMs(env: NodeJS.ProcessEnv = process.
   return Math.max(1, Math.floor(parsed));
 }
 
+export function verifyHasRequiredVerdict(session: ToolContext["session"]): boolean {
+  // In VERIFY mode an empty [] is not a valid clean-audit sentinel: the worker owes
+  // one verdict for the seeded claim, either confirmed by an executable PoC or
+  // refuted with concrete mitigating evidence.
+  return scratchHasFindings(session);
+}
+
 export async function promptWithWallClockAbort(
   session: { prompt: (message: string) => Promise<unknown>; abort: () => unknown },
   prompt: string,
@@ -194,6 +201,7 @@ export async function runAuditSession(input: {
   let finalizing = false;
   let finalizeTurns = 0;
   let finalizeAborted = false;
+  let verifyMissingVerdict = false;
   // Confirm-mode resume: checkpoint the model's decision sheet to the run dir each turn,
   // so an interrupted `flounder confirm` keeps the rows reproduced so far (raw; the end-of-run
   // write replaces them with the consolidated set).
@@ -339,6 +347,23 @@ export async function runAuditSession(input: {
       await input.logger.event("audit_map_finalize_done", { scopes: readScratchScopes(input.ctx.session).length });
       return;
     }
+    if (input.verify) {
+      if (verifyHasRequiredVerdict(input.ctx.session)) return;
+      finalizing = true;
+      await input.logger.event("audit_verify_finalize", { reason: "no verify verdict written before stop" });
+      try {
+        await runFinalizePrompt(VERIFY_FINALIZE_PROMPT, "audit_verify_finalize_timeout");
+      } catch {
+        // best-effort
+      }
+      const hasVerdict = verifyHasRequiredVerdict(input.ctx.session);
+      await input.logger.event("audit_verify_finalize_done", { hasVerdict, hasArtifact: scratchHasFindingsArtifact(input.ctx.session) });
+      if (!hasVerdict) {
+        verifyMissingVerdict = true;
+        await input.logger.event("audit_verify_no_verdict", { reason: "verify requires one confirmed or REFUTED finding for the seeded claim" });
+      }
+      return;
+    }
     if (scratchHasFindingsArtifact(input.ctx.session)) return;
     finalizing = true;
     await input.logger.event("audit_findings_finalize", { reason: "no findings written before stop" });
@@ -383,7 +408,7 @@ export async function runAuditSession(input: {
       // budgetAborted: fall through to the forced finalize below
     }
     await finalizeIfEmpty();
-    return { steps, stoppedReason: budgetAborted ? "step-budget" : "finished" };
+    return { steps, stoppedReason: verifyMissingVerdict ? "error" : budgetAborted ? "step-budget" : "finished" };
   } finally {
     unsubscribe();
     await shutdownSession(session);
@@ -666,6 +691,11 @@ ${MAP_GRANULARITY_RULES}`
 const MAP_FINALIZE_PROMPT = `Your exploration budget is spent. Do NOT read, grep, or run anything else. Based ONLY on what you have already examined, WRITE scopes.json now at the workspace root as your very next action — call the write tool once with a JSON array of objects {"id","obligation","region":"file:lines","lenses":[...],"exposure","difficulty","score","why"} covering every concrete scope you identified under the three general lenses: spec conditions, value/asset flow, and trusted-but-unbound inputs. Score each scope with an integer 0-100 ordering signal; use the full scale to distinguish similarly exposed scopes and do NOT compress into 0-10. If a scope covers multiple independent gates, proof boundaries, invariants, or attacker-controlled inputs, split it before writing. Partial but broad beats empty; do not collapse the inventory into a shortlist or a 30-scope dig batch. After writing, emit {"done": true}. Output only the write tool call.`;
 
 export const FINDINGS_FINALIZE_PROMPT = `Your budget is spent. Do NOT read, grep, or run anything else. Based ONLY on the analysis and command results you have already produced, WRITE findings.json now at the workspace root as your very next action — call the write tool once with ONLY actionable findings: UNMET obligations, concrete suspected bugs, and confirmed bugs that cite an already-passing purpose=confirm command_id. Do NOT include discharged/safe/no-issue obligations, ranked shortlist notes, or obligation ledgers. If you found no actionable bug, write [] exactly. Do NOT invent a confirmation and DO NOT mark anything confirmed by assertion. After writing, emit {"done": true}. Output only the write tool call.`;
+
+export const VERIFY_FINALIZE_PROMPT = `Your VERIFY budget is spent. Do NOT read, grep, or run anything else. Based ONLY on the analysis and command results you have already produced, write findings.json now with exactly ONE verdict for the seeded claim if the existing evidence supports it:
+- If an already-passing purpose=confirm command proves the bug, write one confirmed finding that cites that command_id and includes any fix_patch you already derived.
+- If the code trace or command results prove the claim is false or mitigated, write one severity "info" finding whose title starts "REFUTED:" and cite the exact mitigating evidence.
+If the existing evidence does NOT support either verdict, do NOT write [] and do NOT invent a verdict; emit {"done": true} so the driver marks VERIFY incomplete. After writing a supported verdict, emit {"done": true}.`;
 
 const PREPARE_FINALIZE_PROMPT = `Your budget is spent. Do NOT fetch or run anything else. WRITE prepare_manifest.json now at the workspace root as your very next action — call the write tool once with an object: {"clue","posture","match_deployed"(bool),"scope_declaration":"<where the in-scope set came from: the audited addresses and/or the project's own scope doc>","real_target":{"requires_confirmation":(bool),"mode":"deployed-contract|published-artifact|deployed-service|source-only|unknown","reason":"<why real-target confirmation is or is not required>","ground_truth":[{"kind":"chain|package|service|repo|other","network":"<e.g. ethereum-mainnet, n/a if source-only>","chain_id":<number|null>,"address":"<contract/address or empty if n/a>","role":"proxy|implementation|verifier|registry|asset|package|service|source","block":"<block/tag/version/latest/n/a>","source_match":"matched|unverified|n/a","evidence":"<source of this ground-truth record>","staged_component":"<component id/path>"}],"confirm_guidance":{"required":(bool),"allowed_network_actions":"none|read-only|read-and-local-fork","recommended_method":"<local source tests, package replay, local fork at block..., etc.>","not_required_reason":"<only when required=false>"}},"components":[{"role":"target|dependency|implementation|verifier|other","identity":"<address / package / path / etc.>","platform":"<chain / registry / host, or 'none'>","revision":"<block / version / commit / digest>","source":"<verified|published|repo@commit|unverified>","staged_path":"<workspace-relative path/glob of this component's code>","in_scope":(bool),"scope_basis":"deployed-match|project-scope-doc|first-party|dependency|off-deployment-boundary","match":"matched|unverified|n/a","match_evidence"}],"offscope":[{"kind":"circuit|spec|docs|prior-audit|other","resolved":(bool),"where","note"}],"gaps":[...],"answer_firewall":"clean|flagged: ...","notes"}. Record honestly: a deployed component you could not match is "unverified"; a non-deployed one is "n/a" with its source origin pinned; in_scope=true for the deployment-matched target / project-declared in-scope / first-party code, false for third-party deps and off-deployment trust boundaries (a FACT from deployment + the project's scope, not a guess about bugs). real_target is mandatory: if the later confirm must use a chain fork or published deployment, list the exact network/chain_id/address/role ground truth; if source-only is enough, set requires_confirmation=false and explain why. Every staged first-party source/package that the sealed audit should read must appear in components with a staged_path and revision/version/digest; staged docs/specs may appear in components or offscope, and missing docs/specs should be gaps/caveats rather than blockers. An empty components array is not acceptable after files were staged. Anything you could not find is a gap, not a guess. After writing, emit {"done": true}. Output only the write tool call.`;
 

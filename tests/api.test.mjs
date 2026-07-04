@@ -382,7 +382,7 @@ test("api: full coverage continues prepared pending inventory without a scope ca
   });
 });
 
-test("api: standard coverage lets pipeline continue after 30 audited scopes but still allows explicit scopes", async () => {
+test("api: standard pipeline continue opens the next 30-scope batch after the first batch is settled", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();
     const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -396,7 +396,7 @@ test("api: standard coverage lets pipeline continue after 30 audited scopes but 
     try {
       store.upsertScopes(created.id, [
         ...Array.from({ length: 30 }, (_, i) => ({ scopeId: `audited-${i}`, title: `Audited ${i}`, status: "audited", score: 30 - i })),
-        ...Array.from({ length: 5 }, (_, i) => ({ scopeId: `pending-${i}`, title: `Pending ${i}`, status: "pending", score: 5 - i })),
+        ...Array.from({ length: 35 }, (_, i) => ({ scopeId: `pending-${i}`, title: `Pending ${i}`, status: "pending", score: 35 - i })),
       ]);
     } finally {
       store.close();
@@ -409,7 +409,7 @@ test("api: standard coverage lets pipeline continue after 30 audited scopes but 
     assert.equal(pipelineSpec.pipeline, true);
     assert.equal(pipelineSpec.coverageMode, "standard");
     assert.equal(pipelineSpec.coverageTarget, 30);
-    assert.equal(pipelineSpec.maxScopes, 0);
+    assert.equal(pipelineSpec.maxScopes, 30);
     assert.equal(pipelineSpec.sandboxConfirmNetwork, "enabled");
 
     const continued = await post(`/api/projects/${created.uuid}/runs`, { verb: "run" });
@@ -423,6 +423,50 @@ test("api: standard coverage lets pipeline continue after 30 audited scopes but 
     const spec = JSON.parse(job.spec_json);
     assert.equal(spec.scope, "pending-0");
     assert.equal(spec.maxScopes, 30);
+  });
+});
+
+test("api: standard pipeline continue finishes pending verify work before opening the next scope batch", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const created = await json(await post("/api/projects", {
+      name: "standard-cumulative-pending-verify",
+      sourcePaths: ["./src"],
+      config: { scopeCoverageMode: "standard" },
+    }));
+
+    const store = MetadataStore.openForOutput(out);
+    try {
+      store.upsertScopes(created.id, [
+        ...Array.from({ length: 30 }, (_, i) => ({ scopeId: `audited-${i}`, title: `Audited ${i}`, status: "audited", score: 30 - i })),
+        ...Array.from({ length: 5 }, (_, i) => ({ scopeId: `pending-${i}`, title: `Pending ${i}`, status: "pending", score: 5 - i })),
+      ]);
+      const runId = store.startRun({ projectId: created.id, kind: "run", runDir: path.join(out, "standard-cumulative-pending-verify-run") });
+      store.upsertFindings(created.id, runId, [
+        {
+          findingKey: "ksuspected",
+          title: "Needs execution verification",
+          location: "src/A.sol:1",
+          severity: "high",
+          status: "suspected",
+          evidence: "candidate",
+        },
+      ]);
+      store.finishRun(runId, "done");
+    } finally {
+      store.close();
+    }
+
+    const pipeline = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run", pipeline: true }));
+    assert.equal(pipeline.queued, true);
+    const pipelineJob = (await json(await fetch(base + "/api/jobs/" + pipeline.jobId))).job;
+    const pipelineSpec = JSON.parse(pipelineJob.spec_json);
+    assert.equal(pipelineSpec.pipeline, true);
+    assert.equal(pipelineSpec.coverageMode, "standard");
+    assert.equal(pipelineSpec.coverageTarget, 30);
+    assert.equal(pipelineSpec.maxScopes, 0);
+    assert.equal(pipelineSpec.sandboxConfirmNetwork, "enabled");
   });
 });
 
@@ -792,6 +836,17 @@ test("api: verify launch links project finding rows back to the original finding
     assert.equal(spec.verb, "audit");
     assert.equal(spec.verifyFindings[0].id, finding.id);
     assert.equal(spec.verifyFindings[0].originId, finding.id);
+
+    const launchedById = await json(await post(`/api/projects/${created.uuid}/runs`, {
+      verb: "audit",
+      verifyFindings: [{ id: finding.id }],
+    }));
+    const idJob = (await json(await fetch(base + "/api/jobs/" + launchedById.jobId))).job;
+    const idSpec = JSON.parse(idJob.spec_json);
+    assert.equal(idSpec.verifyFindings[0].id, finding.id);
+    assert.equal(idSpec.verifyFindings[0].originId, finding.id);
+    assert.equal(idSpec.verifyFindings[0].title, "Proof input is not bound");
+    assert.equal(idSpec.verifyFindings[0].location, "src/Rollup.sol:44");
   });
 });
 
@@ -838,6 +893,8 @@ test("api: verify launch rejects findings produced before a newer prepare run", 
     const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
     const spec = JSON.parse(job.spec_json);
     assert.equal(spec.verifyFindings[0].originId, findingId);
+    assert.equal(spec.verifyFindings[0].finding_key, "stale-suspected-bug");
+    assert.equal(spec.verifyFindings[0].title, "Stale proof input is not bound");
   });
 });
 

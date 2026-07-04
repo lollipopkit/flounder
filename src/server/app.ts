@@ -267,7 +267,7 @@ const ROUTES: Route[] = [
       region: "string? — audit: pinned region e.g. src/Foo.sol:120-180", scope: "string? — audit: scope id(s)", verifyFindings: "object|array? — audit: inline suspected finding(s) to confirm-or-refute by execution; project finding rows with id are linked back to that original row",
       allowMaterialDrift: "boolean? — expert override for verifyFindings when a newer Prepare run changed project materials after the selected findings were produced",
       regenerateReports: "boolean? — report: include findings that already have formal reports; selected findingIds are always regenerated",
-      scopeCoverageMode: "focused|standard|half|full|custom? — one-off coverage mode for this run; standard means audit until the project has 30 audited scopes",
+      scopeCoverageMode: "focused|standard|half|full|custom? — one-off coverage mode for this run; standard means audit until the project has 30 audited scopes, then pipeline Continue starts the next 30-scope batch after verify/confirm/report are settled",
       maxScopes: "number? — one-off scope cap for this run, or the custom target when scopeCoverageMode=custom", mapSteps: "number? — one-off map turn cap", digSteps: "number? — one-off per-scope dig turn cap",
       maxSteps: "number? — one-off global turn cap", digSamples: "number? — one-off samples per scope", digConcurrency: "number? — one-off parallel scopes",
       findingId: "number? — confirm/report: reproduce or report one selected finding",
@@ -2102,7 +2102,7 @@ async function runLaunch(c: Ctx): Promise<void> {
   const currentResultRunIds = runIdSet(currentResultRuns(currentRuns, scopeBoundary));
   const scopeView = currentScopeView(c.store, projectId, currentRuns, undefined, scopeBoundary, !materialBoundary);
   const progress = scopeView.hasInventory ? scopeView.progress : emptyProgress();
-  const spec = launchSpec(project, body, c.out, profile, progress, phaseProfiles);
+  const spec = launchSpec(c.store, project, body, c.out, profile, progress, phaseProfiles);
   if (spec.verb === "run") {
     if (spec.sourcePaths.length > 0) {
       applyProjectSourceDefaults(spec, project);
@@ -2126,6 +2126,7 @@ async function runLaunch(c: Ctx): Promise<void> {
   }
   const prepared = applyPreparedWorkspaceIfNeeded(spec, runs);
   if (!prepared.ok) return sendJson(c.res, 400, { error: prepared.error });
+  promoteSettledPipelineCoverageBatch(spec, c.store, projectId, progress, currentResultRunIds, materialBoundary, runs);
   const materialDrift = verifyMaterialDrift(c.store, projectId, spec.verifyFindings, body.allowMaterialDrift === true);
   if (materialDrift) return sendJson(c.res, 409, materialDrift);
   if (coverageTargetReached(spec) && !(spec.verb === "run" && spec.pipeline)) {
@@ -2234,6 +2235,43 @@ function resetPipelineCoverageForUnknownInventory(spec: LaunchSpec): void {
     spec.coverageTarget = undefined;
     spec.maxScopes = undefined;
   }
+}
+
+function promoteSettledPipelineCoverageBatch(
+  spec: LaunchSpec,
+  store: MetadataStore,
+  projectId: number,
+  progress: Coverage,
+  currentResultRunIds: Set<number>,
+  materialBoundary: Record<string, unknown> | undefined,
+  runs: Array<Record<string, unknown>>,
+): void {
+  if (spec.verb !== "run" || !spec.pipeline) return;
+  if (spec.coverageMode !== "standard" || spec.coverageTarget !== 30 || spec.maxScopes !== 0) return;
+  if (progress.pending <= 0) return;
+  if (pipelinePostAuditWorkPending(store, projectId, currentResultRunIds, materialBoundary, runs)) return;
+  spec.maxScopes = Math.min(30, progress.pending);
+}
+
+function pipelinePostAuditWorkPending(
+  store: MetadataStore,
+  projectId: number,
+  currentResultRunIds: Set<number>,
+  materialBoundary: Record<string, unknown> | undefined,
+  runs: Array<Record<string, unknown>>,
+): boolean {
+  if (verifyWorklist(store, projectId, currentResultRunIds, materialBoundary).length > 0) return true;
+  const requiresRealTargetConfirmation = latestPrepareRequiresRealTargetConfirmation(runs);
+  if (requiresRealTargetConfirmation) {
+    const currentDecisions = currentConfirmDecisions(store.listConfirmDecisions(projectId).filter((row) => rowBelongsToCurrentMaterial(row, currentResultRunIds, materialBoundary)));
+    const submissionWorkKeys = new Set(currentDecisions.filter((row) => needsSubmissionReadinessWork(row)).flatMap(confirmDecisionMemberKeys));
+    const pending = store.pendingConfirmable(projectId)
+      .filter((row) => confirmableRunDir(row as unknown as Record<string, unknown>))
+      .filter((row) => rowBelongsToCurrentMaterial(row as unknown as Record<string, unknown>, currentResultRunIds, materialBoundary));
+    if (pending.length > 0 || submissionWorkKeys.size > 0) return true;
+  }
+  const reports = reportWorklist(store, projectId, [], currentResultRunIds, materialBoundary, requiresRealTargetConfirmation);
+  return Array.isArray(reports.findings) && reports.findings.length > 0;
 }
 
 function selectedFindingIds(body: Record<string, unknown>): number[] {
@@ -3793,7 +3831,7 @@ function verifyWorklist(store: MetadataStore, projectId: number, currentResultRu
       if (!fromStart || row.confirm_status != null) return false;
       return status === "confirmed-executable" || status === "confirmed-differential";
     })
-    .map((row) => normalizeProjectVerifyFindings(findingDetailRow(row)));
+    .map((row) => normalizeProjectVerifyFindings(store, projectId, findingDetailRow(row)));
 }
 
 async function daemonJobStatus(c: Ctx): Promise<void> {
@@ -4155,7 +4193,7 @@ function phaseProviderProfiles(project: Record<string, unknown>, store: Metadata
   return out;
 }
 
-function launchSpec(project: Record<string, unknown>, body: Record<string, unknown>, out: string, profile?: ProviderProfile, progress?: Coverage, phaseProfiles: PhaseProfiles = {}): LaunchSpec {
+function launchSpec(store: MetadataStore, project: Record<string, unknown>, body: Record<string, unknown>, out: string, profile?: ProviderProfile, progress?: Coverage, phaseProfiles: PhaseProfiles = {}): LaunchSpec {
   const cfg = (safeParse(project.config_json) as Record<string, unknown>) ?? {};
   const overrides = (body.overrides as Record<string, unknown>) ?? {};
   const configOverrides = (overrides.config as Record<string, unknown>) ?? {};
@@ -4241,7 +4279,7 @@ function launchSpec(project: Record<string, unknown>, body: Record<string, unkno
     region: str(body.region),
     scope: str(body.scope),
     scopeNote: str(merged.scopeNote), // a project may store a default focus note in its config
-    ...(body.verifyFindings !== undefined ? { verifyFindings: normalizeProjectVerifyFindings(body.verifyFindings) } : {}),
+    ...(body.verifyFindings !== undefined ? { verifyFindings: normalizeProjectVerifyFindings(store, Number(project.id), body.verifyFindings) } : {}),
     inputRunDir: str(body.inputRunDir),
     clue: str(body.clue),
     posture: str(body.posture),
@@ -4251,12 +4289,16 @@ function launchSpec(project: Record<string, unknown>, body: Record<string, unkno
   };
 }
 
-function normalizeProjectVerifyFindings(input: unknown): unknown {
-  if (Array.isArray(input)) return input.map(normalizeProjectVerifyFindings);
+function normalizeProjectVerifyFindings(store: MetadataStore, projectId: number, input: unknown): unknown {
+  if (Array.isArray(input)) return input.map((item) => normalizeProjectVerifyFindings(store, projectId, item));
   if (!input || typeof input !== "object") return input;
   const row = input as Record<string, unknown>;
   if (typeof row.originId === "number" || typeof row.origin_id === "number") return input;
   if (typeof row.id !== "number" || !Number.isFinite(row.id)) return input;
+  const finding = store.getFinding(row.id);
+  if (finding && Number(finding.project_id) === projectId) {
+    return { ...findingDetailRow(finding), ...row, originId: row.id };
+  }
   return { ...row, originId: row.id };
 }
 

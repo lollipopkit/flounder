@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -757,6 +757,41 @@ test("read, write, edit, and bash operate on loaded material and the copied work
   }
 });
 
+test("bash blocks build when pinned toolchain does not match sandbox image", async () => {
+  const dir = await tempDir();
+  const oldPath = process.env.PATH;
+  try {
+    const target = path.join(dir, "target");
+    const binDir = path.join(dir, "bin");
+    await mkdir(target, { recursive: true });
+    await mkdir(binDir, { recursive: true });
+    await writeFile(path.join(target, "Scarb.toml"), "[package]\nname = \"audit_target\"\nversion = \"0.1.0\"\n");
+    await writeFile(path.join(target, ".tool-versions"), "scarb 2.12.0\n");
+    const fakeScarb = path.join(binDir, "scarb");
+    await writeFile(fakeScarb, "#!/usr/bin/env bash\nif [ \"$1\" = \"--version\" ]; then echo 'scarb 2.19.0'; exit 0; fi\necho 'unexpected scarb command' >&2\nexit 0\n");
+    await chmod(fakeScarb, 0o755);
+    process.env.PATH = `${binDir}${path.delimiter}${oldPath ?? ""}`;
+
+    const cfg = defaultConfig();
+    cfg.sourcePaths = [target];
+    cfg.sandboxBackend = "host";
+    cfg.sandboxAllowHostFallback = true;
+    cfg.auditPrepare = true;
+    cfg.auditPrepareTimeoutMs = 10_000;
+    const logger = await tempLogger(dir);
+    const ctx = { cfg, source: [], corpus: [], memory: new ProjectMemory(path.join(dir, "memory.jsonl")), logger, session: newSession() };
+
+    const run = await tool("bash").run({ cmd: "scarb build", purpose: "build" }, ctx);
+    assert.match(run.observation, /sandbox image\/toolchain preflight failed/);
+    assert.match(run.observation, /scarb expected 2\.12\.0, actual scarb 2\.19\.0/);
+    assert.match(run.observation, /resource_requests\.json/);
+    assert.equal(ctx.session.commandRuns.length, 0);
+  } finally {
+    process.env.PATH = oldPath;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("confirmed executable commands must link model-written tests to pristine target source", async () => {
   const dir = await tempDir();
   try {
@@ -887,6 +922,41 @@ test("failed bash command events include an output preview for the UI", async ()
     const commandEvent = events.find((event) => event.kind === "audit_command_run");
     assert.equal(commandEvent.exitCode, 1);
     assert.match(commandEvent.output, /VISIBLE_FAILURE_REASON/);
+    assert.ok(commandEvent.output.length <= 2600, "event output preview should stay bounded");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("failed bash command previews preserve early diagnostics and late context", async () => {
+  const dir = await tempDir();
+  try {
+    const cfg = defaultConfig();
+    cfg.sourcePaths = [fixtures];
+    const logger = await tempLogger(dir);
+    const ctx = { cfg, source: [], corpus: [], memory: new ProjectMemory(path.join(dir, "memory.jsonl")), logger, session: newSession() };
+
+    await tool("write").run({
+      path: "noisy_compiler_failure.test.mjs",
+      content: [
+        "import test from 'node:test';",
+        "test('noisy compiler output', () => {",
+        "  console.log('EARLY_COMPILE_ERROR: unresolved Cairo symbol');",
+        "  for (let i = 0; i < 220; i += 1) console.log('warning ' + i + ': workspace manifest profile output');",
+        "  console.log('LATE_COMPILER_CONTEXT: Scarb exited with error');",
+        "  throw new Error('NOISY_COMPILER_FAIL');",
+        "});",
+      ].join("\n"),
+    }, ctx);
+    const run = await tool("bash").run({ cmd: "node --test noisy_compiler_failure.test.mjs", purpose: "confirm", success_patterns: ["NEVER_SEEN"] }, ctx);
+    assert.match(run.observation, /EARLY_COMPILE_ERROR/);
+    assert.match(run.observation, /LATE_COMPILER_CONTEXT/);
+
+    const events = (await readFile(logger.eventsPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const commandEvent = events.find((event) => event.kind === "audit_command_run");
+    assert.equal(commandEvent.exitCode, 1);
+    assert.match(commandEvent.output, /EARLY_COMPILE_ERROR/);
+    assert.match(commandEvent.output, /LATE_COMPILER_CONTEXT/);
     assert.ok(commandEvent.output.length <= 2600, "event output preview should stay bounded");
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -1034,6 +1104,16 @@ test("baseline integrity: the model cannot modify the target source under audit"
     // A new test file is fine.
     const newFile = await tool("write").run({ path: "exploit_test.rs", content: "// poc\n" }, ctx);
     assert.match(newFile.observation, /wrote exploit_test\.rs/);
+
+    const harnessManifest = await tool("write").run({ path: "verify_poc/Scarb.toml", content: "[package]\nname = \"verify_poc\"\nversion = \"0.1.0\"\n" }, ctx);
+    assert.match(harnessManifest.observation, /wrote verify_poc\/Scarb\.toml/);
+
+    const scratchHarnessManifest = await tool("write").run({ path: ".tmp/verify_poc/Scarb.toml", content: "[package]\nname = \"verify_poc\"\nversion = \"0.1.0\"\n" }, ctx);
+    assert.match(scratchHarnessManifest.observation, /wrote \.tmp\/verify_poc\/Scarb\.toml/);
+
+    const topLevelManifest = await tool("write").run({ path: "Scarb.toml", content: "[package]\nname = \"production_shim\"\nversion = \"0.1.0\"\n" }, ctx);
+    assert.match(topLevelManifest.observation, /blocked/i);
+    assert.match(topLevelManifest.observation, /production source files must stay pristine/i);
 
     session.baselineFiles.add("contracts/contracts/Proxy.sol");
     const newNativeTest = await tool("write").run({ path: "contracts/test/hidden_upgrade_target_hash.spec.ts", content: "// poc\n" }, ctx);

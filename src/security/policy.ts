@@ -73,15 +73,28 @@ export function analyzeReproductionCommandSafety(command: StructuredReproduction
 }
 
 export function analyzeAgentBashCommandSafety(command: StructuredReproductionCommand): CommandSafetyDecision {
-  const baseDecision = analyzeStructuredCommandBaseSafety(command);
+  const normalized = unwrapSafeEnvCommand(command);
+  if (!normalized) {
+    return {
+      blocked: true,
+      reason: "Blocked by flounder guardrail: env wrappers may only set simple local environment variables before an allowed command.",
+    };
+  }
+
+  const baseDecision = analyzeStructuredCommandBaseSafety(normalized);
   if (baseDecision.blocked) return baseDecision;
 
-  const program = command.program.trim();
-  const args = command.args.map((arg) => String(arg));
+  const program = normalized.program.trim();
+  const args = normalized.args.map((arg) => String(arg));
   const workspaceDecision = analyzeWorkspacePathSafety(args);
   if (workspaceDecision.blocked) return workspaceDecision;
 
-  if (isAllowedLocalTestCommand(program, args) || isAllowedLocalInspectionCommand(program, args) || isAllowedBuildCommand(program, args)) {
+  if (
+    isAllowedLocalTestCommand(program, args) ||
+    isAllowedLocalInspectionCommand(program, args) ||
+    isAllowedBuildCommand(program, args) ||
+    isAllowedWorkspaceSetupCommand(program, args)
+  ) {
     return { blocked: false };
   }
 
@@ -99,7 +112,9 @@ export function analyzeAgentBashCommandSafety(command: StructuredReproductionCom
  * by printing a success pattern from a file it wrote itself.
  */
 export function isAgentConfirmCommand(command: StructuredReproductionCommand): boolean {
-  return isAllowedLocalTestCommand(command.program.trim(), command.args.map((arg) => String(arg)));
+  const normalized = unwrapSafeEnvCommand(command);
+  if (!normalized) return false;
+  return isAllowedLocalTestCommand(normalized.program.trim(), normalized.args.map((arg) => String(arg)));
 }
 
 /**
@@ -110,7 +125,9 @@ export function isAgentConfirmCommand(command: StructuredReproductionCommand): b
  * confirmation-eligible — a build can never upgrade a finding (only isAgentConfirmCommand can).
  */
 export function isAgentBuildCommand(command: StructuredReproductionCommand): boolean {
-  return isAllowedBuildCommand(command.program.trim(), command.args.map((arg) => String(arg)));
+  const normalized = unwrapSafeEnvCommand(command);
+  if (!normalized) return false;
+  return isAllowedBuildCommand(normalized.program.trim(), normalized.args.map((arg) => String(arg)));
 }
 
 /**
@@ -210,6 +227,32 @@ function analyzeStructuredCommandBaseSafety(command: StructuredReproductionComma
   return { blocked: false };
 }
 
+function unwrapSafeEnvCommand(command: StructuredReproductionCommand): StructuredReproductionCommand | undefined {
+  const program = command.program.trim();
+  if (program.toLowerCase() !== "env") return command;
+  const args = command.args.map((arg) => String(arg));
+  let index = 0;
+  for (; index < args.length; index += 1) {
+    const arg = args[index] ?? "";
+    if (!isSafeEnvAssignment(arg)) break;
+  }
+  const wrappedProgram = args[index];
+  if (!wrappedProgram) return undefined;
+  if (wrappedProgram.includes("/") || wrappedProgram.includes("\\") || /[\s;&|`$<>]/.test(wrappedProgram)) return undefined;
+  return { program: wrappedProgram, args: args.slice(index + 1) };
+}
+
+function isSafeEnvAssignment(arg: string): boolean {
+  const match = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(arg);
+  if (!match) return false;
+  const value = match[2] ?? "";
+  if (/[\0\r\n;&|`<>]/.test(value)) return false;
+  if (looksLikeRpcEnvReference(value)) return false;
+  if (looksLikeRemoteUrl(value) && !isLocalUrl(value)) return false;
+  if (looksLikePathEscape(value)) return false;
+  return true;
+}
+
 function analyzeWorkspacePathSafety(args: string[]): CommandSafetyDecision {
   for (const arg of args) {
     const value = valueAfterEquals(arg) ?? arg;
@@ -307,7 +350,7 @@ function isAllowedLocalTestCommand(program: string, args: string[]): boolean {
   if (name === "cargo") return cargoSubcommand(args) === "test";
   if (name === "go") return first === "test";
   if (name === "npm") return first === "test" || (first === "run" && second === "test");
-  if (name === "pnpm" || name === "yarn" || name === "bun") return first === "test" || (first === "run" && second === "test") || (first === "hardhat" && second === "test");
+  if (name === "pnpm" || name === "yarn" || name === "bun") return first === "test" || (first === "run" && second === "test") || ((first === "hardhat" || first === "blueprint") && second === "test");
   if (name === "node") return first === "--test";
   if (name === "python" || name === "python3") return first === "-m" && (second === "pytest" || second === "unittest");
   if (name === "pytest") return true;
@@ -317,7 +360,10 @@ function isAllowedLocalTestCommand(program: string, args: string[]): boolean {
   if (name === "mvn") return first === "test" || first === "-q" && second === "test";
   if (name === "gradle" || name === "gradlew") return args.some((arg) => arg.toLowerCase() === "test");
   if (name === "forge") return first === "test";
-  if (name === "npx") return first === "hardhat" && second === "test";
+  if (name === "scarb") return scarbSubcommand(args) === "test";
+  if (name === "snforge") return first === "test";
+  if (name === "blueprint") return first === "test";
+  if (name === "npx") return (first === "hardhat" || first === "blueprint") && second === "test";
   return false;
 }
 
@@ -336,9 +382,15 @@ function isAllowedBuildCommand(program: string, args: string[]): boolean {
   if (name === "cargo") return ["build", "fetch", "check", "generate-lockfile", "vendor", "update"].includes(cargoSubcommand(args) ?? "");
   if (name === "go") return first === "build" || first === "mod"; // go build / go mod download|tidy|vendor
   if (name === "npm") return ["install", "ci", "i"].includes(first ?? "");
-  if (name === "pnpm" || name === "yarn" || name === "bun") return ["install", "i", "ci"].includes(first ?? "") || (name === "yarn" && args.length === 0);
+  if (name === "pnpm" || name === "yarn" || name === "bun") return ["install", "i", "ci"].includes(first ?? "") || (name === "yarn" && args.length === 0) || (first === "blueprint" && second === "build");
   if (name === "pip" || name === "pip3") return first === "install";
-  if (name === "python" || name === "python3") return first === "-m" && second === "pip" && (lower[2] === "install");
+  if (name === "python" || name === "python3") {
+    return first === "-m" && (
+      second === "venv" ||
+      second === "virtualenv" ||
+      (second === "pip" && lower[2] === "install")
+    );
+  }
   if (name === "forge") return ["build", "install", "compile", "update"].includes(first ?? "");
   if (name === "cmake") return isAllowedCmakeBuild(args);
   if (name === "ninja") return true;
@@ -347,8 +399,33 @@ function isAllowedBuildCommand(program: string, args: string[]): boolean {
   if (name === "deno") return first === "cache";
   if (name === "mvn") return lower.some((arg) => ["compile", "package", "install", "dependency:resolve", "dependency:go-offline"].includes(arg));
   if (name === "gradle" || name === "gradlew") return lower.some((arg) => ["build", "assemble", "classes", "compilejava", "dependencies"].includes(arg));
-  if (name === "npx") return first === "hardhat" && second === "compile";
+  if (name === "scarb") return ["build", "fetch", "check", "metadata"].includes(scarbSubcommand(args) ?? "");
+  if (name === "blueprint") return first === "build";
+  if (name === "func-js" || name === "tolk-js" || name === "tact") return args.length > 0 && !isToolInfoArgs(args);
+  if (name === "npx") return (first === "hardhat" && second === "compile") || (first === "blueprint" && second === "build");
   return false;
+}
+
+function isAllowedWorkspaceSetupCommand(program: string, args: string[]): boolean {
+  if (program.toLowerCase() !== "mkdir") return false;
+  const paths: string[] = [];
+  for (const arg of args) {
+    const lower = arg.toLowerCase();
+    if (lower === "-p" || lower === "--parents") continue;
+    if (arg.startsWith("-")) return false;
+    paths.push(arg);
+  }
+  return paths.length > 0 && paths.every(isModelOwnedWorkspaceDirectory);
+}
+
+function isModelOwnedWorkspaceDirectory(arg: string): boolean {
+  if (arg.length === 0) return false;
+  if (arg.startsWith("/") || looksLikePathEscape(arg)) return false;
+  const normalized = arg.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/$/, "");
+  const segments = normalized.split("/").filter(Boolean);
+  if (segments.length === 0) return false;
+  const tokens = segments.flatMap((segment) => segment.toLowerCase().split(/[._-]+/).filter(Boolean));
+  return tokens.some((token) => ["poc", "repro", "harness", "scratch", "verify", "verification", "flounder"].includes(token));
 }
 
 function cargoSubcommand(args: string[]): string | undefined {
@@ -370,11 +447,35 @@ function cargoSubcommand(args: string[]): string | undefined {
   return undefined;
 }
 
+function scarbSubcommand(args: string[]): string | undefined {
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]?.toLowerCase() ?? "";
+    if (!arg) continue;
+    if (arg === "--") return undefined;
+    if (arg === "--offline" || arg === "--json" || arg === "--no-cache") continue;
+    if (arg === "--manifest-path" || arg === "--profile" || arg === "-p") {
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--manifest-path=") || arg.startsWith("--profile=")) continue;
+    if (arg.startsWith("-")) continue;
+    return arg;
+  }
+  return undefined;
+}
+
+function isToolInfoArgs(args: string[]): boolean {
+  if (args.length !== 1) return false;
+  const flag = args[0]?.toLowerCase();
+  return flag === "--version" || flag === "-v" || flag === "-version" || flag === "version" || flag === "--help" || flag === "-h" || flag === "help";
+}
+
 function isAllowedLocalInspectionCommand(program: string, args: string[]): boolean {
   const name = program.toLowerCase();
   if (name === "pwd") return args.length === 0;
   if (name === "which") return args.length > 0 && args.every(isPlainToolName);
   if (isAllowedVersionInspection(name, args)) return true;
+  if (name === "scarb" && scarbSubcommand(args) === "metadata") return args.every((arg) => isSafeInspectionArg(name, arg));
   if (isAllowedJsonToolInspection(name, args)) return true;
   if (name === "test" || name === "[") return isAllowedFileTestInspection(name, args);
   if (name === "ls") return args.every((arg) => isSafeInspectionArg(name, arg));
@@ -390,7 +491,7 @@ function isAllowedLocalInspectionCommand(program: string, args: string[]): boole
 function isAllowedVersionInspection(program: string, args: string[]): boolean {
   if (args.length !== 1) return false;
   const flag = args[0]?.toLowerCase();
-  if (!flag || !["--version", "-v", "-version", "version"].includes(flag)) return false;
+  if (!flag || !["--version", "-v", "-version", "version", "--help", "-h", "help"].includes(flag)) return false;
   return new Set([
     "anvil",
     "bb",
@@ -402,6 +503,7 @@ function isAllowedVersionInspection(program: string, args: string[]): boolean {
     "deno",
     "dotnet",
     "forge",
+    "func-js",
     "git",
     "go",
     "gmake",
@@ -422,8 +524,16 @@ function isAllowedVersionInspection(program: string, args: string[]): boolean {
     "python3",
     "rustc",
     "rustup",
+    "scarb",
     "solc",
+    "sncast",
+    "snforge",
+    "tact",
+    "tact-fmt",
+    "tolk-js",
+    "unboc",
     "yarn",
+    "blueprint",
   ]).has(program);
 }
 

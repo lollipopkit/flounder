@@ -263,8 +263,8 @@ test("api: project run defaults leave map/dig turns unbounded and use standard s
     const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
     const spec = JSON.parse(job.spec_json);
 
-    assert.equal(spec.pipeline, true);
-    assert.equal(spec.clue, "default-run-budget");
+    assert.equal(spec.pipeline, false);
+    assert.equal(spec.clue, undefined);
     assert.equal(spec.coverageMode, "standard");
     assert.equal(spec.coverageTarget, 30);
     assert.equal(spec.maxScopes, 30);
@@ -289,8 +289,8 @@ test("api: explicit standard coverage leaves map/dig turns unbounded while cappi
     const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
     const spec = JSON.parse(job.spec_json);
 
-    assert.equal(spec.pipeline, true);
-    assert.equal(spec.clue, "standard-run-budget");
+    assert.equal(spec.pipeline, false);
+    assert.equal(spec.clue, undefined);
     assert.equal(spec.coverageMode, "standard");
     assert.equal(spec.maxScopes, 30);
     assert.equal(spec.mapSteps, undefined);
@@ -324,7 +324,7 @@ test("api: standard coverage fills the project up to 30 audited scopes instead o
     const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
     const spec = JSON.parse(job.spec_json);
 
-    assert.equal(spec.pipeline, true);
+    assert.equal(spec.pipeline, false);
     assert.equal(spec.coverageMode, "standard");
     assert.equal(spec.coverageTarget, 30);
     assert.equal(spec.maxScopes, 10);
@@ -402,13 +402,20 @@ test("api: standard coverage lets pipeline continue after 30 audited scopes but 
       store.close();
     }
 
-    const continued = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run" }));
-    assert.equal(continued.queued, true);
-    const continuedJob = (await json(await fetch(base + "/api/jobs/" + continued.jobId))).job;
-    const continuedSpec = JSON.parse(continuedJob.spec_json);
-    assert.equal(continuedSpec.pipeline, true);
-    assert.equal(continuedSpec.coverageTarget, 30);
-    assert.equal(continuedSpec.maxScopes, 0);
+    const pipeline = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run", pipeline: true }));
+    assert.equal(pipeline.queued, true);
+    const pipelineJob = (await json(await fetch(base + "/api/jobs/" + pipeline.jobId))).job;
+    const pipelineSpec = JSON.parse(pipelineJob.spec_json);
+    assert.equal(pipelineSpec.pipeline, true);
+    assert.equal(pipelineSpec.coverageMode, "standard");
+    assert.equal(pipelineSpec.coverageTarget, 30);
+    assert.equal(pipelineSpec.maxScopes, 0);
+    assert.equal(pipelineSpec.sandboxConfirmNetwork, "enabled");
+
+    const continued = await post(`/api/projects/${created.uuid}/runs`, { verb: "run" });
+    assert.equal(continued.status, 409);
+    const blocked = await json(continued);
+    assert.match(blocked.error, /Standard coverage is already complete/);
 
     const launched = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "audit", scope: "pending-0" }));
     assert.equal(launched.queued, true);
@@ -617,6 +624,7 @@ test("api: daemon pipeline worklist exposes verify candidates before confirm", a
     assert.ok(confirm.confirmKeys.includes("confirmed-bug"));
     assert.ok(confirm.confirmKeys.includes("kalreadyreproduced"), "confirm worklist carries prior decided findings as consolidation context");
     assert.ok(confirm.confirmKeys.includes("kgateblocked"), "confirm worklist carries reproduced decisions whose submission gates are still open");
+    assert.ok(confirm.confirmFindings.some((finding) => finding.id === "confirmed-bug" && finding.originId), "confirm worklist carries DB-backed finding seeds");
     assert.deepEqual(confirm.confirmSettledRows.map((row) => row.bug), ["prior reproduced withdrawal proof"]);
     assert.ok(confirm.confirmKeys.some((key) => /^origin:\d+:confirmed-bug$/.test(key)), "worklist carries origin selector for verify-artifact recovery");
 
@@ -1908,8 +1916,68 @@ test("api: project detail summarizes the latest prepare manifest and workspace q
     assert.deepEqual(confirmSpec.inputRunDirs, [auditRunDir]);
     assert.ok(confirmSpec.confirmKeys.includes("confirmed-bug"));
     assert.ok(confirmSpec.confirmKeys.includes("kalreadyreproduced"), "project confirm carries prior decided findings as consolidation context");
+    assert.ok(confirmSpec.confirmFindings.some((finding) => finding.id === "confirmed-bug" && finding.originId), "project confirm carries DB-backed finding seeds");
     assert.deepEqual(confirmSpec.confirmSettledRows.map((row) => row.bug), ["prior prepared source bug"]);
     assert.ok(confirmSpec.confirmKeys.some((key) => /^origin:\d+:confirmed-bug$/.test(key)), "confirm spec carries origin selector for verify-artifact recovery");
+  });
+});
+
+test("api: confirm launch carries DB-backed seeds when prior run artifact is missing", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const created = await json(await post("/api/projects", {
+      name: "confirm-db-seed-missing-artifact",
+      sourcePaths: ["src"],
+      config: { sandboxConfirmNetwork: "none" },
+    }));
+    const missingRunDir = path.join(out, "missing-audit-findings-run");
+    let readyId;
+    const store = MetadataStore.openForOutput(out);
+    try {
+      const auditRunId = store.startRun({ projectId: created.id, kind: "audit", runDir: missingRunDir });
+      store.upsertFindings(created.id, auditRunId, [{
+        findingKey: "kdbseed",
+        title: "Confirmed finding persisted without artifact",
+        location: "src/Target.sol:9",
+        severity: "high",
+        status: "confirmed-differential",
+        scopeId: "SCOPE-DB",
+        description: "DB-only confirmed finding.",
+        evidence: "Local executable evidence was persisted.",
+        exploitSketch: "Trigger the invariant violation.",
+        fix: "Bind the invariant.",
+        confidence: 0.91,
+      }]);
+      store.finishRun(auditRunId, "killed");
+      readyId = store.listFindings(created.id)[0].id;
+    } finally {
+      store.close();
+    }
+
+    const launched = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "confirm", findingIds: [readyId] }));
+    const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
+    const spec = JSON.parse(job.spec_json);
+
+    assert.equal(spec.verb, "confirm");
+    assert.equal(spec.sandboxConfirmNetwork, "enabled");
+    assert.deepEqual(spec.inputRunDirs, [missingRunDir]);
+    assert.ok(spec.confirmKeys.includes("kdbseed"));
+    assert.ok(spec.confirmKeys.some((key) => key === `origin:${readyId}:kdbseed`));
+    assert.equal(spec.confirmFindings.length, 1);
+    assert.equal(spec.confirmFindings[0].id, "kdbseed");
+    assert.equal(spec.confirmFindings[0].originId, readyId);
+    assert.equal(spec.confirmFindings[0].confirmationStatus, "confirmed-differential");
+    assert.equal(spec.confirmFindings[0].scopeId, "SCOPE-DB");
+
+    const explicit = await json(await post(`/api/projects/${created.uuid}/runs`, {
+      verb: "confirm",
+      findingIds: [readyId],
+      sandboxConfirmNetwork: "none",
+    }));
+    const explicitJob = (await json(await fetch(base + "/api/jobs/" + explicit.jobId))).job;
+    const explicitSpec = JSON.parse(explicitJob.spec_json);
+    assert.equal(explicitSpec.sandboxConfirmNetwork, "none");
   });
 });
 

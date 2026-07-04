@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -14,18 +14,42 @@ async function fakeContainerCli(options = {}) {
   const dir = await tempDir("flounder-fake-container-bin-");
   const bin = path.join(dir, "container");
   await writeFile(bin, `#!/usr/bin/env bash
-if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then exit ${options.imageInspectExit ?? 0}; fi
+LOG_FILE=${JSON.stringify(options.logFile ?? "")}
+RUN_SLEEP_SECONDS=${JSON.stringify(String(options.runSleepSeconds ?? 0))}
+if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then printf '%s' ${JSON.stringify(options.imageInspectStderr ?? "")} >&2; exit ${options.imageInspectExit ?? 0}; fi
 if [ "$1" = "network" ] && [ "$2" = "inspect" ]; then exit ${options.networkInspectExit ?? 0}; fi
 if [ "$1" = "network" ] && [ "$2" = "create" ]; then exit ${options.networkCreateExit ?? 0}; fi
+if [ "$1" = "delete" ]; then
+  if [ -n "$LOG_FILE" ]; then printf 'DELETE:%s\\n' "\${3:-}" >> "$LOG_FILE"; fi
+  exit ${options.deleteExit ?? 0}
+fi
 if [ "$1" = "run" ]; then
+  if [ -n "$LOG_FILE" ]; then printf 'RUN\\n' >> "$LOG_FILE"; fi
   printf 'ARGS:'
   for arg in "$@"; do printf '[%s]' "$arg"; done
+  if [ "$RUN_SLEEP_SECONDS" != "0" ]; then exec sleep "$RUN_SLEEP_SECONDS"; fi
   exit 0
 fi
 exit 1
 `);
   await chmod(bin, 0o755);
   return dir;
+}
+
+async function waitForFileMatch(file, pattern, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = "";
+  while (Date.now() < deadline) {
+    try {
+      last = await readFile(file, "utf8");
+      if (pattern.test(last)) return last;
+    } catch {
+      // File may not exist until the fake CLI handles the cleanup call.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.match(last, pattern);
+  return last;
 }
 
 async function fakeDockerCli() {
@@ -124,15 +148,74 @@ test("sandbox readiness reports missing OCI image before agent commands run", as
   assert.match(readiness.message ?? "", /No sandbox backend is available|OCI sandbox image/);
 });
 
-test("sandbox readiness reports missing Apple container image without host fallback", async () => {
-  const image = `flounder-test-missing-${Date.now()}-${Math.random().toString(16).slice(2)}:latest`;
-  const readiness = await checkSandboxReadiness({ backend: "apple-container", image, allowHostFallback: true, network: "none" });
+test("sandbox capped logs preserve early diagnostics and late context", async () => {
+  const workspace = await tempDir("flounder-sandbox-log-cap-");
+  try {
+    const script = [
+      "console.log('EARLY_SANDBOX_ERROR: missing package');",
+      "for (let i = 0; i < 400; i += 1) console.log('warning ' + i + ': noisy compiler profile output');",
+      "console.log('LATE_SANDBOX_CONTEXT: build failed after compilation');",
+    ].join("\n");
+    const result = await runSandboxCommand(
+      { program: process.execPath, args: ["-e", script], timeoutMs: 10_000 },
+      workspace,
+      1200,
+      [],
+      undefined,
+      { backend: "host", allowHostFallback: true, network: "none" },
+    );
 
-  assert.equal(readiness.ok, false);
-  assert.equal(readiness.backend, "apple-container");
-  assert.equal(readiness.allowHostFallback, false);
-  assert.equal(readiness.image, image);
-  assert.match(readiness.message ?? "", /Apple container sandbox image/);
+    assert.equal(result.exitCode, 0);
+    assert.match(result.stdout, /EARLY_SANDBOX_ERROR/);
+    assert.match(result.stdout, /LATE_SANDBOX_CONTEXT/);
+    assert.match(result.stdout, /preserving head and tail/);
+    assert.ok(result.stdout.length <= 1250, "log cap should remain bounded");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("sandbox readiness reports missing Apple container image without host fallback", async () => {
+  const fakeBin = await fakeContainerCli({ imageInspectExit: 1 });
+  const oldPath = process.env.PATH;
+  const image = `flounder-test-missing-${Date.now()}-${Math.random().toString(16).slice(2)}:latest`;
+  try {
+    process.env.PATH = `${fakeBin}${path.delimiter}${oldPath ?? ""}`;
+    clearSandboxAvailabilityCache(image);
+    const readiness = await checkSandboxReadiness({ backend: "apple-container", image, allowHostFallback: true, network: "none" });
+
+    assert.equal(readiness.ok, false);
+    assert.equal(readiness.backend, "apple-container");
+    assert.equal(readiness.allowHostFallback, false);
+    assert.equal(readiness.image, image);
+    assert.match(readiness.message ?? "", /Apple container sandbox image/);
+  } finally {
+    process.env.PATH = oldPath;
+    clearSandboxAvailabilityCache(image);
+    await rm(fakeBin, { recursive: true, force: true });
+  }
+});
+
+test("sandbox readiness reports Apple container host permission denial distinctly", async () => {
+  const fakeBin = await fakeContainerCli({ imageInspectExit: 1, imageInspectStderr: "Error: The operation couldn’t be completed. Operation not permitted" });
+  const oldPath = process.env.PATH;
+  const image = "flounder-sandbox:permission-denied";
+  try {
+    process.env.PATH = `${fakeBin}${path.delimiter}${oldPath ?? ""}`;
+    clearSandboxAvailabilityCache(image);
+    const readiness = await checkSandboxReadiness({ backend: "apple-container", image, allowHostFallback: true, network: "none" });
+
+    assert.equal(readiness.ok, false);
+    assert.equal(readiness.backend, "apple-container");
+    assert.equal(readiness.allowHostFallback, false);
+    assert.equal(readiness.image, image);
+    assert.match(readiness.message ?? "", /not permitted to access the container system API/);
+    assert.doesNotMatch(readiness.message ?? "", /sandbox image .* is not available/);
+  } finally {
+    process.env.PATH = oldPath;
+    clearSandboxAvailabilityCache(image);
+    await rm(fakeBin, { recursive: true, force: true });
+  }
 });
 
 test("sandbox auto prefers Apple container on Apple silicon when the backend is ready", async () => {
@@ -236,11 +319,67 @@ test("sandbox Apple container backend maps Flounder isolation options to contain
     assert.match(result.stdout, /\[--memory\]\[256M\]/);
     assert.match(result.stdout, /\[--cpus\]\[1.25\]/);
     assert.match(result.stdout, /\[--env\]\[HOME=\/workspace\]/);
+    assert.match(result.stdout, /\[--env\]\[SCARB_CACHE=\/cache\/scarb-cache\]/);
     assert.match(result.stdout, /\[flounder-sandbox:latest\]\[node\]\[--test\]/);
   } finally {
     process.env.PATH = oldPath;
     await rm(workspace, { recursive: true, force: true });
     await rm(cache, { recursive: true, force: true });
+    await rm(fakeBin, { recursive: true, force: true });
+  }
+});
+
+test("sandbox Apple container backend pins DNS only for network-enabled runs", async () => {
+  const workspace = await tempDir("flounder-sandbox-apple-container-dns-");
+  const fakeBin = await fakeContainerCli();
+  const oldPath = process.env.PATH;
+  try {
+    process.env.PATH = `${fakeBin}${path.delimiter}${oldPath ?? ""}`;
+    const result = await runSandboxCommand(
+      { program: "scarb", args: ["build"], timeoutMs: 10_000 },
+      workspace,
+      8000,
+      [],
+      undefined,
+      { backend: "apple-container", image: "flounder-sandbox:cairo", network: "enabled" },
+    );
+
+    assert.equal(result.exitCode, 0);
+    assert.match(result.stdout, /\[--dns\]\[1\.1\.1\.1\]/);
+    assert.match(result.stdout, /\[--dns\]\[8\.8\.8\.8\]/);
+    assert.doesNotMatch(result.stdout, /\[--no-dns\]/);
+    assert.doesNotMatch(result.stdout, /\[--network\]\[flounder-sealed\]/);
+    assert.match(result.stdout, /\[flounder-sandbox:cairo\]\[scarb\]\[build\]/);
+  } finally {
+    process.env.PATH = oldPath;
+    await rm(workspace, { recursive: true, force: true });
+    await rm(fakeBin, { recursive: true, force: true });
+  }
+});
+
+test("sandbox Apple container backend force-deletes timed-out containers", async () => {
+  const workspace = await tempDir("flounder-sandbox-apple-timeout-");
+  const logDir = await tempDir("flounder-sandbox-apple-timeout-log-");
+  const logFile = path.join(logDir, "container.log");
+  const fakeBin = await fakeContainerCli({ logFile, runSleepSeconds: 5 });
+  const oldPath = process.env.PATH;
+  try {
+    process.env.PATH = `${fakeBin}${path.delimiter}${oldPath ?? ""}`;
+    const result = await runSandboxCommand(
+      { program: "node", args: ["--test"], timeoutMs: 100 },
+      workspace,
+      8000,
+      [],
+      undefined,
+      { backend: "apple-container", image: "flounder-sandbox:timeout", network: "enabled" },
+    );
+
+    assert.equal(result.timedOut, true);
+    await waitForFileMatch(logFile, /DELETE:flounder-/);
+  } finally {
+    process.env.PATH = oldPath;
+    await rm(workspace, { recursive: true, force: true });
+    await rm(logDir, { recursive: true, force: true });
     await rm(fakeBin, { recursive: true, force: true });
   }
 });
@@ -252,7 +391,7 @@ test("sandbox host backend is explicit and still uses isolated HOME and caches",
     const result = await runSandboxCommand(
       {
         program: process.execPath,
-        args: ["-e", "console.log(process.env.HOME); console.log(process.env.TMPDIR); console.log(process.env.CARGO_HOME);"],
+        args: ["-e", "console.log(process.env.HOME); console.log(process.env.TMPDIR); console.log(process.env.CARGO_HOME); console.log(process.env.SCARB_CACHE);"],
         timeoutMs: 10_000,
       },
       workspace,

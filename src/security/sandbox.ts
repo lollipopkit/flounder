@@ -21,6 +21,7 @@ export type SandboxBackend = typeof SANDBOX_BACKENDS[number];
 export type SandboxNetworkMode = "none" | "enabled";
 export const DEFAULT_SANDBOX_IMAGE = "flounder-sandbox:latest";
 const APPLE_CONTAINER_SEALED_NETWORK = "flounder-sealed";
+const APPLE_CONTAINER_NETWORK_DNS = ["1.1.1.1", "8.8.8.8"] as const;
 
 export interface SandboxExecutionOptions {
   backend?: SandboxBackend;
@@ -384,6 +385,12 @@ async function runOciSandboxProcess(input: ProcessRunInput): Promise<{ stdout: s
     if (value !== undefined) dockerArgs.push("--env", `${key}=${value}`);
   }
   dockerArgs.push(input.options.image, input.command.program, ...input.command.args);
+  let cleanupStarted = false;
+  const cleanupTimedOutContainer = (): void => {
+    if (cleanupStarted) return;
+    cleanupStarted = true;
+    void forceRemoveContainer(containerName);
+  };
   const result = await runSpawnedProcess({
     program: "docker",
     args: dockerArgs,
@@ -391,8 +398,10 @@ async function runOciSandboxProcess(input: ProcessRunInput): Promise<{ stdout: s
     env: dockerClientEnv(),
     timeoutMs: input.command.timeoutMs ?? 120_000,
     maxLogBytes: input.maxLogBytes,
+    onTimeout: cleanupTimedOutContainer,
+    timeoutKillDelayMs: 250,
   });
-  if (result.timedOut) void forceRemoveContainer(containerName);
+  if (result.timedOut) cleanupTimedOutContainer();
   return result;
 }
 
@@ -419,7 +428,11 @@ async function runAppleContainerSandboxProcess(input: ProcessRunInput): Promise<
     "--tmpfs",
     "/var/tmp",
   ];
-  if (input.options.network === "none") containerArgs.push("--network", APPLE_CONTAINER_SEALED_NETWORK, "--no-dns");
+  if (input.options.network === "none") {
+    containerArgs.push("--network", APPLE_CONTAINER_SEALED_NETWORK, "--no-dns");
+  } else {
+    for (const server of APPLE_CONTAINER_NETWORK_DNS) containerArgs.push("--dns", server);
+  }
   if (input.cacheDir) containerArgs.push("--mount", `type=bind,source=${input.cacheDir},target=/cache`);
   if (typeof process.getuid === "function" && typeof process.getgid === "function") {
     containerArgs.push("--user", `${process.getuid()}:${process.getgid()}`);
@@ -430,6 +443,12 @@ async function runAppleContainerSandboxProcess(input: ProcessRunInput): Promise<
     if (value !== undefined) containerArgs.push("--env", `${key}=${value}`);
   }
   containerArgs.push(input.options.image, input.command.program, ...input.command.args);
+  let cleanupStarted = false;
+  const cleanupTimedOutContainer = (): void => {
+    if (cleanupStarted) return;
+    cleanupStarted = true;
+    void forceRemoveAppleContainer(containerName);
+  };
   const result = await runSpawnedProcess({
     program: "container",
     args: containerArgs,
@@ -437,28 +456,41 @@ async function runAppleContainerSandboxProcess(input: ProcessRunInput): Promise<
     env: containerClientEnv(),
     timeoutMs: input.command.timeoutMs ?? 120_000,
     maxLogBytes: input.maxLogBytes,
+    onTimeout: cleanupTimedOutContainer,
+    timeoutKillDelayMs: 250,
   });
-  if (result.timedOut) void forceRemoveAppleContainer(containerName);
+  if (result.timedOut) cleanupTimedOutContainer();
   return result;
 }
 
-async function runSpawnedProcess(input: { program: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; maxLogBytes: number }): Promise<{ stdout: string; stderr: string; exitCode: number | null; timedOut: boolean }> {
+async function runSpawnedProcess(input: { program: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; maxLogBytes: number; onTimeout?: () => void; timeoutKillDelayMs?: number }): Promise<{ stdout: string; stderr: string; exitCode: number | null; timedOut: boolean }> {
   let stdout = "";
   let stderr = "";
   let timedOut = false;
   let exitCode: number | null = null;
+  let terminateTimer: ReturnType<typeof setTimeout> | undefined;
   let killTimer: ReturnType<typeof setTimeout> | undefined;
   const child = spawn(input.program, input.args, {
     cwd: input.cwd,
     shell: false,
     env: input.env,
   });
-  const timer = setTimeout(() => {
-    timedOut = true;
+  const terminateChild = (): void => {
     child.kill("SIGTERM");
     killTimer = setTimeout(() => {
       if (exitCode === null) child.kill("SIGKILL");
     }, 2_000);
+  };
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try {
+      input.onTimeout?.();
+    } catch (error) {
+      stderr = appendLimited(stderr, error instanceof Error ? error.message : String(error), input.maxLogBytes);
+    }
+    const delay = Math.max(0, input.timeoutKillDelayMs ?? 0);
+    if (delay > 0) terminateTimer = setTimeout(terminateChild, delay);
+    else terminateChild();
   }, input.timeoutMs);
 
   child.stdout?.on("data", (chunk) => {
@@ -479,6 +511,7 @@ async function runSpawnedProcess(input: { program: string; args: string[]; cwd: 
     });
   });
   clearTimeout(timer);
+  if (terminateTimer) clearTimeout(terminateTimer);
   if (killTimer) clearTimeout(killTimer);
   return { stdout, stderr, exitCode, timedOut };
 }
@@ -616,7 +649,12 @@ function shouldSkipCopyName(name: string): boolean {
 function appendLimited(current: string, next: string, maxBytes: number): string {
   const combined = current + next;
   if (Buffer.byteLength(combined, "utf8") <= maxBytes) return combined;
-  return combined.slice(0, Math.max(0, maxBytes)) + "\n[truncated]\n";
+  const marker = "\n[truncated; preserving head and tail]\n";
+  if (maxBytes <= marker.length + 16) return combined.slice(0, Math.max(0, maxBytes));
+  const budget = maxBytes - marker.length;
+  const head = Math.floor(budget / 2);
+  const tail = budget - head;
+  return `${combined.slice(0, head)}${marker}${combined.slice(-tail)}`;
 }
 
 function redactLocalPaths(input: string, paths: string[]): string {
@@ -646,7 +684,12 @@ function replaceAll(input: string, needle: string, replacement: string): string 
 }
 
 const ociAvailability = new Map<string, Promise<boolean>>();
-const appleContainerAvailability = new Map<string, Promise<boolean>>();
+const appleContainerAvailability = new Map<string, Promise<AppleContainerAvailability>>();
+
+interface AppleContainerAvailability {
+  available: boolean;
+  message?: string;
+}
 
 function isOciSandboxAvailable(image: string): Promise<boolean> {
   let cached = ociAvailability.get(image);
@@ -669,7 +712,7 @@ async function checkOciSandboxAvailable(image: string): Promise<boolean> {
   return result.exitCode === 0 && !result.timedOut;
 }
 
-function isAppleContainerSandboxAvailable(image: string): Promise<boolean> {
+function isAppleContainerSandboxAvailable(image: string): Promise<AppleContainerAvailability> {
   let cached = appleContainerAvailability.get(image);
   if (!cached) {
     cached = checkAppleContainerSandboxAvailable(image);
@@ -678,7 +721,7 @@ function isAppleContainerSandboxAvailable(image: string): Promise<boolean> {
   return cached;
 }
 
-async function checkAppleContainerSandboxAvailable(image: string): Promise<boolean> {
+async function checkAppleContainerSandboxAvailable(image: string): Promise<AppleContainerAvailability> {
   const result = await runSpawnedProcess({
     program: "container",
     args: ["image", "inspect", image],
@@ -687,15 +730,41 @@ async function checkAppleContainerSandboxAvailable(image: string): Promise<boole
     timeoutMs: 5000,
     maxLogBytes: 2000,
   });
-  return result.exitCode === 0 && !result.timedOut;
+  if (result.exitCode === 0 && !result.timedOut) return { available: true };
+  if (result.timedOut) {
+    return {
+      available: false,
+      message: `Apple container did not respond while inspecting sandbox image "${image}". Check "container system status" and restart apple/container if needed.`,
+    };
+  }
+  const output = `${result.stderr}\n${result.stdout}`.trim();
+  if (/spawn container ENOENT|not found|No such file or directory/i.test(output)) {
+    return {
+      available: false,
+      message: `Apple container CLI was not found on PATH. Install apple/container, run "container system start", and build or pull sandbox image "${image}" for the Apple container runtime.`,
+    };
+  }
+  if (/Operation not permitted/i.test(output)) {
+    return {
+      available: false,
+      message: `Apple container CLI is installed, but this process is not permitted to access the container system API. Run Flounder from an unsandboxed terminal/session, then verify "container image inspect ${image}" succeeds.`,
+    };
+  }
+  if (/connection|connect|service|apiserver|not running|cannot.*container/i.test(output)) {
+    return {
+      available: false,
+      message: `Apple container system is not reachable while inspecting sandbox image "${image}". Run "container system start" and verify "container system status" is running.`,
+    };
+  }
+  return { available: false };
 }
 
 async function checkAppleContainerBackendReady(options: SandboxProcessOptions): Promise<{ ok: true } | { ok: false; message: string }> {
   const available = await isAppleContainerSandboxAvailable(options.image);
-  if (!available) {
+  if (!available.available) {
     return {
       ok: false,
-      message: `Apple container sandbox image "${options.image}" is not available. Install apple/container, run "container system start", and build or pull the image for the Apple container runtime.`,
+      message: available.message ?? `Apple container sandbox image "${options.image}" is not available. Install apple/container, run "container system start", and build or pull the image for the Apple container runtime.`,
     };
   }
   if (options.network === "none") return ensureAppleContainerSealedNetwork();
@@ -800,6 +869,7 @@ function sandboxEnv(workspace: string, tmpDir: string, cacheDir?: string): NodeJ
     TMP: tmpDir,
     XDG_CACHE_HOME: path.join(pkgCache, "xdg-cache"),
     CARGO_HOME: path.join(pkgCache, "cargo-home"),
+    SCARB_CACHE: path.join(pkgCache, "scarb-cache"),
     GOCACHE: path.join(pkgCache, "go-build-cache"),
     GOMODCACHE: path.join(pkgCache, "go-mod-cache"),
     NPM_CONFIG_CACHE: path.join(pkgCache, "npm-cache"),

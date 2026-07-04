@@ -1,4 +1,4 @@
-import { readdir } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { sandboxExecutionOptions, type AuditorConfig } from "../config.js";
 import { runSandboxCommand, type SandboxWorkspace } from "../security/sandbox.js";
@@ -10,7 +10,7 @@ import type { ReproductionCommand } from "../types.js";
 // means the toolchain's dependencies must be present. This module warms the
 // copied workspace ONCE: it detects the toolchain and runs the project's own
 // dependency-fetch/build with network allowed and a generous timeout, populating
-// the workspace-local caches (CARGO_HOME, GOMODCACHE, npm cache, …) that
+// the workspace-local caches (CARGO_HOME, SCARB_CACHE, GOMODCACHE, npm cache, …) that
 // runSandboxCommand already points inside the workspace. Afterwards the model's
 // bash test runs are incremental and can run offline and reproducibly.
 //
@@ -24,7 +24,7 @@ const SKIP_DIRS = new Set([".git", ".hg", ".svn", "node_modules", "vendor", "tar
 const MAX_SCAN_DEPTH = 6;
 const MAX_SCAN_ENTRIES = 8000;
 
-type Toolchain = "cargo" | "go" | "npm" | "pnpm" | "yarn" | "forge";
+type Toolchain = "cargo" | "go" | "npm" | "pnpm" | "yarn" | "forge" | "scarb" | "blueprint";
 
 export interface PrepareCommandResult {
   toolchain: Toolchain;
@@ -39,14 +39,45 @@ export interface PrepareCommandResult {
 export interface PrepareReport {
   ran: boolean;
   detected: Toolchain[];
+  pinnedToolVersions: PinnedToolVersion[];
+  toolVersionChecks: ToolVersionCheck[];
   results: PrepareCommandResult[];
 }
 
+export interface PinnedToolVersion {
+  tool: string;
+  version: string;
+  dir: string;
+}
+
+export interface ToolVersionCheck {
+  tool: string;
+  command: string;
+  expected: string;
+  actual?: string;
+  ok: boolean;
+  reason?: string;
+}
+
 export async function prepareWorkspaceToolchain(input: { workspace: SandboxWorkspace; cfg: AuditorConfig; logger: RunLogger; cacheDir?: string }): Promise<PrepareReport> {
+  const pinnedToolVersions = await detectPinnedToolVersions(input.workspace.absolute);
+  if (pinnedToolVersions.length > 0) {
+    await input.logger.event("audit_prepare_tool_versions", { pins: pinnedToolVersions });
+  }
+  const toolVersionChecks = await checkPinnedToolVersions(input, pinnedToolVersions);
+  if (toolVersionChecks.length > 0) {
+    await input.logger.event("audit_prepare_tool_version_checks", { checks: toolVersionChecks });
+  }
   const plans = await detectToolchains(input.workspace.absolute);
+  const failedChecks = toolVersionChecks.filter((check) => !check.ok);
+  if (failedChecks.length > 0) {
+    await input.logger.event("audit_prepare_tool_version_mismatch", { checks: failedChecks });
+    await input.logger.artifact("audit_prepare.json", { detected: plans.map((plan) => plan.toolchain), pinnedToolVersions, toolVersionChecks, results: [] });
+    return { ran: false, detected: plans.map((plan) => plan.toolchain), pinnedToolVersions, toolVersionChecks, results: [] };
+  }
   if (plans.length === 0) {
     await input.logger.event("audit_prepare_skipped", { reason: "no supported toolchain manifest detected" });
-    return { ran: false, detected: [], results: [] };
+    return { ran: false, detected: [], pinnedToolVersions, toolVersionChecks, results: [] };
   }
 
   await input.logger.event("audit_prepare_start", { toolchains: plans.map((plan) => plan.toolchain), timeoutMs: input.cfg.auditPrepareTimeoutMs });
@@ -86,8 +117,85 @@ export async function prepareWorkspaceToolchain(input: { workspace: SandboxWorks
     }
   }
 
-  await input.logger.artifact("audit_prepare.json", { detected: plans.map((plan) => plan.toolchain), results });
-  return { ran: true, detected: plans.map((plan) => plan.toolchain), results };
+  await input.logger.artifact("audit_prepare.json", { detected: plans.map((plan) => plan.toolchain), pinnedToolVersions, toolVersionChecks, results });
+  return { ran: true, detected: plans.map((plan) => plan.toolchain), pinnedToolVersions, toolVersionChecks, results };
+}
+
+export function prepareToolVersionBlockingIssue(report: PrepareReport): string | undefined {
+  const failed = report.toolVersionChecks.filter((check) => !check.ok);
+  if (failed.length === 0) return undefined;
+  const details = failed.map((check) => {
+    const actual = check.actual ? `actual ${check.actual}` : (check.reason ?? "tool unavailable");
+    return `${check.tool} expected ${check.expected}, ${actual}`;
+  });
+  return `sandbox image/toolchain preflight failed: ${details.join("; ")}. Build or select a target-specific sandbox image that matches the project's pinned toolchain.`;
+}
+
+async function checkPinnedToolVersions(
+  input: { workspace: SandboxWorkspace; cfg: AuditorConfig; logger: RunLogger; cacheDir?: string },
+  pins: PinnedToolVersion[],
+): Promise<ToolVersionCheck[]> {
+  const specs = pins.flatMap((pin) => versionCheckSpecs(pin));
+  const out: ToolVersionCheck[] = [];
+  for (const spec of specs) {
+    const command: ReproductionCommand = {
+      program: spec.argv[0] ?? "",
+      args: spec.argv.slice(1),
+      timeoutMs: Math.min(input.cfg.auditPrepareTimeoutMs, 30_000),
+      expectedExitCode: 0,
+      ...(spec.cwd && spec.cwd !== "." ? { cwd: spec.cwd } : {}),
+    };
+    const run = await runSandboxCommand(
+      command,
+      input.workspace.absolute,
+      input.cfg.reproductionMaxLogBytes,
+      input.cfg.sourcePaths,
+      input.cacheDir,
+      sandboxExecutionOptions(input.cfg, "none"),
+    );
+    const combined = `${run.stdout}\n${run.stderr}`.trim();
+    const actual = firstNonEmptyLine(combined);
+    out.push({
+      tool: spec.tool,
+      command: spec.argv.join(" "),
+      expected: spec.expected,
+      ...(actual ? { actual } : {}),
+      ok: run.exitCode === 0 && !run.timedOut && versionOutputMatches(combined, spec.expected),
+      ...(run.exitCode !== 0 || run.timedOut ? { reason: run.timedOut ? "version command timed out" : `version command exited ${run.exitCode}` } : {}),
+    });
+  }
+  return out;
+}
+
+interface VersionCheckSpec {
+  tool: string;
+  expected: string;
+  argv: string[];
+  cwd?: string;
+}
+
+function versionCheckSpecs(pin: PinnedToolVersion): VersionCheckSpec[] {
+  if (pin.tool === "scarb") return [{ tool: "scarb", expected: pin.version, argv: ["scarb", "--version"], cwd: pin.dir }];
+  if (pin.tool === "starknet-foundry") {
+    return [
+      { tool: "snforge", expected: pin.version, argv: ["snforge", "--version"], cwd: pin.dir },
+      { tool: "sncast", expected: pin.version, argv: ["sncast", "--version"], cwd: pin.dir },
+    ];
+  }
+  if (pin.tool === "universal-sierra-compiler") return [{ tool: "universal-sierra-compiler", expected: pin.version, argv: ["universal-sierra-compiler", "--version"], cwd: pin.dir }];
+  return [];
+}
+
+function versionOutputMatches(output: string, expected: string): boolean {
+  return new RegExp(`(^|[^0-9A-Za-z.])${escapeRegExp(expected)}([^0-9A-Za-z.]|$)`).test(output);
+}
+
+function firstNonEmptyLine(output: string): string | undefined {
+  return output.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 interface ToolchainPlan {
@@ -109,7 +217,8 @@ async function detectToolchains(workspaceAbsolute: string): Promise<ToolchainPla
   // Order matters: dependency-install toolchains (npm/pnpm/yarn) run FIRST, because
   // a Solidity/Foundry project often imports its dependencies (e.g. @openzeppelin)
   // from node_modules — so `forge build` only resolves after `npm install`. Then go
-  // mod download, then the compile toolchains (cargo, forge).
+  // mod download, then the compile toolchains (cargo, Scarb/Cairo, Blueprint/TON,
+  // forge).
   //
   // The package manager is chosen by the lockfile CO-LOCATED with the shallowest
   // package.json (the project root), NOT by any lockfile anywhere in the tree: a
@@ -134,10 +243,38 @@ async function detectToolchains(workspaceAbsolute: string): Promise<ToolchainPla
   const cargoDir = shallowest((name) => name === "Cargo.toml");
   if (cargoDir !== undefined) plans.push({ toolchain: "cargo", ...cwd(cargoDir), commands: [["cargo", "fetch"], ["cargo", "build"]] });
 
+  const scarbDir = shallowest((name) => name === "Scarb.toml");
+  if (scarbDir !== undefined) plans.push({ toolchain: "scarb", ...cwd(scarbDir), commands: [["scarb", "fetch"], ["scarb", "build"]] });
+
+  const blueprintDir = shallowest((name) => isBlueprintManifest(name));
+  if (blueprintDir !== undefined) plans.push({ toolchain: "blueprint", ...cwd(blueprintDir), commands: [["blueprint", "build", "--all"]] });
+
   const foundryDir = shallowest((name) => name === "foundry.toml");
   if (foundryDir !== undefined) plans.push({ toolchain: "forge", ...cwd(foundryDir), commands: [["forge", "build"]] });
 
   return plans;
+}
+
+export async function detectPinnedToolVersions(workspaceAbsolute: string): Promise<PinnedToolVersion[]> {
+  const manifests = await scanManifests(workspaceAbsolute);
+  const out: PinnedToolVersion[] = [];
+  for (const entry of manifests.filter((manifest) => manifest.name === ".tool-versions")) {
+    const abs = path.join(workspaceAbsolute, ...entry.dir.split("/").filter(Boolean), entry.name);
+    let content: string;
+    try {
+      content = await readFile(abs, "utf8");
+    } catch {
+      continue;
+    }
+    for (const line of content.split(/\r?\n/)) {
+      const trimmed = line.replace(/#.*/, "").trim();
+      if (!trimmed) continue;
+      const [tool, version] = trimmed.split(/\s+/, 2);
+      if (!tool || !version) continue;
+      out.push({ tool, version, dir: entry.dir || "." });
+    }
+  }
+  return out;
 }
 
 function cwd(dir: string): { cwd?: string } {
@@ -150,7 +287,7 @@ interface ManifestEntry {
 }
 
 async function scanManifests(root: string): Promise<ManifestEntry[]> {
-  const wanted = new Set(["Cargo.toml", "go.mod", "package.json", "foundry.toml", "package-lock.json", "pnpm-lock.yaml", "yarn.lock"]);
+  const wanted = new Set(["Cargo.toml", "go.mod", "package.json", "foundry.toml", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "Scarb.toml", "Scarb.lock", "snfoundry.toml", ".tool-versions", "blueprint.config.ts", "blueprint.config.js", "blueprint.config.cjs", "blueprint.config.mjs", "tact.config.json"]);
   const out: ManifestEntry[] = [];
   let budget = MAX_SCAN_ENTRIES;
   const walk = async (absDir: string, relDir: string, depth: number): Promise<void> => {
@@ -173,4 +310,12 @@ async function scanManifests(root: string): Promise<ManifestEntry[]> {
   };
   await walk(root, "", 0);
   return out;
+}
+
+function isBlueprintManifest(name: string): boolean {
+  return name === "blueprint.config.ts"
+    || name === "blueprint.config.js"
+    || name === "blueprint.config.cjs"
+    || name === "blueprint.config.mjs"
+    || name === "tact.config.json";
 }

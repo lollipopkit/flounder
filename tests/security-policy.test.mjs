@@ -13,6 +13,21 @@ test("agent bash allows build/dependency commands (the build phase) across ecosy
     cmd("go", "mod", "download"),
     cmd("forge", "build"),
     cmd("pip", "install", "-r", "requirements.txt"),
+    cmd("python3", "-m", "venv", ".venv"),
+    cmd("python3", "-m", "pip", "install", "-r", "requirements.txt"),
+    cmd("scarb", "build"),
+    cmd("scarb", "fetch"),
+    cmd("scarb", "check"),
+    cmd("scarb", "metadata", "--format-version", "1"),
+    cmd("scarb", "--offline", "build"),
+    cmd("scarb", "--offline", "metadata", "--format-version", "1"),
+    cmd("env", "SCARB_CACHE=./.scarb-cache", "scarb", "fetch"),
+    cmd("blueprint", "build", "--all"),
+    cmd("npx", "blueprint", "build", "--all"),
+    cmd("yarn", "blueprint", "build", "--all"),
+    cmd("func-js", "contracts/pool.fc"),
+    cmd("tolk-js", "contracts/router.tolk"),
+    cmd("tact", "--config", "tact.config.json"),
     cmd("cmake", "-S", "source/aztec-packages/barretenberg/cpp", "-B", "build/bbapi-poc", "-DMOBILE=ON"),
     cmd("cmake", "--build", "build/bbapi-poc"),
     cmd("cmake", "--build", "build/bbapi-poc", "--parallel", "2"),
@@ -27,8 +42,17 @@ test("agent bash allows build/dependency commands (the build phase) across ecosy
 test("a build command is NOT confirmation-eligible (build cannot mint a finding)", () => {
   assert.equal(isAgentConfirmCommand(cmd("cargo", "build")), false);
   assert.equal(isAgentConfirmCommand(cmd("npm", "install")), false);
+  assert.equal(isAgentConfirmCommand(cmd("python3", "-m", "venv", ".venv")), false);
   assert.equal(isAgentConfirmCommand(cmd("cmake", "--build", "build/bbapi-poc")), false);
   assert.equal(isAgentConfirmCommand(cmd("ninja", "-C", "build/bbapi-poc")), false);
+  assert.equal(isAgentConfirmCommand(cmd("scarb", "build")), false);
+  assert.equal(isAgentConfirmCommand(cmd("scarb", "--offline", "build")), false);
+  assert.equal(isAgentConfirmCommand(cmd("env", "SCARB_CACHE=./.scarb-cache", "scarb", "fetch")), false);
+  assert.equal(isAgentConfirmCommand(cmd("blueprint", "build", "--all")), false);
+  assert.equal(isAgentConfirmCommand(cmd("func-js", "contracts/pool.fc")), false);
+  assert.equal(isAgentBuildCommand(cmd("func-js")), false);
+  assert.equal(isAgentConfirmCommand(cmd("tolk-js", "contracts/router.tolk")), false);
+  assert.equal(isAgentConfirmCommand(cmd("tact", "--config", "tact.config.json")), false);
   // and a test runner is a confirm command, not a build command
   assert.equal(isAgentBuildCommand(cmd("cargo", "test")), false);
   assert.equal(isAgentConfirmCommand(cmd("cargo", "test")), true);
@@ -38,6 +62,16 @@ test("a build command is NOT confirmation-eligible (build cannot mint a finding)
   assert.equal(analyzeAgentBashCommandSafety(cmd("cargo", "+nightly", "-Z", "next-lockfile-bump", "test")).blocked, false);
   assert.equal(isAgentBuildCommand(cmd("ctest", "--test-dir", "build/bbapi-poc")), false);
   assert.equal(isAgentConfirmCommand(cmd("ctest", "--test-dir", "build/bbapi-poc")), true);
+  assert.equal(isAgentBuildCommand(cmd("scarb", "test")), false);
+  assert.equal(isAgentConfirmCommand(cmd("scarb", "test")), true);
+  assert.equal(isAgentBuildCommand(cmd("scarb", "--offline", "test")), false);
+  assert.equal(isAgentConfirmCommand(cmd("scarb", "--offline", "test")), true);
+  assert.equal(isAgentBuildCommand(cmd("snforge", "test")), false);
+  assert.equal(isAgentConfirmCommand(cmd("snforge", "test")), true);
+  assert.equal(isAgentBuildCommand(cmd("blueprint", "test")), false);
+  assert.equal(isAgentConfirmCommand(cmd("blueprint", "test")), true);
+  assert.equal(isAgentBuildCommand(cmd("npx", "blueprint", "test")), false);
+  assert.equal(isAgentConfirmCommand(cmd("npx", "blueprint", "test")), true);
 });
 
 test("a build command still cannot smuggle a remote/mainnet target in its argv", () => {
@@ -49,8 +83,29 @@ test("a build command still cannot smuggle a remote/mainnet target in its argv",
 
 test("arbitrary non-build, non-test, non-inspection commands stay blocked", () => {
   assert.equal(analyzeAgentBashCommandSafety(cmd("curl", "https://evil.example")).blocked, true);
+  assert.equal(analyzeAgentBashCommandSafety(cmd("env", "FOO=bar", "curl", "https://evil.example")).blocked, true);
+  assert.equal(analyzeAgentBashCommandSafety(cmd("env", "SCARB_CACHE=../outside", "scarb", "fetch")).blocked, true);
+  assert.equal(analyzeAgentBashCommandSafety(cmd("env", "BAD=https://evil.example", "scarb", "fetch")).blocked, true);
   assert.equal(analyzeAgentBashCommandSafety(cmd("rm", "-rf", "x")).blocked, true);
+  assert.equal(analyzeAgentBashCommandSafety(cmd("env", "FOO=bar", "rm", "-rf", "x")).blocked, true);
   assert.equal(analyzeAgentBashCommandSafety(cmd("python3", "-c", "print('unchecked script')")).blocked, true);
+});
+
+test("agent bash allows creating model-owned PoC harness directories only", () => {
+  for (const c of [
+    cmd("mkdir", "-p", "poc/src"),
+    cmd("mkdir", "--parents", "tests/verify_poc/src"),
+    cmd("mkdir", "-p", ".tmp/flounder-repro/src"),
+    cmd("mkdir", "-p", "scratch/harness"),
+  ]) {
+    assert.equal(analyzeAgentBashCommandSafety(c).blocked, false, `${c.program} ${c.args.join(" ")} should be allowed`);
+    assert.equal(isAgentBuildCommand(c), false);
+    assert.equal(isAgentConfirmCommand(c), false);
+  }
+
+  assert.equal(analyzeAgentBashCommandSafety(cmd("mkdir", "src")).blocked, true);
+  assert.equal(analyzeAgentBashCommandSafety(cmd("mkdir", "-p", "../poc")).blocked, true);
+  assert.equal(analyzeAgentBashCommandSafety(cmd("mkdir", "-m", "777", "poc/src")).blocked, true);
 });
 
 test("destructive filesystem commands stay blocked even in network-enabled confirm mode", () => {
@@ -72,7 +127,17 @@ test("destructive filesystem commands stay blocked even in network-enabled confi
 test("agent bash allows readonly tool discovery, version, and local JSON inspection", () => {
   for (const c of [
     cmd("which", "nargo"),
+    cmd("which", "scarb"),
+    cmd("which", "tact"),
     cmd("nargo", "--version"),
+    cmd("scarb", "--version"),
+    cmd("scarb", "--help"),
+    cmd("snforge", "--version"),
+    cmd("sncast", "--version"),
+    cmd("blueprint", "--version"),
+    cmd("func-js", "--version"),
+    cmd("tolk-js", "--version"),
+    cmd("tact", "--version"),
     cmd("forge", "--version"),
     cmd("jq", ".", "provenance/mainnet_rpc_state_20260614.json"),
     cmd("python3", "-m", "json.tool", "provenance/mainnet_rpc_state_20260614.json"),
@@ -125,8 +190,13 @@ test("reproduction command policy allows only structured local test commands", (
   assert.equal(analyzeReproductionCommandSafety({ program: "node", args: ["--test", "repro.test.mjs"] }).blocked, false);
   assert.equal(analyzeReproductionCommandSafety({ program: "forge", args: ["test", "--match-test", "testLocalRepro"] }).blocked, false);
   assert.equal(analyzeReproductionCommandSafety({ program: "ctest", args: ["--test-dir", "build/bbapi-poc", "-R", "noncanonical"] }).blocked, false);
+  assert.equal(analyzeReproductionCommandSafety({ program: "scarb", args: ["test"] }).blocked, false);
+  assert.equal(analyzeReproductionCommandSafety({ program: "snforge", args: ["test"] }).blocked, false);
+  assert.equal(analyzeReproductionCommandSafety({ program: "blueprint", args: ["test"] }).blocked, false);
   assert.equal(analyzeReproductionCommandSafety({ program: "npx", args: ["hardhat", "test", "test/repro.ts"] }).blocked, false);
+  assert.equal(analyzeReproductionCommandSafety({ program: "npx", args: ["blueprint", "test", "tests/repro.spec.ts"] }).blocked, false);
   assert.equal(analyzeReproductionCommandSafety({ program: "yarn", args: ["hardhat", "test", "test/repro.ts"] }).blocked, false);
+  assert.equal(analyzeReproductionCommandSafety({ program: "yarn", args: ["blueprint", "test", "repro"] }).blocked, false);
   assert.equal(analyzeReproductionCommandSafety({ program: "zcash-cli", args: ["-testnet", "sendrawtransaction", "poc"] }).blocked, true);
   assert.equal(analyzeReproductionCommandSafety({ program: "bash", args: ["-lc", "cargo test"] }).blocked, true);
   assert.equal(analyzeReproductionCommandSafety({ program: "cargo;curl", args: ["test"] }).blocked, true);

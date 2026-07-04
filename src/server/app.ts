@@ -1935,6 +1935,39 @@ function confirmableRunDir(row: Record<string, unknown>): string {
   return stringValue(row.run_dir);
 }
 
+function confirmFindingSeeds(store: MetadataStore, projectId: number, rows: Array<{ id?: unknown }>): Array<Record<string, unknown>> {
+  const seeds: Array<Record<string, unknown>> = [];
+  const seen = new Set<number>();
+  for (const row of rows) {
+    const id = Number(row.id);
+    if (!Number.isFinite(id) || seen.has(id)) continue;
+    seen.add(id);
+    const finding = store.getFinding(id);
+    if (!finding || Number(finding.project_id) !== projectId) continue;
+    seeds.push(confirmFindingSeed(finding));
+  }
+  return seeds;
+}
+
+function confirmFindingSeed(row: Record<string, unknown>): Record<string, unknown> {
+  const seed: Record<string, unknown> = {
+    id: stringValue(row.finding_key) || `finding-${stringValue(row.id)}`,
+    originId: numericValue(row.id) ?? undefined,
+    title: stringValue(row.title),
+    location: stringValue(row.location) || undefined,
+    severity: stringValue(row.severity) || undefined,
+    confirmationStatus: stringValue(row.status) || undefined,
+    scopeId: stringValue(row.scope_id) || undefined,
+    description: stringValue(row.description) || undefined,
+    evidence: stringValue(row.evidence) || undefined,
+    exploitSketch: stringValue(row.exploit_sketch) || undefined,
+    fix: stringValue(row.fix) || undefined,
+    confidence: numericValue(row.confidence) ?? undefined,
+  };
+  for (const key of Object.keys(seed)) if (seed[key] === undefined || seed[key] === "") delete seed[key];
+  return seed;
+}
+
 function numberValue(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
@@ -2071,17 +2104,22 @@ async function runLaunch(c: Ctx): Promise<void> {
   const progress = scopeView.hasInventory ? scopeView.progress : emptyProgress();
   const spec = launchSpec(project, body, c.out, profile, progress, phaseProfiles);
   if (spec.verb === "run") {
-    applyProjectPrepareDefaults(spec, project, runs);
-    spec.pipeline = true;
-    const prepared = latestPreparedWorkspace(runs);
-    if (prepared) {
-      spec.dir = undefined;
-      spec.sourcePaths = [prepared.workspaceDir];
-      spec.buildRoot = prepared.workspaceDir;
-      spec.clue = undefined;
-      if (!spec.scopeNote && prepared.scopeNote) spec.scopeNote = prepared.scopeNote;
-    } else if (spec.clue && spec.sourcePaths.length === 0) {
-      resetPipelineCoverageForUnknownInventory(spec);
+    if (spec.sourcePaths.length > 0) {
+      applyProjectSourceDefaults(spec, project);
+      if (!spec.pipeline) spec.pipeline = false;
+    } else {
+      applyProjectPrepareDefaults(spec, project, runs);
+      spec.pipeline = true;
+      const prepared = latestPreparedWorkspace(runs);
+      if (prepared) {
+        spec.dir = undefined;
+        spec.sourcePaths = [prepared.workspaceDir];
+        spec.buildRoot = prepared.workspaceDir;
+        spec.clue = undefined;
+        if (!spec.scopeNote && prepared.scopeNote) spec.scopeNote = prepared.scopeNote;
+      } else if (spec.clue && spec.sourcePaths.length === 0) {
+        resetPipelineCoverageForUnknownInventory(spec);
+      }
     }
   } else if (spec.verb === "prepare") {
     applyProjectPrepareDefaults(spec, project, runs);
@@ -2123,6 +2161,7 @@ async function runLaunch(c: Ctx): Promise<void> {
       spec.inputRunDirs = [...new Set(rows.map((row) => confirmableRunDir(row as unknown as Record<string, unknown>)).filter(Boolean))];
       spec.inputRunDir = spec.inputRunDirs[0];
       spec.confirmKeys = rows.flatMap((row) => confirmSelectorsForFinding(row as unknown as { id?: unknown; finding_key?: unknown }));
+      spec.confirmFindings = confirmFindingSeeds(c.store, Number(project.id), rows);
     } else {
       const pending = c.store.pendingConfirmable(Number(project.id))
         .filter((p) => confirmableRunDir(p as unknown as Record<string, unknown>))
@@ -2135,6 +2174,7 @@ async function runLaunch(c: Ctx): Promise<void> {
       spec.inputRunDirs = [...new Set(rows.map((p) => confirmableRunDir(p as unknown as Record<string, unknown>)).filter(Boolean))];
       spec.inputRunDir = spec.inputRunDirs[0];
       spec.confirmKeys = rows.flatMap((p) => confirmSelectorsForFinding(p as unknown as { id?: unknown; finding_key?: unknown }));
+      spec.confirmFindings = confirmFindingSeeds(c.store, Number(project.id), rows);
       const currentDecisions = currentConfirmDecisions(c.store.listConfirmDecisions(Number(project.id)).filter((row) => rowBelongsToCurrentMaterial(row, currentResultRunIds, materialBoundary)));
       spec.confirmSettledRows = confirmSettledRows(currentDecisions);
     }
@@ -2172,6 +2212,12 @@ function applyProjectPrepareDefaults(spec: LaunchSpec, project: Record<string, u
     spec.posture = stringValue(previousPrepare?.posture) || "blind";
   }
   if (spec.matchDeployed === undefined) spec.matchDeployed = true;
+}
+
+function applyProjectSourceDefaults(spec: LaunchSpec, project: Record<string, unknown>): void {
+  if (spec.scopeNote) return;
+  const cfg = (safeParse(project.config_json) as Record<string, unknown>) ?? {};
+  spec.scopeNote = stringValue(cfg.scopeNote) || stringValue(cfg.projectIntent) || stringValue(cfg.prepareClue);
 }
 
 function resetPipelineCoverageForUnknownInventory(spec: LaunchSpec): void {
@@ -2687,6 +2733,28 @@ function confirmDecisionDisplayRow(row: Record<string, unknown>): Record<string,
   if (adjudication) out.adjudication = adjudication;
   out.has_report = decisionHasFormalReport(row);
   return out;
+}
+
+function confirmDecisionRunHealth(rows: Array<{ reproduced?: unknown; recommendation?: unknown }>): { status: string; reasons: string[]; signals: Record<string, unknown> } | undefined {
+  if (rows.length === 0) return undefined;
+  const couldNotSetUp = rows.filter((row) => row.reproduced === "could-not-set-up").length;
+  const needsHuman = rows.filter((row) => row.recommendation === "needs-human").length;
+  if (couldNotSetUp === 0 && needsHuman === 0) return undefined;
+  const reproducedYes = rows.filter((row) => row.reproduced === "yes").length;
+  const submitCandidates = rows.filter((row) => row.recommendation === "submit-candidate").length;
+  return {
+    status: couldNotSetUp > 0 ? "needs-resource" : "needs-human",
+    reasons: couldNotSetUp > 0
+      ? [`${couldNotSetUp} confirm decision(s) could not be set up; review toolchain, network, or environment blockers before reporting.`]
+      : [`${needsHuman} confirm decision(s) still need human review before reporting.`],
+    signals: {
+      confirmDecisionRows: rows.length,
+      reproducedYes,
+      submitCandidates,
+      needsHuman,
+      couldNotSetUp,
+    },
+  };
 }
 
 function decisionHasFormalReport(row: Record<string, unknown>): boolean {
@@ -3628,7 +3696,11 @@ async function daemonRunUpdate(c: Ctx): Promise<void> {
       }
     }
   }
-  if (body.confirmDecisions) c.store.upsertConfirmDecisions(projectId, runId, body.confirmDecisions, body.decisionPath);
+  if (body.confirmDecisions) {
+    c.store.upsertConfirmDecisions(projectId, runId, body.confirmDecisions, body.decisionPath);
+    const health = confirmDecisionRunHealth(body.confirmDecisions);
+    if (health) c.store.recordRunHealth(runId, health);
+  }
   if (body.finish) c.store.finishRun(runId, body.finish.status, body.finish.coverage, body.finish.findingsTotal);
   c.store.touchJobByRun(runId);
   sendJson(c.res, 200, { ok: true });
@@ -3697,6 +3769,7 @@ async function daemonPipelineWorklist(c: Ctx): Promise<void> {
       inputRunDirs: [...new Set(rows.map((row) => confirmableRunDir(row as unknown as Record<string, unknown>)).filter(Boolean))],
       inputRunDir: rows[0] ? confirmableRunDir(rows[0] as unknown as Record<string, unknown>) || undefined : undefined,
       confirmKeys: rows.flatMap((row) => confirmSelectorsForFinding(row as unknown as { id?: unknown; finding_key?: unknown })),
+      confirmFindings: confirmFindingSeeds(c.store, projectId, rows),
       confirmSettledRows: confirmSettledRows(currentDecisions),
     });
   }
@@ -4104,8 +4177,14 @@ function launchSpec(project: Record<string, unknown>, body: Record<string, unkno
   // resolve via the profile fallback. Materials are RELATIVE to the project dir (resolved on
   // the daemon against its workspace); new projects default dir to their UUID.
   const verb = (typeof body.verb === "string" ? body.verb : "run") as RunKind;
+  const pipeline = body.pipeline === true;
   const phases = (merged.phases && typeof merged.phases === "object" ? merged.phases : {}) as Record<string, { model?: unknown; thinking?: unknown }>;
   const primaryPhase = verb === "prepare" ? "prepare" : verb === "map" ? "map" : verb === "confirm" || verb === "report" ? "confirm" : "dig";
+  const explicitSandboxConfirmNetwork = configOverrides.sandboxConfirmNetwork !== undefined || bodyOverrides.sandboxConfirmNetwork !== undefined;
+  const effectiveSandboxConfirmNetwork =
+    (verb === "prepare" || verb === "confirm" || (verb === "run" && pipeline)) && !explicitSandboxConfirmNetwork
+      ? "enabled"
+      : network(merged.sandboxConfirmNetwork);
   const phaseModel = (ph: string): string | undefined => str(phases[ph]?.model);
   const phaseThinking = (ph: string): string | undefined => str(phases[ph]?.thinking);
   const phaseProfile = (ph: "prepare" | "map" | "dig" | "confirm"): ProviderProfile | undefined => phaseProfiles[ph] ?? profile;
@@ -4150,14 +4229,14 @@ function launchSpec(project: Record<string, unknown>, body: Record<string, unkno
     sandboxImage: str(merged.sandboxImage),
     sandboxAllowHostFallback: typeof merged.sandboxAllowHostFallback === "boolean" ? merged.sandboxAllowHostFallback : undefined,
     sandboxPrepareNetwork: network(merged.sandboxPrepareNetwork),
-    sandboxConfirmNetwork: network(merged.sandboxConfirmNetwork),
+    sandboxConfirmNetwork: effectiveSandboxConfirmNetwork,
     sandboxMemoryMb: num(merged.sandboxMemoryMb),
     sandboxCpus: num(merged.sandboxCpus),
     remap: Boolean(body.remap),
     fresh: Boolean(body.fresh),
     quick: Boolean(body.quick),
     mockLlm: Boolean(body.mockLlm),
-    pipeline: Boolean(body.pipeline),
+    pipeline,
     verifyFromStart: Boolean(body.verifyFromStart),
     region: str(body.region),
     scope: str(body.scope),

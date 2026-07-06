@@ -8,7 +8,7 @@ import { writeLastRunPointer } from "../trace/last-run.js";
 import { RunLogger } from "../trace/logger.js";
 import type { Doc } from "../types.js";
 import { publicPath } from "../util/paths.js";
-import { enforceSubmissionReadiness } from "../util/submission-readiness.js";
+import { enforceSubmissionReadiness, isResumeSettledDecision } from "../util/submission-readiness.js";
 import { consolidateByFixEquivalence, type FixEquivEdge, type FixEquivItem } from "./consolidate.js";
 import { RunRecorder, type RunTrackerFactory } from "../db/record.js";
 import { findingContentKey } from "../util/finding-key.js";
@@ -157,8 +157,8 @@ export async function runConfirm(
   };
   recordConfirmStage();
   // RESUME (auto, unless --fresh): an interrupted prior confirm of THIS input run left a
-  // decision sheet; carry its already-SETTLED rows (reproduced yes/no) forward and tell
-  // the model to skip them, so a re-run continues instead of re-reproducing from scratch.
+  // decision sheet; carry only rows that are actually final for the pipeline, so a re-run
+  // continues instead of re-reproducing settled work while still retrying open submit gates.
   const settled = options.fresh ? [] : mergeSettledRows([...(options.settledDecisions ?? []), ...await loadSettledFromPriorConfirm(confirmCfg.outputDir, confirmCfg.targetName, inputRunDir, logger.runDir, runDirs)]);
   let seed = renderFindingsSeed(priorFindings);
   if (settled.length > 0) {
@@ -543,7 +543,7 @@ function mergeSettledRows(rows: ConfirmDecisionRow[]): ConfirmDecisionRow[] {
     const keys = row.members.map((member) => member.trim().toLowerCase()).filter(Boolean);
     return keys.length > 0 ? keys : [row.bug.trim().toLowerCase()].filter(Boolean);
   };
-  for (const row of rows.filter((entry) => entry.reproduced === "yes" || entry.reproduced === "no")) {
+  for (const row of rows.filter((entry) => isResumeSettledDecision(entry))) {
     const keys = memberKeys(row);
     if (keys.length > 0 && keys.every((key) => covered.has(key))) continue;
     out.push(row);
@@ -868,7 +868,7 @@ export async function loadSettledFromPriorConfirm(outputDir: string, targetName:
       const settled = items
         .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
         .map(normalizeDecisionRow);
-      for (const row of settled.filter((entry) => entry.reproduced === "yes" || entry.reproduced === "no")) {
+      for (const row of settled.filter((entry) => isResumeSettledDecision(entry))) {
         const keys = memberKeys(row);
         if (keys.length > 0 && keys.every((key) => covered.has(key))) continue;
         rows.push(row);

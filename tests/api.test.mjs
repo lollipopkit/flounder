@@ -505,7 +505,7 @@ test("api: standard pipeline continue finishes pending verify work before openin
   });
 });
 
-test("api: standard pipeline continue opens next scope batch when only needs-human decisions remain", async () => {
+test("api: standard pipeline continue keeps reproduced needs-human decisions in confirm before opening the next scope batch", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();
     const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -556,7 +556,7 @@ test("api: standard pipeline continue opens next scope batch when only needs-hum
     assert.equal(pipelineSpec.pipeline, true);
     assert.equal(pipelineSpec.coverageMode, "standard");
     assert.equal(pipelineSpec.coverageTarget, 30);
-    assert.equal(pipelineSpec.maxScopes, 12);
+    assert.equal(pipelineSpec.maxScopes, 0);
   });
 });
 
@@ -801,9 +801,10 @@ test("api: daemon pipeline worklist exposes verify candidates before confirm", a
       body: JSON.stringify({ project: "pipeline-verify-worklist", phase: "confirm" }),
     }));
     assert.ok(confirm.confirmKeys.includes("confirmed-bug"));
+    assert.ok(confirm.confirmKeys.includes("kgateblocked"), "confirm worklist retries reproduced needs-human decisions whose submission gates remain open");
     assert.ok(!confirm.confirmKeys.includes("kalreadyreproduced"), "confirm worklist skips prior decided findings");
-    assert.ok(!confirm.confirmKeys.includes("kgateblocked"), "confirm worklist skips needs-human decisions already covered by confirm_decision rows");
     assert.ok(confirm.confirmFindings.some((finding) => finding.id === "confirmed-bug" && finding.originId), "confirm worklist carries DB-backed finding seeds");
+    assert.ok(confirm.confirmFindings.some((finding) => finding.id === "kgateblocked" && finding.originId), "confirm worklist carries DB-backed seeds for submission-readiness retries");
     assert.deepEqual(confirm.confirmSettledRows.map((row) => row.bug), ["prior reproduced withdrawal proof"]);
     assert.ok(confirm.confirmKeys.some((key) => /^origin:\d+:confirmed-bug$/.test(key)), "worklist carries origin selector for verify-artifact recovery");
 

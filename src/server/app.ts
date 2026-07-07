@@ -262,7 +262,7 @@ const ROUTES: Route[] = [
     params: { uuid: "project UUID" },
     body: {
       verb: "'run' | 'map' | 'audit' | 'confirm' | 'report' | 'prepare' (default 'run'; project run = prepare-if-needed→map/dig→synthesize→verify→confirm→report; source run = map→dig→synthesize→verify)",
-      remap: "boolean? — re-enumerate scopes (restart)", appendMap: "boolean? — expand the existing scope inventory by appending novel scopes", fresh: "boolean? — confirm: ignore a prior interrupted confirm",
+      remap: "boolean? — re-enumerate scopes (restart)", appendMap: "boolean? — expand the existing scope inventory by appending novel scopes", appendMapSeedPaths: "string[]? — extra prior scope inventories used only as append-map covered-reference seed", fresh: "boolean? — confirm: ignore a prior interrupted confirm",
       quick: "boolean? — run: single breadth pass", mockLlm: "boolean? — offline mock model",
       verifyFromStart: "boolean? — run/continue pipeline: re-run Verify from the beginning instead of only pending candidates",
       region: "string? — audit: pinned region e.g. src/Foo.sol:120-180", scope: "string? — audit: scope id(s)", verifyFindings: "object|array? — audit: inline suspected finding(s) to confirm-or-refute by execution; project finding rows with id are linked back to that original row",
@@ -440,7 +440,7 @@ const ROUTES: Route[] = [
       provider: "string?", model: "string?", thinking: "string?",
       scopeCoverageMode: "focused|standard|half|full|custom? — standard/focused are cumulative project targets, not per-run additions", maxScopes: "number?", mapSteps: "number?", digSteps: "number?", maxSteps: "number?", digSamples: "number?", digConcurrency: "number?",
       sandboxBackend: "'auto'|'oci'|'apple-container'|'host'?", sandboxImage: "string?", sandboxAllowHostFallback: "boolean?", sandboxPrepareNetwork: "'none'|'enabled'?", sandboxConfirmNetwork: "'none'|'enabled'?",
-      remap: "boolean?", appendMap: "boolean? — expand existing scope inventory by appending novel scopes", quick: "boolean?", mockLlm: "boolean?", pipeline: "boolean? — run clue pipeline: prepare if needed -> map/dig -> synthesize -> verify -> confirm -> report", continueCoverage: "boolean? — explicit opt-in to open the next mapped scope batch after the current pipeline round is fully settled", verifyFromStart: "boolean? — pipeline: re-run Verify from the beginning instead of only pending candidates", region: "string?", scope: "string?", scopeNote: "string? — map/audit: 'authorized scope note' that focuses map on the in-scope target (the pipeline auto-derives it from prepare's manifest)", verifyFindings: "object|array? — audit: inline suspected finding(s) to confirm-or-refute by execution",
+      remap: "boolean?", appendMap: "boolean? — expand existing scope inventory by appending novel scopes", appendMapSeedPaths: "string[]? — extra prior scope inventories used only as append-map covered-reference seed", quick: "boolean?", mockLlm: "boolean?", pipeline: "boolean? — run clue pipeline: prepare if needed -> map/dig -> synthesize -> verify -> confirm -> report", continueCoverage: "boolean? — explicit opt-in to open the next mapped scope batch after the current pipeline round is fully settled", verifyFromStart: "boolean? — pipeline: re-run Verify from the beginning instead of only pending candidates", region: "string?", scope: "string?", scopeNote: "string? — map/audit: 'authorized scope note' that focuses map on the in-scope target (the pipeline auto-derives it from prepare's manifest)", verifyFindings: "object|array? — audit: inline suspected finding(s) to confirm-or-refute by execution",
       inputRunDir: "string? — confirm", fresh: "boolean? — confirm",
       clue: "string? — prepare", posture: "string? — prepare", matchDeployed: "boolean? — prepare", endpoint: "string? — prepare",
     },
@@ -1344,11 +1344,11 @@ function latestScopeCheckpoint(runs: Array<Record<string, unknown>>): { scopes: 
   const run = runs.find((entry) => ["run", "map", "audit"].includes(String(entry.kind)) && typeof entry.run_dir === "string");
   if (!run) return null;
   const runDir = path.resolve(String(run.run_dir));
-  const candidates = [
-    path.join(runDir, "audit", "workspace", "scopes.json"),
-    path.join(runDir, "scopes.json"),
-    path.join(runDir, "inventory", "scopes.json"),
-  ];
+  const finalScopes = path.join(runDir, "audit_scopes.json");
+  const workspaceScopes = path.join(runDir, "audit", "workspace", "scopes.json");
+  const candidates = stringValue(run.status) === "running"
+    ? [workspaceScopes, finalScopes, path.join(runDir, "scopes.json"), path.join(runDir, "inventory", "scopes.json")]
+    : [finalScopes, workspaceScopes, path.join(runDir, "scopes.json"), path.join(runDir, "inventory", "scopes.json")];
   const file = candidates.find((candidate) => existsSync(candidate));
   if (!file) return null;
   try {
@@ -2767,6 +2767,7 @@ function normalizeLaunchSpec(body: Record<string, unknown>, target: string, verb
     sandboxCpus: num(body.sandboxCpus),
     remap: bool(body.remap),
     appendMap: bool(body.appendMap),
+    appendMapSeedPaths: list(body.appendMapSeedPaths),
     fresh: bool(body.fresh),
     quick: bool(body.quick),
     mockLlm: bool(body.mockLlm),
@@ -4417,6 +4418,7 @@ function launchSpec(store: MetadataStore, project: Record<string, unknown>, body
     sandboxCpus: num(merged.sandboxCpus),
     remap: Boolean(body.remap),
     appendMap: Boolean(body.appendMap),
+    appendMapSeedPaths: list(body.appendMapSeedPaths, undefined),
     fresh: Boolean(body.fresh),
     quick: Boolean(body.quick),
     mockLlm: Boolean(body.mockLlm),

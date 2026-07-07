@@ -62,6 +62,7 @@ export interface LaunchSpec {
   digConcurrency?: number | undefined;
   remap?: boolean | undefined; // run/map/audit: re-enumerate the scope inventory (restart)
   appendMap?: boolean | undefined; // run/map: expand the existing scope inventory without replacing prior scopes
+  appendMapSeedPaths?: string[] | undefined; // run/map/audit append-map: extra prior scope inventories used only as covered-reference seed
   fresh?: boolean | undefined; // confirm: ignore a prior interrupted confirm
   inputRunDir?: string | undefined; // confirm: the finished run dir to reproduce
   inputRunDirs?: string[] | undefined; // confirm (aggregate): several run dirs whose confirmed findings are unioned + reproduced together
@@ -141,8 +142,10 @@ export function specToConfig(spec: LaunchSpec, out: string, workspace?: string):
   cfg.targetName = spec.target;
   const root = spec.dir !== undefined ? resolveUnder(path.resolve(workspace ?? "."), spec.dir, "project dir") : undefined;
   const resolveMat = (p: string): string => (root ? resolveUnder(root, p, "project material") : p);
+  const resolveSeed = (p: string): string => (root && !path.isAbsolute(p) ? resolveUnder(root, p, "append-map seed") : p);
   cfg.sourcePaths = spec.sourcePaths.map(resolveMat);
   cfg.corpusPaths = (spec.corpusPaths ?? []).map(resolveMat);
+  cfg.auditAppendMapSeedPaths = (spec.appendMapSeedPaths ?? []).map(resolveSeed);
   if (spec.buildRoot) cfg.buildRoot = resolveMat(spec.buildRoot);
   else if (root) cfg.buildRoot = root; // default the buildable root to the whole project dir
   if (spec.provider) cfg.provider = spec.provider;
@@ -260,6 +263,7 @@ export function buildArgs(spec: LaunchSpec): string[] {
   if (spec.digConcurrency !== undefined) args.push("--dig-concurrency", String(spec.digConcurrency));
   if (spec.remap && spec.verb !== "confirm") args.push("--remap");
   if (spec.appendMap && (spec.verb === "run" || spec.verb === "map")) args.push("--append-map");
+  for (const seedPath of spec.appendMapSeedPaths ?? []) args.push("--append-map-seed", seedPath);
   if (spec.fresh && spec.verb === "confirm") args.push("--fresh");
   if (spec.quick && spec.verb === "run") args.push("--quick");
   if (spec.mockLlm) args.push("--mock-llm");

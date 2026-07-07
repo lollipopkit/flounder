@@ -146,6 +146,7 @@ export async function runSandboxCommand(
   // dependency builds are downloaded once and reused across runs. HOME stays the
   // per-run workspace either way, so host credentials/config are never exposed.
   if (cacheDir) await mkdir(cacheDir, { recursive: true });
+  await restoreSandboxToolCaches(workspaceAbsolute, cacheDir);
   const raw = await runWithSelectedBackend({
     command,
     workspaceAbsolute,
@@ -155,6 +156,7 @@ export async function runSandboxCommand(
     maxLogBytes,
     options: normalizeSandboxExecutionOptions(executionOptions),
   });
+  await persistSandboxToolCaches(workspaceAbsolute, cacheDir);
 
   const redactionScope = [workspaceAbsolute, tmpDir, ...redactPaths, ...machineRedactionPaths()];
   return {
@@ -166,6 +168,16 @@ export async function runSandboxCommand(
     stdout: redactMachineStrings(redactLocalPaths(raw.stdout, redactionScope)),
     stderr: redactMachineStrings(redactLocalPaths(raw.stderr, redactionScope)),
   };
+}
+
+async function restoreSandboxToolCaches(workspaceAbsolute: string, cacheDir?: string): Promise<void> {
+  if (!cacheDir) return;
+  await mergeDirectoryContents(path.join(cacheDir, "foundry-svm"), path.join(workspaceAbsolute, ".svm"));
+}
+
+async function persistSandboxToolCaches(workspaceAbsolute: string, cacheDir?: string): Promise<void> {
+  if (!cacheDir) return;
+  await mergeDirectoryContents(path.join(workspaceAbsolute, ".svm"), path.join(cacheDir, "foundry-svm"));
 }
 
 function normalizeSandboxExecutionOptions(input: SandboxExecutionOptions): SandboxProcessOptions {
@@ -618,6 +630,12 @@ async function copyDirectoryContents(sourceDir: string, targetDir: string): Prom
     if (shouldSkipCopyName(entry.name)) continue;
     await copySourcePath(path.join(sourceDir, entry.name), path.join(targetDir, entry.name));
   }
+}
+
+async function mergeDirectoryContents(sourceDir: string, targetDir: string): Promise<void> {
+  if (!(await isDirectory(sourceDir))) return;
+  await mkdir(targetDir, { recursive: true });
+  await copyDirectoryContents(sourceDir, targetDir);
 }
 
 async function copySourcePath(sourcePath: string, targetPath: string): Promise<void> {

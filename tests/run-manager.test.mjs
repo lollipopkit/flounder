@@ -86,6 +86,20 @@ test("buildArgs: verify-from-start is an explicit run pipeline flag", () => {
   assert.equal(specToConfig({ verb: "run", target: "p", sourcePaths: ["./s"], verifyFromStart: true }, "runs").auditVerifyFromStart, true);
 });
 
+test("buildArgs/specToConfig: append-map can carry extra seed inventories", () => {
+  const args = buildArgs({ verb: "map", target: "p", sourcePaths: ["./s"], appendMap: true, appendMapSeedPaths: ["/old/audit_scopes.json", "local/scopes.json"] });
+  assert.ok(args.includes("--append-map"));
+  assert.deepEqual(args.slice(args.indexOf("--append-map-seed")), ["--append-map-seed", "/old/audit_scopes.json", "--append-map-seed", "local/scopes.json", "--out", defaultOutputDir()]);
+
+  const cfg = specToConfig(
+    { verb: "map", target: "p", dir: "proj", sourcePaths: ["src"], appendMap: true, appendMapSeedPaths: ["/old/audit_scopes.json", "local/scopes.json"] },
+    "runs",
+    "/ws",
+  );
+  assert.equal(cfg.auditAppendMap, true);
+  assert.deepEqual(cfg.auditAppendMapSeedPaths, ["/old/audit_scopes.json", path.resolve("/ws/proj/local/scopes.json")]);
+});
+
 test("buildArgs: confirm without a run dir is rejected", () => {
   assert.throws(() => buildArgs({ verb: "confirm", target: "p", sourcePaths: ["./s"] }), /inputRunDir/);
 });

@@ -411,6 +411,46 @@ test("sandbox host backend is explicit and still uses isolated HOME and caches",
   }
 });
 
+test("sandbox reuses Foundry solc cache across isolated HOME directories", async () => {
+  const workspace = await tempDir("flounder-sandbox-svm-home-");
+  const cache = await tempDir("flounder-sandbox-svm-cache-");
+  try {
+    await mkdir(path.join(cache, "foundry-svm", "0.8.35"), { recursive: true });
+    await writeFile(path.join(cache, "foundry-svm", "0.8.35", "solc-0.8.35"), "cached-solc");
+
+    const result = await runSandboxCommand(
+      {
+        program: process.execPath,
+        args: [
+          "-e",
+          [
+            "const fs = require('node:fs');",
+            "const path = require('node:path');",
+            "const cached = path.join(process.env.HOME, '.svm', '0.8.35', 'solc-0.8.35');",
+            "console.log('cached=' + fs.existsSync(cached));",
+            "const installedDir = path.join(process.env.HOME, '.svm', '0.8.33');",
+            "fs.mkdirSync(installedDir, { recursive: true });",
+            "fs.writeFileSync(path.join(installedDir, 'solc-0.8.33'), 'installed-solc');",
+          ].join(" "),
+        ],
+        timeoutMs: 10_000,
+      },
+      workspace,
+      4000,
+      [cache],
+      cache,
+      { backend: "host", allowHostFallback: true, network: "none" },
+    );
+
+    assert.equal(result.exitCode, 0);
+    assert.match(result.stdout, /cached=true/);
+    assert.equal(await readFile(path.join(cache, "foundry-svm", "0.8.33", "solc-0.8.33"), "utf8"), "installed-solc");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+    await rm(cache, { recursive: true, force: true });
+  }
+});
+
 test("sandbox timeouts kill processes that ignore SIGTERM", async () => {
   const workspace = await tempDir("flounder-sandbox-timeout-");
   try {

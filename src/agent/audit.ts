@@ -292,8 +292,9 @@ export async function runAudit(
     // dig. The resumable `flounder audit` digs from this inventory afterwards.
     const inventoryDir = projectHistoryDir(historyLocation(cfg));
     const existing = cfg.auditAppendMap ? await loadScopeInventory(inventoryDir) : [];
-    const mapSeed = await writeAppendMapExistingScopesSeed(existing, workspaceCwd);
-    if (existing.length > 0) await logger.event("audit_map_append_start", { existing: existing.length, seed: mapSeed });
+    const seedScopes = await loadAppendMapSeedScopes(cfg);
+    const mapSeed = await writeAppendMapExistingScopesSeed([...existing, ...seedScopes], workspaceCwd);
+    if (existing.length > 0 || seedScopes.length > 0) await logger.event("audit_map_append_start", { existing: existing.length, seedScopes: seedScopes.length, seed: mapSeed });
     const mapPhase = await runPhase(withRole(cfg, "map"), {
       mode: "map",
       maxSteps: cfg.auditMapSteps,
@@ -331,13 +332,14 @@ export async function runAudit(
     const picked = cfg.auditScopeIds ?? [];
     scopeInventory = cfg.auditRemap ? [] : await loadScopeInventory(inventoryDir);
     const appendExisting = cfg.auditAppendMap ? scopeInventory : [];
+    const appendSeedScopes = cfg.auditAppendMap ? await loadAppendMapSeedScopes(cfg) : [];
     const resuming = scopeInventory.length > 0 && !cfg.auditAppendMap;
     if (!resuming && (picked.length > 0 || cfg.auditRequireInventory)) {
       throw new Error("`flounder audit` needs an existing scope inventory; run `flounder map` first to enumerate scopes (then pick with `--scope` from audit_scopes.json), or `flounder run` to map and audit in one pass.");
     }
     if (!resuming) {
-      const mapSeed = await writeAppendMapExistingScopesSeed(appendExisting, workspaceCwd);
-      if (appendExisting.length > 0) await logger.event("audit_map_append_start", { existing: appendExisting.length, seed: mapSeed });
+      const mapSeed = await writeAppendMapExistingScopesSeed([...appendExisting, ...appendSeedScopes], workspaceCwd);
+      if (appendExisting.length > 0 || appendSeedScopes.length > 0) await logger.event("audit_map_append_start", { existing: appendExisting.length, seedScopes: appendSeedScopes.length, seed: mapSeed });
       const mapPhase = await runPhase(withRole(cfg, "map"), {
         mode: "map",
         maxSteps: cfg.auditMapSteps,
@@ -1197,6 +1199,37 @@ function deriveScopeNoteFromSource(sourcePaths: string[]): string | undefined {
 function renderMemoryHint(notes: { kind: string; note: string; sourceRef?: string }[]): string {
   if (notes.length === 0) return "";
   return notes.map((note) => `- [${note.kind}] ${note.note}${note.sourceRef ? ` (ref: ${note.sourceRef})` : ""}`).join("\n");
+}
+
+async function loadAppendMapSeedScopes(cfg: AuditorConfig): Promise<AuditScope[]> {
+  const out: AuditScope[] = [];
+  for (const seedPath of cfg.auditAppendMapSeedPaths) {
+    const parsed = JSON.parse(readFileSync(seedPath, "utf8")) as unknown;
+    const scopes = Array.isArray(parsed)
+      ? parsed
+      : parsed && typeof parsed === "object" && Array.isArray((parsed as { scopes?: unknown }).scopes)
+        ? (parsed as { scopes: unknown[] }).scopes
+        : undefined;
+    if (!scopes) throw new Error(`append-map seed must be a scope array or {scopes}: ${seedPath}`);
+    for (const scope of scopes) {
+      if (!scope || typeof scope !== "object") continue;
+      const candidate = scope as Partial<AuditScope>;
+      if (typeof candidate.region !== "string" || typeof candidate.obligation !== "string") continue;
+      out.push({
+        id: typeof candidate.id === "string" ? candidate.id : `seed-${out.length + 1}`,
+        status: candidate.status ?? "pending",
+        region: candidate.region,
+        obligation: candidate.obligation,
+        lenses: Array.isArray(candidate.lenses) ? candidate.lenses : [],
+        exposure: typeof candidate.exposure === "string" ? candidate.exposure : "",
+        difficulty: typeof candidate.difficulty === "string" ? candidate.difficulty : "",
+        score: typeof candidate.score === "number" ? candidate.score : 0,
+        why: typeof candidate.why === "string" ? candidate.why : "",
+        source: candidate.source ?? "map",
+      });
+    }
+  }
+  return out;
 }
 
 async function writeAppendMapExistingScopesSeed(scopes: AuditScope[], workspaceCwd: string): Promise<string | undefined> {

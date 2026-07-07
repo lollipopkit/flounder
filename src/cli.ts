@@ -272,6 +272,7 @@ async function parseConfig(args: string[]): Promise<{ cfg: AuditorConfig }> {
   cfg.auditDigConcurrency = readIntFlag(args, "--dig-concurrency") ?? cfg.auditDigConcurrency;
   if (args.includes("--remap")) cfg.auditRemap = true;
   if (args.includes("--append-map") || args.includes("--expand-map")) cfg.auditAppendMap = true;
+  cfg.auditAppendMapSeedPaths = readMultiFlag(args, "--append-map-seed");
   if (args.includes("--dry-run")) cfg.dryRun = true;
   const thinking = readFlag(args, "--thinking");
   if (thinking === "off" || thinking === "minimal" || thinking === "low" || thinking === "medium" || thinking === "high" || thinking === "xhigh") {
@@ -566,6 +567,8 @@ function buildAuditSpec(cmd: "run" | "map" | "audit", rest: string[], cfg: Audit
   if (cmd === "run" && rest.includes("--quick")) spec.quick = true;
   if (rest.includes("--remap")) spec.remap = true;
   if (rest.includes("--append-map") || rest.includes("--expand-map")) spec.appendMap = true;
+  const appendMapSeedPaths = readMultiFlag(rest, "--append-map-seed");
+  if (appendMapSeedPaths.length > 0) spec.appendMapSeedPaths = appendMapSeedPaths;
   if (cmd === "run" && rest.includes("--verify-from-start")) spec.verifyFromStart = true;
   if (rest.includes("--mock-llm")) spec.mockLlm = true; // offline mock model, executed by the daemon
   if (cmd === "audit") {
@@ -736,7 +739,7 @@ function firstPositional(args: string[]): string | undefined {
     "--dig-concurrency", "--scope", "--scope-note", "--max-tokens", "--repro-timeout-ms",
     "--sandbox-backend", "--sandbox-image", "--prepare-network", "--confirm-network",
     "--sandbox-memory-mb", "--sandbox-cpus", "--prepare-timeout-ms", "--scope-coverage-mode",
-    "--coverage",
+    "--coverage", "--append-map-seed",
   ]);
   for (let i = 0; i < args.length; i += 1) {
     const token = args[i];

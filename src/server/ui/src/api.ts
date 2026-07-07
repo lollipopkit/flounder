@@ -433,6 +433,7 @@ export interface LaunchPayload {
   continueCoverage?: boolean;
   remap?: boolean;
   appendMap?: boolean;
+  appendMapSeedPaths?: string[];
   verifyFromStart?: boolean;
   findingId?: number;
   findingIds?: number[];

@@ -65,6 +65,10 @@ export interface AuditorConfig {
   // Expand the persisted scope inventory by running MAP with the existing
   // inventory visible, then append only novel scopes. Existing statuses are kept.
   auditAppendMap: boolean;
+  // Extra scope inventory artifact(s) to show MAP in append mode as already-covered
+  // reference material. These are seed-only and are not persisted into the current
+  // inventory unless MAP independently emits novel scopes.
+  auditAppendMapSeedPaths: string[];
   // After the per-scope dig, run one cross-scope SYNTHESIS pass (sink-driven composition) to find
   // bugs that only exist in the COMPOSITION of components. Default on for map→dig; set false to skip.
   auditSynthesize?: boolean;
@@ -199,6 +203,7 @@ export function defaultConfig(): AuditorConfig {
     auditDigConcurrency: 1,
     auditRemap: false,
     auditAppendMap: false,
+    auditAppendMapSeedPaths: [],
     auditMapOnly: false,
     auditRequireInventory: false,
     auditVerifyFromStart: false,

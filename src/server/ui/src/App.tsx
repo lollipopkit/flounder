@@ -3088,7 +3088,6 @@ function ProjectDetailView(props: {
           onLaunch={props.onLaunch}
           onPatchScope={props.onPatchScope}
           onPatchBacklog={props.onPatchBacklog}
-          onOpenSetup={openSetupTab}
         />
       ) : null}
       {tab === "decisions" ? <ProjectDecisions detail={currentDetail} onOpenFinding={openLinkedFinding} onOpenDecisionReport={props.onOpenDecisionReport} /> : null}
@@ -3452,26 +3451,26 @@ function runHealthDetail(health: ProjectDetail["latestRunHealth"] | RunRow["runH
   return [steps, commands].filter(Boolean).join(" · ") || "No framework health blocker detected.";
 }
 
-type BacklogGroupId = "agent-runnable" | "needs-resource" | "needs-decision";
+type BacklogGroupId = "agent-runnable" | "agent-resource" | "agent-review";
 
 const BACKLOG_GROUPS: Array<{ id: BacklogGroupId; label: string; detail: string; empty: string }> = [
   {
     id: "agent-runnable",
-    label: "Agent can run",
+    label: "Coverage work",
     detail: "Coverage gaps and follow-up scopes that can be handled with Continue, Expand map, or scope prioritization.",
-    empty: "No agent-runnable backlog items.",
+    empty: "No coverage backlog items.",
   },
   {
-    id: "needs-resource",
-    label: "Needs resource",
-    detail: "Toolchain, sandbox, dependency, credential, or source material requests that need operator or environment work.",
-    empty: "No resource blockers.",
+    id: "agent-resource",
+    label: "Setup work",
+    detail: "Toolchain, sandbox, dependency, credential, or source material requests the agent should resolve or narrow to an explicit ask.",
+    empty: "No setup backlog items.",
   },
   {
-    id: "needs-decision",
-    label: "Needs decision",
-    detail: "Backlog rows without a safe automatic action mapping.",
-    empty: "No decision-only backlog items.",
+    id: "agent-review",
+    label: "Routing work",
+    detail: "Backlog rows the agent should inspect and route to the right safe workflow action.",
+    empty: "No routing backlog items.",
   },
 ];
 
@@ -3480,44 +3479,41 @@ function NextActionsView({
   onLaunch,
   onPatchScope,
   onPatchBacklog,
-  onOpenSetup,
 }: {
   detail: ProjectDetail;
   onLaunch: (action: LaunchAction) => void;
   onPatchScope: (scopeId: string, body: unknown) => Promise<void> | void;
   onPatchBacklog: (id: number, status: string) => Promise<void> | void;
-  onOpenSetup: () => void;
 }) {
   const items = detail.discoveryBacklog ?? [];
-  const open = backlogOpenCount(items, detail.backlogCounts ?? {});
   const groupCounts = backlogActionGroupCounts(items);
   const currentRuns = currentMaterialRuns(detail.runs, detail.material);
   const runningRun = currentRuns.find((run) => run.status === "running");
-  const runnable = backlogGroupItems(items, "agent-runnable");
-  const canRunAgentQueue = runnable.length > 0 && !runningRun;
+  const openItems = backlogOpenItems(items);
+  const canRunAgentQueue = openItems.length > 0 && !runningRun;
   return (
     <div id="project-next-actions" className="section-anchor">
-      <Card title={<span>Next actions <Counter>{open}</Counter></span>}>
+      <Card title="Next actions">
         <div className="next-actions-head">
           <div>
-            <strong>{runnable.length ? `${plural(runnable.length, "item")} can be advanced by the agent` : "No agent-runnable backlog item is loaded"}</strong>
-            <small>Resource and decision rows stay visible; automatic work should only run items marked agent-runnable.</small>
+            <strong>{openItems.length ? `${plural(openItems.length, "item")} assigned to the agent` : "No open next actions"}</strong>
+            <small>The agent owns technical follow-up. It should ask the operator only for explicit credentials, authorization, or unavailable external resources.</small>
           </div>
           <Button
             size="sm"
             variant="primary"
             icon="play"
             disabled={!canRunAgentQueue}
-            title={runningRun ? "A run is already active for this project." : runnable.length ? "Continue the project pipeline against agent-runnable backlog." : "No agent-runnable backlog items."}
+            title={runningRun ? "A run is already active for this project." : openItems.length ? "Continue the project pipeline against open next actions." : "No open next actions."}
             onClick={() => onLaunch("run")}
           >
             Run agent queue
           </Button>
         </div>
         <div className="queue-grid next-action-metrics">
-          <QueueItem label="Agent can run" value={String(groupCounts["agent-runnable"])} detail="Continue, append map, or prioritize scope without operator input." />
-          <QueueItem label="Needs resource" value={String(groupCounts["needs-resource"])} detail="Requires setup, auth, sandbox, dependency, source, or toolchain work." />
-          <QueueItem label="Needs decision" value={String(groupCounts["needs-decision"])} detail="Requires a human/product mapping before automatic execution." />
+          <QueueItem label="Coverage work" value={String(groupCounts["agent-runnable"])} detail="Continue, append map, or prioritize scope." />
+          <QueueItem label="Setup work" value={String(groupCounts["agent-resource"])} detail="Resolve toolchain, sandbox, dependency, source, or auth blockers when possible." />
+          <QueueItem label="Routing work" value={String(groupCounts["agent-review"])} detail="Inspect ambiguous rows and choose the next safe workflow action." />
         </div>
         <div className="next-action-groups">
           {BACKLOG_GROUPS.map((group) => {
@@ -3541,7 +3537,6 @@ function NextActionsView({
                         onLaunch={onLaunch}
                         onPatchScope={onPatchScope}
                         onPatchBacklog={onPatchBacklog}
-                        onOpenSetup={onOpenSetup}
                       />
                     ))}
                   </div>
@@ -3563,14 +3558,12 @@ function NextActionRow({
   onLaunch,
   onPatchScope,
   onPatchBacklog,
-  onOpenSetup,
 }: {
   item: DiscoveryBacklogRow;
   running: boolean;
   onLaunch: (action: LaunchAction) => void;
   onPatchScope: (scopeId: string, body: unknown) => Promise<void> | void;
   onPatchBacklog: (id: number, status: string) => Promise<void> | void;
-  onOpenSetup: () => void;
 }) {
   const group = backlogGroupId(item);
   const recommended = backlogRecommendedAction(item);
@@ -3597,7 +3590,7 @@ function NextActionRow({
         {group === "agent-runnable" && recommended !== "expand-map" ? (
           <Button size="sm" icon="play" disabled={running} onClick={() => onLaunch("run")}>{recommended === "prioritize-scope" && scopeId ? "Continue" : primaryLabel}</Button>
         ) : null}
-        {group === "needs-resource" ? <Button size="sm" onClick={onOpenSetup}>Setup</Button> : null}
+        {group === "agent-resource" || group === "agent-review" ? <Button size="sm" icon="play" disabled={running} onClick={() => onLaunch("run")}>{primaryLabel}</Button> : null}
         {item.status === "open" ? <Button size="sm" onClick={() => void Promise.resolve(onPatchBacklog(item.id, "resolved"))}>Resolve</Button> : null}
         {item.status === "open" ? <Button size="sm" onClick={() => void Promise.resolve(onPatchBacklog(item.id, "ignored"))}>Ignore</Button> : null}
       </span>
@@ -3609,10 +3602,6 @@ function backlogOpenItems(items: DiscoveryBacklogRow[]): DiscoveryBacklogRow[] {
   return items.filter((item) => item.status === "open");
 }
 
-function backlogOpenCount(items: DiscoveryBacklogRow[], counts: Record<string, number>): number {
-  return counts.open ?? backlogOpenItems(items).length;
-}
-
 function backlogGroupItems(items: DiscoveryBacklogRow[], group: BacklogGroupId): DiscoveryBacklogRow[] {
   return backlogOpenItems(items).filter((item) => backlogGroupId(item) === group);
 }
@@ -3620,30 +3609,32 @@ function backlogGroupItems(items: DiscoveryBacklogRow[], group: BacklogGroupId):
 function backlogActionGroupCounts(items: DiscoveryBacklogRow[]): Record<BacklogGroupId, number> {
   return {
     "agent-runnable": backlogGroupItems(items, "agent-runnable").length,
-    "needs-resource": backlogGroupItems(items, "needs-resource").length,
-    "needs-decision": backlogGroupItems(items, "needs-decision").length,
+    "agent-resource": backlogGroupItems(items, "agent-resource").length,
+    "agent-review": backlogGroupItems(items, "agent-review").length,
   };
 }
 
 function backlogGroupId(item: DiscoveryBacklogRow): BacklogGroupId {
-  if (item.actionability === "agent-runnable" || item.actionability === "needs-resource" || item.actionability === "needs-decision") return item.actionability;
-  if (item.kind === "resource-request") return "needs-resource";
+  if (item.actionability === "agent-runnable" || item.actionability === "agent-resource" || item.actionability === "agent-review") return item.actionability;
+  if (item.actionability === "needs-resource") return "agent-resource";
+  if (item.actionability === "needs-decision") return "agent-review";
+  if (item.kind === "resource-request") return "agent-resource";
   if (item.kind === "coverage-gap" || item.kind === "followup-scope") return "agent-runnable";
-  return "needs-decision";
+  return "agent-review";
 }
 
 function backlogGroupShortLabel(group: BacklogGroupId): string {
-  if (group === "agent-runnable") return "Agent";
-  if (group === "needs-resource") return "Resource";
-  return "Decision";
+  if (group === "agent-runnable") return "Coverage";
+  if (group === "agent-resource") return "Setup";
+  return "Route";
 }
 
 function backlogRecommendedAction(item: DiscoveryBacklogRow): string {
   if (item.recommended_action) return item.recommended_action;
   if (item.kind === "coverage-gap") return backlogScopeId(item) ? "prioritize-scope" : "expand-map";
   if (item.kind === "followup-scope") return backlogScopeId(item) ? "prioritize-scope" : "continue";
-  if (item.kind === "resource-request") return "supply-resource";
-  return "review";
+  if (item.kind === "resource-request") return "resolve-resource";
+  return "review-and-route";
 }
 
 function backlogPrimaryActionLabel(item: DiscoveryBacklogRow): string {
@@ -3651,8 +3642,8 @@ function backlogPrimaryActionLabel(item: DiscoveryBacklogRow): string {
   if (action === "prioritize-scope") return "Prioritize scope";
   if (action === "expand-map") return "Expand map";
   if (action === "continue") return "Continue";
-  if (action === "supply-resource") return "Review setup";
-  return "Review";
+  if (action === "resolve-resource") return "Fix setup";
+  return "Run agent";
 }
 
 function backlogScopeId(item: DiscoveryBacklogRow): string {

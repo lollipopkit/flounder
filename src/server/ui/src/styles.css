@@ -2284,11 +2284,11 @@ small {
   border-left-color: var(--accent);
 }
 
-.next-action-card.needs-resource {
+.next-action-card.agent-resource {
   border-left-color: var(--warning);
 }
 
-.next-action-card.needs-decision {
+.next-action-card.agent-review {
   border-left-color: var(--fg-subtle);
 }
 
@@ -2314,13 +2314,13 @@ small {
   border-color: transparent;
 }
 
-.backlog-owner.needs-resource {
+.backlog-owner.agent-resource {
   color: var(--warning);
   background: color-mix(in srgb, var(--warning) 10%, var(--canvas));
   border-color: color-mix(in srgb, var(--warning) 25%, var(--border));
 }
 
-.backlog-owner.needs-decision {
+.backlog-owner.agent-review {
   color: var(--fg-muted);
   background: var(--canvas-subtle);
 }

@@ -130,8 +130,8 @@ export interface RunHealth {
 
 export type DiscoveryBacklogKind = "coverage-gap" | "resource-request" | "followup-scope" | string;
 export type DiscoveryBacklogStatus = "open" | "resolved" | "stale" | "ignored" | string;
-export type DiscoveryBacklogActionability = "agent-runnable" | "needs-resource" | "needs-decision" | string;
-export type DiscoveryBacklogOwner = "agent" | "user" | "decision" | string;
+export type DiscoveryBacklogActionability = "agent-runnable" | "agent-resource" | "agent-review" | string;
+export type DiscoveryBacklogOwner = "agent" | string;
 
 export interface DiscoveryBacklogRow {
   id: number;

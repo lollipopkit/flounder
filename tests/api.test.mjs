@@ -240,8 +240,10 @@ test("api: project detail exposes discovery health and operator backlog actions"
     const resource = detail.discoveryBacklog.find((row) => row.kind === "resource-request");
     const followup = detail.discoveryBacklog.find((row) => row.kind === "followup-scope");
     const gap = detail.discoveryBacklog.find((row) => row.kind === "coverage-gap");
-    assert.equal(resource.actionability, "needs-resource");
-    assert.equal(resource.autonomous, false);
+    assert.equal(resource.actionability, "agent-resource");
+    assert.equal(resource.action_owner, "agent");
+    assert.equal(resource.recommended_action, "resolve-resource");
+    assert.equal(resource.autonomous, true);
     assert.equal(followup.actionability, "agent-runnable");
     assert.equal(followup.recommended_action, "prioritize-scope");
     assert.equal(gap.actionability, "agent-runnable");
@@ -250,7 +252,17 @@ test("api: project detail exposes discovery health and operator backlog actions"
     const backlog = await json(await fetch(base + `/api/projects/${created.uuid}/backlog?kind=resource-request`));
     assert.equal(backlog.total, 1);
     assert.equal(backlog.backlog[0].payload.id, "R1");
-    assert.equal(backlog.backlog[0].action_owner, "user");
+    assert.equal(backlog.backlog[0].action_owner, "agent");
+
+    const launched = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run" }));
+    assert.equal(launched.queued, true);
+    const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
+    const spec = JSON.parse(job.spec_json);
+    assert.equal(spec.nextActions.length, 3);
+    const resourceAction = spec.nextActions.find((row) => row.kind === "resource-request");
+    assert.equal(resourceAction.actionability, "agent-resource");
+    assert.equal(resourceAction.recommendedAction, "resolve-resource");
+    assert.equal(resourceAction.title, "Foundry dependencies");
 
     const patched = await json(await patch(`/api/backlog/${backlog.backlog[0].id}`, { status: "resolved" }));
     assert.equal(patched.ok, true);

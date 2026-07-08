@@ -1,4 +1,4 @@
-import type { ConfirmDecision, Coverage, FindingRow, PhaseConfig, ProjectDetail, RunRow, ScopeRow } from "./api";
+import type { ConfirmDecision, ContestStrategy, Coverage, EngagementConfig, FindingRow, PhaseConfig, ProjectDetail, RunRow, ScopeRow } from "./api";
 
 export const STATUSES = ["confirmed-differential", "confirmed-executable", "confirmed-source", "needs-evidence", "suspected", "discharged", "refuted"] as const;
 export const TRACKING = ["open", "triaging", "submitted", "accepted", "fixed", "duplicate", "rejected", "ignored"] as const;
@@ -16,6 +16,11 @@ export const PHASE_DESC: Record<(typeof PHASES)[number], string> = {
   confirm: "Reproduce confirmed findings on the real target",
   report: "Prepare one submission package per bug",
 };
+
+export const BUG_BOUNTY_CONTEST_KIND = "bug-bounty-contest";
+export const BUG_BOUNTY_KIND = "bug-bounty";
+export const DEFAULT_CONTEST_BATCH_SCOPES = 10;
+export const DEFAULT_CONTEST_DIG_CONCURRENCY = 5;
 
 const STATUS_RANK: Record<string, number> = {
   "confirmed-differential": 5,
@@ -44,6 +49,7 @@ export interface PhaseInfo {
 export type PhaseState = Record<(typeof PHASES)[number], PhaseInfo>;
 
 function needsRealTargetConfirmation(detail: ProjectDetail): boolean {
+  if (contestStrategy(projectConfig(detail).cfg).skipRealTargetConfirm) return false;
   return detail.prepareSummary?.realTarget?.requiresConfirmation !== false;
 }
 
@@ -324,6 +330,7 @@ export function currentMaterialDetail(detail: ProjectDetail): ProjectDetail {
   const confirmDecisions = currentMaterialConfirmDecisions(detail);
   const auditConfirmedFindings = allFindings.filter(isExecutionConfirmedFinding).length;
   const reproducedBugs = confirmedDecisions(confirmDecisions).length;
+  const requiresConfirmation = needsRealTargetConfirmation(detail);
   return {
     ...detail,
     progress,
@@ -331,19 +338,20 @@ export function currentMaterialDetail(detail: ProjectDetail): ProjectDetail {
     findingsTotal: allFindings.length,
     auditConfirmedFindings,
     reproducedBugs,
-    confirmedBugs: reproducedBugs,
+    confirmedBugs: requiresConfirmation ? reproducedBugs : auditConfirmedFindings,
     confirmDecisions,
     allFindings,
   };
 }
 
 export function projectConfig(detail: ProjectDetail | null): { cfg: ProjectConfigShape; sourcePaths: string[]; buildRoot: string; corpusPaths: string[] } {
-  if (!detail) return { cfg: {}, sourcePaths: [], buildRoot: "", corpusPaths: [] };
+  const project = detail?.project;
+  if (!project) return { cfg: {}, sourcePaths: [], buildRoot: "", corpusPaths: [] };
   return {
-    cfg: parseJson<ProjectConfigShape>(detail.project.config_json, {}),
-    sourcePaths: parseJson<string[]>(detail.project.source_paths, []),
-    buildRoot: detail.project.build_root ?? "",
-    corpusPaths: parseJson<string[]>(detail.project.corpus_paths, []),
+    cfg: parseJson<ProjectConfigShape>(project.config_json, {}),
+    sourcePaths: parseJson<string[]>(project.source_paths, []),
+    buildRoot: project.build_root ?? "",
+    corpusPaths: parseJson<string[]>(project.corpus_paths, []),
   };
 }
 
@@ -368,6 +376,151 @@ export interface ProjectConfigShape {
   digConcurrency?: number;
   phases?: PhaseConfig;
   phaseProviders?: Partial<Record<ProviderPhase, number>>;
+  engagement?: EngagementConfig;
+}
+
+export interface NormalizedContestStrategy {
+  enabled: boolean;
+  batchScopes: number;
+  digConcurrency: number;
+  appendMapWhenExhausted: boolean;
+  skipRealTargetConfirm: boolean;
+  stopAfterHours?: number;
+}
+
+export interface ContestReviewState {
+  kind: "review-due" | "low-yield" | "inventory-exhausted";
+  tone: "info" | "warning";
+  label: string;
+  detail: string;
+  recentAuditedScopes?: number;
+  recentConfirmedFindings?: number;
+  elapsedHours?: number;
+}
+
+export function isBugBountyContestConfig(cfg: Pick<ProjectConfigShape, "engagement"> | undefined): boolean {
+  const kind = cfg?.engagement?.kind;
+  return kind === BUG_BOUNTY_CONTEST_KIND || kind === "contest";
+}
+
+export function isBugBountyConfig(cfg: Pick<ProjectConfigShape, "engagement"> | undefined): boolean {
+  const kind = cfg?.engagement?.kind;
+  return kind === BUG_BOUNTY_KIND || kind === BUG_BOUNTY_CONTEST_KIND || kind === "contest";
+}
+
+export function bugBountyEngagementLabel(cfg: Pick<ProjectConfigShape, "engagement"> | undefined): string {
+  if (isBugBountyContestConfig(cfg)) return "Contest";
+  return isBugBountyConfig(cfg) ? "Bounty" : "";
+}
+
+export function contestStrategy(cfg: Pick<ProjectConfigShape, "engagement"> | undefined): NormalizedContestStrategy {
+  const enabled = isBugBountyContestConfig(cfg);
+  const strategy: ContestStrategy = cfg?.engagement?.strategy ?? {};
+  const positive = (value: unknown, fallback: number): number => {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+  };
+  const optionalPositive = (value: unknown): number | undefined => {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+  };
+  return {
+    enabled,
+    batchScopes: positive(strategy.batchScopes, DEFAULT_CONTEST_BATCH_SCOPES),
+    digConcurrency: positive(strategy.digConcurrency, DEFAULT_CONTEST_DIG_CONCURRENCY),
+    appendMapWhenExhausted: strategy.appendMapWhenExhausted !== false,
+    skipRealTargetConfirm: enabled && strategy.skipRealTargetConfirm !== false,
+    stopAfterHours: optionalPositive(strategy.stopAfterHours),
+  };
+}
+
+export function contestReviewState(detail: Pick<ProjectDetail, "project" | "runs" | "allFindings" | "progress">, cfg: ProjectConfigShape): ContestReviewState | null {
+  const contest = contestStrategy(cfg);
+  if (!contest.enabled) return null;
+  const lowYield = recentContestYield(detail, contest.batchScopes);
+  if (lowYield) {
+    return {
+      kind: "low-yield",
+      tone: "warning",
+      label: "Low marginal yield",
+      detail: `The latest ${lowYield.recentAuditedScopes} audited scopes produced no locally confirmed findings. Review duplicate rate, map expansion quality, and whether this contest campaign should pause or change direction.`,
+      ...lowYield,
+    };
+  }
+  const elapsedHours = contestElapsedHours(detail, cfg);
+  if (contest.stopAfterHours !== undefined && elapsedHours !== undefined && elapsedHours >= contest.stopAfterHours) {
+    return {
+      kind: "review-due",
+      tone: "warning",
+      label: "Contest review due",
+      detail: `${contest.stopAfterHours}h review window elapsed. Check submitted duplicates, report backlog, and recent yield before opening more scopes.`,
+      elapsedHours,
+    };
+  }
+  const progress = detail.progress;
+  if (contest.appendMapWhenExhausted && progress.total > 0 && progress.pending === 0) {
+    return {
+      kind: "inventory-exhausted",
+      tone: "info",
+      label: "Map expansion ready",
+      detail: `The current inventory is exhausted. Continue will append novel scopes before auditing the next ${contest.batchScopes}-scope contest batch.`,
+    };
+  }
+  return null;
+}
+
+function contestElapsedHours(detail: Pick<ProjectDetail, "project" | "runs">, cfg: Pick<ProjectConfigShape, "engagement">): number | undefined {
+  const startedAt = timestampMs(cfg.engagement?.startsAt)
+    ?? timestampMs(detail.project.created_at)
+    ?? oldestRunStartedAt(detail.runs);
+  if (startedAt === undefined) return undefined;
+  return Math.floor((Date.now() - startedAt) / 3_600_000);
+}
+
+function oldestRunStartedAt(runs: RunRow[] | undefined): number | undefined {
+  const values = (runs ?? []).flatMap((run) => {
+    const value = timestampMs(run.started_at);
+    return value === undefined ? [] : [value];
+  });
+  return values.length ? Math.min(...values) : undefined;
+}
+
+function timestampMs(value: string | null | undefined): number | undefined {
+  if (!value) return undefined;
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
+function recentContestYield(
+  detail: Pick<ProjectDetail, "runs" | "allFindings" | "progress">,
+  batchScopes: number,
+): Pick<ContestReviewState, "recentAuditedScopes" | "recentConfirmedFindings"> | null {
+  const minimumScopes = Math.max(1, batchScopes * 2);
+  if (detail.progress.audited < minimumScopes) return null;
+  const recentRunIds = new Set<number>();
+  let recentAuditedScopes = 0;
+  const runs = [...(detail.runs ?? [])]
+    .filter((run) => run.kind === "run" && run.status === "done" && !isVerifyRun(run))
+    .sort((a, b) => (timestampMs(b.started_at) ?? 0) - (timestampMs(a.started_at) ?? 0));
+  for (const run of runs) {
+    const audited = runScopeCount(run);
+    if (audited <= 0) continue;
+    recentRunIds.add(run.id);
+    recentAuditedScopes += audited;
+    if (recentAuditedScopes >= minimumScopes) break;
+  }
+  if (recentAuditedScopes < minimumScopes) return null;
+  const recentConfirmedFindings = (detail.allFindings ?? []).filter((finding) => {
+    return finding.run_id != null && recentRunIds.has(finding.run_id) && isExecutionConfirmedFinding(finding);
+  }).length;
+  return recentConfirmedFindings === 0 ? { recentAuditedScopes, recentConfirmedFindings } : null;
+}
+
+function runScopeCount(run: RunRow): number {
+  const done = Number(run.run_scopes_done);
+  if (Number.isFinite(done) && done > 0) return Math.floor(done);
+  const target = Number(run.run_scopes_target);
+  return Number.isFinite(target) && target > 0 ? Math.floor(target) : 0;
 }
 
 export function parseJson<T>(input: unknown, fallback: T): T {
@@ -706,7 +859,7 @@ export function phaseState(detail: ProjectDetail, progress: Coverage): PhaseStat
         ? "running"
         : verifyRechecksConfirmed
           ? "pending"
-        : !requiresConfirmation && locallyVerified > 0
+        : !requiresConfirmation
           ? "done"
         : decisions.length
           ? (repro === decisions.length && pendingConfirm === 0 && decisions.filter(needsSubmissionReadinessWork).length === 0 ? "done" : "partial")
@@ -715,7 +868,7 @@ export function phaseState(detail: ProjectDetail, progress: Coverage): PhaseStat
             : "none",
       stat: conf?.status === "error"
         ? "Confirm blocked"
-        : !requiresConfirmation && locallyVerified > 0
+        : !requiresConfirmation
         ? "Not required"
         : verifyRechecksConfirmed
           ? "Waiting for Verify to finish"

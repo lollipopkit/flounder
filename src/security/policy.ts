@@ -167,6 +167,12 @@ export function analyzeConfirmBashCommandSafety(command: StructuredReproductionC
   if (args.some((arg) => /[\0\r\n]/.test(arg))) {
     return { blocked: true, reason: "Blocked by flounder guardrail: confirm command arguments must be simple argv entries." };
   }
+  if (program.toLowerCase() === "env" && !unwrapSafeEnvCommand(command)) {
+    return {
+      blocked: true,
+      reason: "Blocked by flounder guardrail: env wrappers cannot override executable lookup, runtime injection, or sandbox safety settings.",
+    };
+  }
   const workspaceDecision = analyzeWorkspacePathSafety(args);
   if (workspaceDecision.blocked) return workspaceDecision;
   const destructiveDecision = analyzeDestructiveFilesystemCommandSafety(program, args);
@@ -193,6 +199,12 @@ export function analyzeConfirmBashCommandSafety(command: StructuredReproductionC
  * This makes lexical command checks defense-in-depth rather than the boundary.
  */
 export function openWorldCommandNeedsNetwork(command: StructuredReproductionCommand, purpose: AgentCommandPurpose): boolean {
+  // Egress is attached to the exact executable the sandbox launches. Even a
+  // benign-looking env assignment can change a tool's implicit config or runtime
+  // behavior, so wrapped commands remain network-sealed. Call the allowlisted
+  // tool directly when it needs read/fork/fetch access; sandboxEnv owns the
+  // dependency-cache and safety variables.
+  if (command.program.trim().toLowerCase() === "env") return false;
   const normalized = unwrapSafeEnvCommand(command);
   if (!normalized) return false;
   const program = normalized.program.trim().toLowerCase();
@@ -426,7 +438,8 @@ function unwrapSafeEnvCommand(command: StructuredReproductionCommand): Structure
   let index = 0;
   for (; index < args.length; index += 1) {
     const arg = args[index] ?? "";
-    if (!isSafeEnvAssignment(arg)) break;
+    if (!/^[A-Za-z_][A-Za-z0-9_]*=/.test(arg)) break;
+    if (!isSafeEnvAssignment(arg)) return undefined;
   }
   const wrappedProgram = args[index];
   if (!wrappedProgram) return undefined;
@@ -437,12 +450,43 @@ function unwrapSafeEnvCommand(command: StructuredReproductionCommand): Structure
 function isSafeEnvAssignment(arg: string): boolean {
   const match = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(arg);
   if (!match) return false;
+  if (isSecuritySensitiveEnvName(match[1] ?? "")) return false;
   const value = match[2] ?? "";
   if (/[\0\r\n;&|`<>]/.test(value)) return false;
   if (looksLikeRpcEnvReference(value)) return false;
   if (looksLikeRemoteUrl(value) && !isLocalUrl(value)) return false;
   if (looksLikePathEscape(value)) return false;
   return true;
+}
+
+const SECURITY_SENSITIVE_ENV_NAMES = new Set([
+  "PATH",
+  "HOME",
+  "BASH_ENV",
+  "ENV",
+  "SHELLOPTS",
+  "IFS",
+  "CDPATH",
+  "GLOBIGNORE",
+  "FOUNDRY_FFI",
+  "NODE_OPTIONS",
+  "PYTHONHOME",
+  "PYTHONPATH",
+  "RUBYOPT",
+  "PERL5OPT",
+  "GIT_EXEC_PATH",
+  "GIT_CONFIG",
+  "GIT_CONFIG_SYSTEM",
+  "GIT_CONFIG_GLOBAL",
+  "GIT_CONFIG_NOSYSTEM",
+  "CURL_HOME",
+  "WGETRC",
+]);
+
+function isSecuritySensitiveEnvName(name: string): boolean {
+  const upper = name.toUpperCase();
+  if (SECURITY_SENSITIVE_ENV_NAMES.has(upper)) return true;
+  return upper.startsWith("DYLD_") || upper.startsWith("LD_") || upper.startsWith("GIT_CONFIG_");
 }
 
 function analyzeWorkspacePathSafety(args: string[]): CommandSafetyDecision {

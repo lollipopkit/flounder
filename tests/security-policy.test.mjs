@@ -257,6 +257,25 @@ test("open-world egress is granted per command instead of per phase", () => {
   assert.equal(openWorldCommandNeedsNetwork(cmd("npm", "test"), "confirm"), false);
 });
 
+test("env wrappers cannot alter the executable or sandbox settings behind an egress decision", () => {
+  for (const c of [
+    cmd("env", "PATH=.", "forge", "test", "--fork-url", "https://mainnet.example"),
+    cmd("env", "FOUNDRY_FFI=true", "forge", "test", "--fork-url", "https://mainnet.example"),
+    cmd("env", "CURL_HOME=poc", "curl", "https://mainnet.example"),
+    cmd("env", "LD_PRELOAD=poc/shim.so", "curl", "https://mainnet.example"),
+  ]) {
+    assert.equal(analyzeConfirmBashCommandSafety(c).blocked, true, `${c.args[0]} must be rejected`);
+    assert.equal(analyzeAgentBashCommandSafety(c).blocked, true, `${c.args[0]} must be rejected in sealed agent mode too`);
+    assert.equal(openWorldCommandNeedsNetwork(c, "inspect"), false, `${c.args[0]} must not receive egress`);
+  }
+
+  // Harmless local wrappers remain usable, but never acquire open-world egress:
+  // the allowlisted executable must be launched directly for that capability.
+  const cacheWrapper = cmd("env", "SCARB_CACHE=./.scarb-cache", "scarb", "fetch");
+  assert.equal(analyzeConfirmBashCommandSafety(cacheWrapper).blocked, false);
+  assert.equal(openWorldCommandNeedsNetwork(cacheWrapper, "build"), false);
+});
+
 test("confirm-mode bash cannot smuggle remote URLs into generated test files", () => {
   const pythonWrite = cmd(
     "python3",

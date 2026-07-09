@@ -684,14 +684,15 @@ export class MetadataStore {
     this.db.exec("PRAGMA busy_timeout = 5000");
     this.db.exec("PRAGMA foreign_keys = ON");
     this.db.exec(SCHEMA);
-    // CREATE IF NOT EXISTS does not add columns to old tables. Inspect the real
-    // schema before each additive migration so only the expected duplicate case is
-    // skipped; permission, corruption, locking, and malformed-SQL failures surface.
+    // CREATE IF NOT EXISTS does not add columns to old tables. Take the SQLite
+    // write reservation before inspecting the schema so concurrent processes
+    // cannot both decide to add the same column. Unexpected migration failures
+    // (permissions, corruption, malformed SQL) still surface.
     this.transaction(() => {
       for (const [table, column, alter] of ADDITIVE_COLUMNS) {
         if (!this.hasColumn(table, column)) this.db.exec(alter);
       }
-    });
+    }, "immediate");
     this.ensureProjectUuids();
     this.reconcileConfirmStatuses();
     this.runDataMigrations();
@@ -1992,8 +1993,8 @@ export class MetadataStore {
 
   // --- internals ------------------------------------------------------------
 
-  private transaction(fn: () => void): void {
-    this.db.exec("BEGIN");
+  private transaction(fn: () => void, mode: "deferred" | "immediate" = "deferred"): void {
+    this.db.exec(mode === "immediate" ? "BEGIN IMMEDIATE" : "BEGIN");
     try {
       fn();
       this.db.exec("COMMIT");

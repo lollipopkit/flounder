@@ -4515,10 +4515,10 @@ test("api: provider profiles — seed + CRUD + per-phase roles; pi discovery", a
     // a fresh store is seeded with starter profiles
     const seeded = (await json(await fetch(base + "/api/providers"))).providers;
     assert.ok(seeded.length >= 1 && seeded.some((p) => p.provider === "openai-codex"), "expected seeded providers");
-    const codexDefault = seeded.find((p) => p.name === "openai-codex · gpt-5.5 · xhigh");
-    assert.ok(codexDefault, "expected codex gpt-5.5 xhigh starter profile");
+    const codexDefault = seeded.find((p) => p.name === "openai-codex · gpt-5.6-sol · xhigh");
+    assert.ok(codexDefault, "expected codex gpt-5.6-sol xhigh starter profile");
     assert.equal(codexDefault.provider, "openai-codex");
-    assert.equal(codexDefault.model, "gpt-5.5");
+    assert.equal(codexDefault.model, "gpt-5.6-sol");
     assert.equal(codexDefault.thinking, "xhigh");
     const opusMax = seeded.find((p) => p.name === "claude-code · opus 4.8 max");
     assert.ok(opusMax, "expected opus 4.8 max starter profile");
@@ -4532,8 +4532,9 @@ test("api: provider profiles — seed + CRUD + per-phase roles; pi discovery", a
     const discoveredModels = (await json(await fetch(base + "/api/pi/models/openai-codex"))).models;
     assert.ok(discoveredModels.length >= 1, "expected pi model discovery");
     assert.ok(discoveredModels.every((m) => Array.isArray(m.thinkingLevels) && m.thinkingLevels.length >= 1));
-    const gpt55 = discoveredModels.find((m) => m.id === "gpt-5.5");
-    if (gpt55) assert.ok(gpt55.thinkingLevels.includes("xhigh"), "gpt-5.5 should expose xhigh through pi metadata");
+    const gpt56sol = discoveredModels.find((m) => m.id === "gpt-5.6-sol");
+    assert.ok(gpt56sol, "the pinned pi runtime must expose the default gpt-5.6-sol model");
+    assert.ok(gpt56sol.thinkingLevels.includes("xhigh"), "gpt-5.6-sol should expose xhigh through pi metadata");
 
     // create with a per-phase override (map cheaper than dig), then read it back
     const created = await json(await post("/api/providers", { name: "prof-x", provider: "openai-codex", model: "gpt-5.5", thinking: "high", roles: { map: { thinking: "low" } } }));

@@ -71,6 +71,8 @@ import {
 } from "./domain";
 import { Icon, type IconName } from "./icons";
 
+const DEFAULT_OPENAI_CODEX_MODEL = "gpt-5.6-sol";
+
 type View = "projects" | "findings" | "settings";
 type SettingsPane = "providers" | "daemons" | "archived";
 type ProjectTab = "overview" | "next-actions" | "decisions" | "findings" | "scopes" | "runs" | "activity" | "setup";
@@ -539,7 +541,7 @@ function providerProfileLabel(provider: ProviderProfile): string {
 function defaultProjectProviderId(providers: ProviderProfile[]): string {
   const preferred = providers.find((provider) =>
     provider.provider === "openai-codex"
-    && provider.model === "gpt-5.5"
+    && provider.model === DEFAULT_OPENAI_CODEX_MODEL
     && provider.thinking === "xhigh",
   );
   return preferred?.id ? String(preferred.id) : providers[0]?.id ? String(providers[0].id) : "";
@@ -5227,7 +5229,7 @@ function ProviderForm({ provider, onCancel, onSaved, onError }: { provider: Prov
   }
   return (
     <form className="inline-editor" onSubmit={(event) => void submit(event)}>
-      <label>Name<input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="openai-codex · gpt-5.5 · xhigh" /></label>
+      <label>Name<input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder={`openai-codex · ${DEFAULT_OPENAI_CODEX_MODEL} · xhigh`} /></label>
       <label>Provider<select required value={form.provider} onChange={(event) => setForm({ ...form, provider: event.target.value, model: "" })}>{providerChoices.map((name) => <option key={name} value={name}>{name}</option>)}</select></label>
       <label>Model<input list="provider-model-options" value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })} placeholder="provider default" /><datalist id="provider-model-options">{modelOptions.map((model) => <option key={model.id} value={model.id}>{model.name ?? model.id}</option>)}</datalist></label>
       <label>Thinking<select value={form.thinking} onChange={(event) => setForm({ ...form, thinking: event.target.value })}>

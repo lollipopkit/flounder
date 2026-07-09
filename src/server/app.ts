@@ -17,7 +17,7 @@ import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, rea
 import { timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { defaultOutputDir } from "../config.js";
+import { DEFAULT_AUDIT_MODEL, defaultOutputDir } from "../config.js";
 import { MetadataStore, type RunKind, type Coverage, type DiscoveryBacklogFilter, type DiscoveryBacklogKind, type DiscoveryBacklogStatus, type ProviderInput, type ProviderProfile, type ProjectInput, type ProjectListOptions, type ProviderRoles, type RoleOverride } from "../db/store.js";
 import { getSupportedThinkingLevels, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { getProviders, getModels } from "@earendil-works/pi-ai/compat";
@@ -566,7 +566,7 @@ export function startUiServer(options: UiServerOptions = {}): ReturnType<typeof 
   const store = MetadataStore.openForOutput(out);
   // Seed a couple of starter profiles so a fresh install has something to select (no-op if any exist).
   store.seedProviders([
-    { name: "openai-codex · gpt-5.5 · xhigh", provider: "openai-codex", model: "gpt-5.5", thinking: "xhigh" },
+    { name: `openai-codex · ${DEFAULT_AUDIT_MODEL} · xhigh`, provider: "openai-codex", model: DEFAULT_AUDIT_MODEL, thinking: "xhigh" },
     { name: "claude-code · opus 4.8 max", provider: "claude-code", model: "claude-opus-4-8", thinking: "xhigh" },
   ]);
   const artifactReconciled = reconcileSuccessfulArtifactRuns(store);

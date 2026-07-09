@@ -151,7 +151,7 @@ the same provider is already logged in through pi at `~/.pi/agent/auth.json`,
 Flounder imports that provider entry into its daemon-local auth file on
 `login`/`check`.
 
-Then create a project in the dashboard, describe the audit task in the task/clue box, choose its execution daemon and default provider profile, and start a run. The project directory defaults to the project UUID under the daemon workspace, so it stays stable even if the display name changes. A fresh install seeds starter profiles for `openai-codex · gpt-5.5 · xhigh` and `claude-code · opus 4.8 max`; each selected daemon still needs local auth for the providers it will run. The CLI can drive the same control plane:
+Then create a project in the dashboard, describe the audit task in the task/clue box, choose its execution daemon and default provider profile, and start a run. The project directory defaults to the project UUID under the daemon workspace, so it stays stable even if the display name changes. A fresh install seeds starter profiles for `openai-codex · gpt-5.6-sol · xhigh` and `claude-code · opus 4.8 max`; each selected daemon still needs local auth for the providers it will run. Existing projects keep their explicitly selected profile until an operator changes it. The CLI can drive the same control plane:
 
 ```bash
 # Recommended default: let Flounder prepare the target, then audit, confirm, and report.

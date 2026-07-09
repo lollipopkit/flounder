@@ -52,6 +52,41 @@ test("scope store distinguishes a missing inventory from a corrupt checkpoint", 
   }
 });
 
+test("scope store validates and exact-shapes persisted model output", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "flounder-scope-shape-"));
+  try {
+    await writeFile(path.join(dir, "scopes.json"), JSON.stringify([{
+      id: " S1 ",
+      obligation: " Bind the value ",
+      region: " src/proof.ts:1 ",
+      lenses: [" authorization ", 42, ""],
+      exposure: "external",
+      difficulty: "medium",
+      score: 7,
+      status: "owned-by-model",
+      source: "untrusted",
+      priority: Number.NaN,
+      unexpected: "must not survive",
+    }]));
+    const loaded = await loadScopeInventory(dir);
+    assert.deepEqual(loaded, [{
+      id: "S1",
+      obligation: "Bind the value",
+      region: "src/proof.ts:1",
+      lenses: ["authorization"],
+      exposure: "external",
+      difficulty: "medium",
+      score: 7,
+      why: "",
+      status: "pending",
+    }]);
+    await writeFile(path.join(dir, "scopes.json"), JSON.stringify([{ region: "   ", obligation: "present" }]));
+    await assert.rejects(loadScopeInventory(dir), /entry 0 is incomplete/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("scope workspace keys remain stable for safe ids and unique after normalization", () => {
   assert.equal(scopeWorkspaceKey("S1"), "S1");
   assert.notEqual(scopeWorkspaceKey("a/b"), scopeWorkspaceKey("a_b"));

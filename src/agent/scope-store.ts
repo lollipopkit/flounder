@@ -77,17 +77,31 @@ async function atomicWriteScopeInventory(historyDir: string, file: string, snaps
 function normalizeAuditScope(value: unknown, index: number): AuditScope | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const scope = value as Partial<AuditScope>;
-  if (typeof scope.region !== "string" || typeof scope.obligation !== "string") return undefined;
+  const region = typeof scope.region === "string" ? scope.region.trim() : "";
+  const obligation = typeof scope.obligation === "string" ? scope.obligation.trim() : "";
+  if (!region || !obligation) return undefined;
+  const status: NonNullable<AuditScope["status"]> = ["pending", "audited", "deferred", "auditing"].includes(String(scope.status))
+    ? scope.status as NonNullable<AuditScope["status"]>
+    : "pending";
+  const source: AuditScope["source"] = ["map", "followup", "coverage-gap"].includes(String(scope.source))
+    ? scope.source as NonNullable<AuditScope["source"]>
+    : undefined;
   return {
-    ...scope,
-    id: typeof scope.id === "string" && scope.id.trim() ? scope.id : `S${index + 1}`,
-    obligation: scope.obligation,
-    region: scope.region,
-    lenses: Array.isArray(scope.lenses) ? scope.lenses.filter((lens): lens is string => typeof lens === "string") : [],
+    id: typeof scope.id === "string" && scope.id.trim() ? scope.id.trim() : `S${index + 1}`,
+    obligation,
+    region,
+    lenses: Array.isArray(scope.lenses)
+      ? scope.lenses.filter((lens): lens is string => typeof lens === "string").map((lens) => lens.trim()).filter(Boolean)
+      : [],
     exposure: typeof scope.exposure === "string" ? scope.exposure : "unknown",
     difficulty: typeof scope.difficulty === "string" ? scope.difficulty : "unknown",
     score: typeof scope.score === "number" && Number.isFinite(scope.score) ? scope.score : 0,
     why: typeof scope.why === "string" ? scope.why : "",
+    status,
+    ...(source ? { source } : {}),
+    ...(typeof scope.digSeconds === "number" && Number.isFinite(scope.digSeconds) ? { digSeconds: scope.digSeconds } : {}),
+    ...(typeof scope.priority === "number" && Number.isFinite(scope.priority) ? { priority: scope.priority } : {}),
+    ...(typeof scope.parentScopeId === "string" && scope.parentScopeId.trim() ? { parentScopeId: scope.parentScopeId.trim() } : {}),
   };
 }
 

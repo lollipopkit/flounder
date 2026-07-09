@@ -209,29 +209,40 @@ export function openWorldCommandNeedsNetwork(command: StructuredReproductionComm
 }
 
 function isReadOnlyCurl(args: string[]): boolean {
-  const forbidden = /^(?:-d|--data(?:-|$)|-F$|--form(?:-|$)|-T$|--upload-file$|--json$|--url-query$|-K|--config(?:=|$))/i;
-  if (args.some((arg) => forbidden.test(arg) || /^--(?:data|form|upload-file|json)=/i.test(arg))) return false;
-  const requestIndex = args.findIndex((arg) => arg === "-X" || arg === "--request");
-  const inlineRequest = args.find((arg) => /^--request=/i.test(arg));
-  const method = requestIndex >= 0 ? args[requestIndex + 1] : inlineRequest?.split("=", 2)[1];
-  if (method && method.toUpperCase() !== "GET" && method.toUpperCase() !== "HEAD") return false;
+  const forbiddenLong = /^--(?:data(?:-|=|$)|form(?:-|=|$)|upload-file(?:=|$)|json(?:=|$)|url-query(?:=|$)|config(?:=|$))/i;
+  if (args.some((arg) => forbiddenLong.test(arg) || /^-(?:d|F|T|K)(?:.|$)/.test(arg))) return false;
+  for (let idx = 0; idx < args.length; idx += 1) {
+    const arg = args[idx] ?? "";
+    const method = arg === "-X" || arg === "--request"
+      ? args[idx + 1]
+      : arg.startsWith("-X") && arg.length > 2
+        ? arg.slice(2)
+        : /^--request=/i.test(arg)
+          ? arg.slice(arg.indexOf("=") + 1)
+          : undefined;
+    if (method && !/^(?:GET|HEAD)$/i.test(method)) return false;
+  }
   return args.some((arg) => Boolean(firstNonLocalRemoteUrl(arg)));
 }
 
 function isReadOnlyWget(args: string[]): boolean {
-  if (args.some((arg) => /^(?:--post-|--method|--body-|--upload-file|--execute|--config|-e$)/i.test(arg))) return false;
+  if (args.some((arg) => /^(?:--post-|--method(?:=|$)|--body-|--upload-file(?:=|$)|--execute(?:=|$)|--config(?:=|$))/i.test(arg) || /^-e(?:.|$)/.test(arg))) return false;
   return args.some((arg) => Boolean(firstNonLocalRemoteUrl(arg)));
 }
 
 function isReadOnlyGitNetworkCommand(args: string[]): boolean {
   if (args.some((arg) =>
     arg === "-c"
-    || arg.startsWith("-c=")
+    || /^-c(?:=|.)/.test(arg)
+    || arg === "--config"
+    || arg.startsWith("--config=")
     || arg === "--config-env"
     || arg.startsWith("--config-env=")
     || arg === "--upload-pack"
     || arg === "-u"
+    || /^-u./.test(arg)
     || arg.startsWith("--upload-pack=")
+    || arg.includes("::")
   )) return false;
   const verbIndex = args.findIndex((arg) => arg === "clone" || arg === "fetch" || arg === "ls-remote");
   if (verbIndex < 0) return false;
@@ -249,11 +260,20 @@ function isHttpsGitRemote(arg: string): boolean {
 }
 
 function isReadOnlyGitHubCommand(args: string[]): boolean {
-  if (args.some((arg, idx) => (arg === "--method" || arg === "-X") && !/^(?:GET|HEAD)$/i.test(args[idx + 1] ?? ""))) return false;
-  if (args.some((arg) => /^--method=(?!GET$|HEAD$)/i.test(arg))) return false;
+  for (let idx = 0; idx < args.length; idx += 1) {
+    const arg = args[idx] ?? "";
+    const method = arg === "--method" || arg === "-X"
+      ? args[idx + 1]
+      : arg.startsWith("-X") && arg.length > 2
+        ? arg.slice(2)
+        : /^--method=/i.test(arg)
+          ? arg.slice(arg.indexOf("=") + 1)
+          : undefined;
+    if (method && !/^(?:GET|HEAD)$/i.test(method)) return false;
+  }
   const verb = args.find((arg) => !arg.startsWith("-"));
   if (verb === "search") return true;
-  if (verb === "api") return !args.some((arg) => /^(?:-f|--field|-F|--raw-field|--input)$/i.test(arg));
+  if (verb === "api") return !args.some((arg) => /^(?:-f|-F)(?:.|$)/.test(arg) || /^--(?:field|raw-field|input)(?:=|$)/i.test(arg));
   if (verb === "repo") {
     if (args.includes("clone") && args.some((arg) => arg === "--" || /upload-pack|config-env|core\./i.test(arg))) return false;
     return args.some((arg) => arg === "clone" || arg === "view");

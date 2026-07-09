@@ -395,6 +395,17 @@ test("store: daemon tokens + job queue (claim is FIFO and one-shot; cancel is ob
   db.close();
 });
 
+test("store: daemon terminal updates cannot overwrite an operator cancellation", async () => {
+  const db = await tempDb();
+  const { id: daemonId } = db.createDaemonToken("terminal-race");
+  const jobId = db.enqueueJob("proj", { verb: "run" }, daemonId);
+  assert.equal(db.claimJob(daemonId)?.id, jobId);
+  assert.equal(db.cancelJob(jobId), true);
+  assert.equal(db.setActiveJobTerminalStatus(jobId, "done"), false);
+  assert.equal(db.getJob(jobId).status, "canceled");
+  db.close();
+});
+
 test("store: local auto-daemon token is stable across UI restarts", async () => {
   const db = await tempDb();
   const first = db.getOrCreateLocalDaemonToken();

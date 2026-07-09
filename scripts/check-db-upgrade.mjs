@@ -6,20 +6,13 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
+import { selectDbUpgradeTag } from "./select-db-upgrade-tag.mjs";
 
 const execFileAsync = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const requestedTag = process.env.FLOUNDER_DB_UPGRADE_FROM || process.argv[2];
 
-async function latestReleaseTag() {
-  if (requestedTag) return requestedTag;
-  const { stdout } = await execFileAsync("git", ["tag", "--list", "v*", "--sort=-v:refname"], { cwd: root });
-  const tag = stdout.split("\n").map((line) => line.trim()).find(Boolean);
-  if (!tag) throw new Error("No release tag is available. Fetch tags or set FLOUNDER_DB_UPGRADE_FROM.");
-  return tag;
-}
-
-const tag = await latestReleaseTag();
+const tag = await selectDbUpgradeTag({ cwd: root, requestedTag });
 const temp = await mkdtemp(path.join(os.tmpdir(), "flounder-db-upgrade-"));
 
 try {

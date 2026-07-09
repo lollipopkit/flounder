@@ -1868,6 +1868,14 @@ export class MetadataStore {
     this.db.prepare("UPDATE job SET status = ?, error = ?, updated_at = ? WHERE id = ?").run(status, error ?? null, now(), jobId);
   }
 
+  /** Terminal daemon updates may race an operator cancellation. Never revive or rewrite a terminal job. */
+  setActiveJobTerminalStatus(jobId: number, status: "done" | "error" | "canceled", error?: string): boolean {
+    const info = this.db
+      .prepare("UPDATE job SET status = ?, error = ?, updated_at = ? WHERE id = ? AND status IN ('dispatched','running')")
+      .run(status, error ?? null, now(), jobId);
+    return Number(info.changes) > 0;
+  }
+
   cancelRunJob(jobId: number, error = "canceled by operator"): boolean {
     const info = this.db
       .prepare("UPDATE job SET status = 'canceled', cancel = 1, error = ?, updated_at = ? WHERE id = ? AND status IN ('queued','dispatched','running')")

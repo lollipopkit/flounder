@@ -4258,7 +4258,10 @@ async function daemonJobStatus(c: Ctx): Promise<void> {
   if (isJobTerminalStatus(before.status)) {
     return sendJson(c.res, 200, { ok: true, stale: before.status !== status });
   }
-  c.store.setJobStatus(jobId, status, body.error);
+  if (!c.store.setActiveJobTerminalStatus(jobId, status, body.error)) {
+    const current = c.store.getJob(jobId);
+    return sendJson(c.res, 200, { ok: true, stale: current?.status !== status });
+  }
   // If the daemon died/aborted before its run reached a terminal state, reconcile the run.
   if (status === "error" || status === "canceled") {
     const job = c.store.getJob(jobId);

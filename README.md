@@ -414,6 +414,7 @@ Flounder supports white-hat audits of publicly available source, your own code, 
 - [Architecture](docs/ARCHITECTURE.md): thin-agent design, sandbox boundary, confirmation boundary, control/execution split, and tracking model.
 - [Product validation](docs/VALIDATION.md): current release-readiness evidence, limits, and remaining validation work.
 - [Capability expansion plan](docs/PRODUCT_CAPABILITY_PLAN.md): accepted design direction for future batch, evidence, and target-preparation capabilities.
+- [Versioned coverage loop](docs/VERSIONED_COVERAGE_LOOP.md): material-versioned Map/Dig state, adaptive sampling, Evaluation isolation, and maintainer Harness safety invariants.
 - [Agent skill](skills/flounder/SKILL.md): Codex / Claude Code operating manual.
 - [Domain profiles](configs/README.md): optional answer-free context packs. They are not product modes and are off by default.
 - [Optional Solidity/EVM notes](docs/SOLIDITY.md), [Cairo/Starknet notes](docs/STARKNET.md), [TON/FunC notes](docs/TON.md), and [ZK constraint profile](configs/zk-constraint-audit.default.json): high-signal context examples and verification-environment setup, not Flounder's core limit.

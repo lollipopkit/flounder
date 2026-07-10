@@ -34,8 +34,10 @@ Implemented foundation:
   decisions;
 - verifier-grounded harness experiments that cluster baseline misses, control
   failures, blocked execution, and policy-invalid work by terminal cause;
-- bounded candidate proposals limited to approved prompt, skill, and agent
-  harness files, with passing baseline behavior recorded as a preservation set;
+- bounded candidate proposals limited to prompts, skills, memory routing, and the
+  legacy agent loop, with passing non-holdout baseline behavior recorded as a
+  preservation set; audit orchestration, health classification, and preparation
+  remain protected;
 - paired baseline/candidate scoring with stable work-item and contract identity,
   repeated positive/control minimums, zero-regression checks, blocked/duration/
   attempt budgets, and deterministic `promote | reject | needs-more-samples`

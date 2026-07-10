@@ -50,8 +50,9 @@ strategy to use.
 - Adaptive sampling may allocate more model work; it may not declare a scope safe.
 - Finding consolidation is authoritative only when execution proves fix
   equivalence.
-- Harness candidates cannot edit the evaluator, evidence gates, material policy,
-  sandbox policy, promotion policy, tests, merge authority, or deployment logic.
+- Harness candidates cannot edit audit orchestration, run-health classification,
+  preparation, the evaluator, evidence gates, material policy, sandbox policy,
+  promotion policy, tests, merge authority, or deployment logic.
 - Harness is a maintainer-only source-improvement capability. Ordinary Project
   runs never trigger it, and the default control plane neither advertises nor
   accepts its operations.
@@ -86,9 +87,10 @@ strategy to use.
   than a safe result.
 - Blocked build preparation remains a resource request, not a negative security
   outcome.
-- A Harness holdout cannot be mined into the candidate proposal.
-- Candidate and baseline groups with different evidence contracts remain
-  incomparable.
+- A Harness holdout cannot be mined into the candidate proposal or preservation
+  brief; the coding-agent context receives only the exported brief.
+- Candidate and baseline groups with different evidence contracts or effective
+  provider/model/thinking settings remain incomparable.
 
 ### UI and API
 

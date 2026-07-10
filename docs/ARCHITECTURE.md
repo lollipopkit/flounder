@@ -86,9 +86,11 @@ evidence requirements, but they cannot execute their own commands, enable host
 execution, relax network policy, bypass allowed sandbox backends, or mint
 findings. Harness experiments use persisted baseline results to cluster terminal
 verifier causes, record passing behavior that must be preserved, and propose
-changes only inside an explicit file allowlist. The evaluator, expected answers,
-command policy, material boundary, confirmation/refutation gate, promotion
-policy, merge, and deployment authority remain outside the optimization loop.
+changes only inside an explicit file allowlist covering prompts, skills, memory
+routing, and the legacy agent loop. Audit orchestration, run-health
+classification, preparation, the evaluator, expected answers, command policy,
+material boundary, confirmation/refutation gate, promotion policy, merge, and
+deployment authority remain outside the optimization loop.
 
 ```mermaid
 flowchart LR

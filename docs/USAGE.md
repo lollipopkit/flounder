@@ -381,7 +381,9 @@ They do not let a model change its own judge or deploy itself:
    causal status, and terminal reason rather than text similarity alone.
 2. Record passing positive/control behavior that a candidate must preserve.
 3. Produce a candidate proposal whose files are limited to an explicit allowlist
-   under `prompts/`, `skills/`, or approved agent-harness modules.
+   under `prompts/`, `skills/`, `src/agent/prompts.ts`,
+   `src/agent/memory.ts`, or `src/agent/loop.ts`. Audit orchestration, health
+   classification, and preparation are not editable candidate surfaces.
 4. Run the same stable work-item keys and contracts as a candidate Evaluation,
    normally from a daemon/workspace running the candidate branch.
 5. Apply the product-owned gate: sufficient repeated positive/control samples,
@@ -389,9 +391,11 @@ They do not let a model change its own judge or deploy itself:
    holdout passing, zero paired regressions, every safe control passing, no
    unresolved blocked or invalid work, and configured duration/attempt budgets.
 
-`caseId`, `caseFamily`, `targetStack`, and `holdout` live only in the evaluator
-contract. Holdouts are excluded from failure mining, so a candidate cannot learn
-their mechanism from the experiment that later judges it.
+`caseId`, `caseFamily`, `targetStack`, and `holdout` live in the evaluator
+contract. Candidate briefs exclude holdout failures and preserved-behavior
+details. The maintainer workflow must give a fresh coding-agent context only that
+brief and the approved checkout; the evaluation-operator context retains the
+baseline manifest, item-level holdout identities, expected answers, and results.
 
 The gate returns `promote`, `reject`, or `needs-more-samples`. It never changes
 code, creates an unreviewed merge, or deploys a release. The evaluator, expected

@@ -6,6 +6,9 @@ import {
   type DaemonRow,
   type DiscoveryBacklogRow,
   type FindingRow,
+  type FindingLifecycle,
+  type FindingPhase,
+  type FindingPhaseAttempt,
   type ProjectDetail,
   type ProjectConfig,
   type ProjectPayload,
@@ -4917,6 +4920,48 @@ function FindingList({ findings, compact, empty, onOpenReport }: { findings: Fin
   );
 }
 
+type LifecycleRailState = "done" | "running" | "blocked" | "pending";
+
+function FindingLifecycleRail({ finding, onOpen }: { finding: FindingRow; onOpen: () => void }) {
+  const attempts = finding.phase_attempts ?? [];
+  const verify = latestAttempt(attempts, "verify");
+  const confirm = latestAttempt(attempts, "confirm");
+  const report = latestAttempt(attempts, "report");
+  const localSettled = finding.status === "confirmed-source" || finding.status === "confirmed-executable" || finding.status === "confirmed-differential" || finding.status === "refuted";
+  const disclosureDone = ["submitted", "accepted", "fixed", "rejected", "duplicate"].includes(finding.tracking_status ?? "open");
+  const phases: Array<{ label: string; state: LifecycleRailState; detail: string }> = [
+    { label: "Found", state: "done", detail: (finding.occurrence_count ?? 1) > 1 ? `${finding.occurrence_count} recorded occurrences` : "Canonical finding recorded" },
+    {
+      label: "Local",
+      state: localSettled ? "done" : attemptState(verify),
+      detail: finding.refutation_status === "blocked"
+        ? `Independent review blocked: ${finding.refutation_reason ?? "no verdict"}`
+        : verify?.blocker || (localSettled ? finding.status.replaceAll("-", " ") : "Waiting for executable evidence"),
+    },
+    { label: "Target", state: finding.confirm_status ? "done" : attemptState(confirm), detail: confirm?.blocker || (finding.confirm_status ? `Real target: ${finding.confirm_status}` : "Real-target confirmation pending") },
+    { label: "Report", state: finding.has_report ? "done" : attemptState(report), detail: report?.blocker || (finding.has_report ? "Formal report ready" : "Formal report pending") },
+    { label: "Disclose", state: disclosureDone ? "done" : "pending", detail: disclosureDone ? `Tracking: ${finding.tracking_status}` : "Not yet submitted" },
+  ];
+  const focus = phases.find((phase) => phase.state === "running" || phase.state === "blocked") ?? phases.find((phase) => phase.state === "pending") ?? phases[phases.length - 1]!;
+  return (
+    <button type="button" className="lifecycle-summary-button" onClick={onOpen} aria-label={`Open lifecycle for ${finding.title ?? "finding"}`} title={focus.detail}>
+      <span className={`label lifecycle-state ${focus.state}`}>{focus.label} · {focus.state}</span>
+      <small className={focus.state === "blocked" ? "lifecycle-focus blocked" : "lifecycle-focus"}>{focus.detail}</small>
+    </button>
+  );
+}
+
+function latestAttempt(attempts: FindingPhaseAttempt[], phase: FindingPhase): FindingPhaseAttempt | undefined {
+  return attempts.filter((attempt) => attempt.phase === phase).sort((a, b) => b.attempt_number - a.attempt_number)[0];
+}
+
+function attemptState(attempt?: FindingPhaseAttempt): LifecycleRailState {
+  if (!attempt) return "pending";
+  if (attempt.state === "running") return "running";
+  if (attempt.state === "blocked" || attempt.state === "error") return "blocked";
+  return "done";
+}
+
 function FindingTable({
   rows,
   global,
@@ -5000,6 +5045,7 @@ function FindingTable({
                   <td className="finding-cell">
                     <strong>{finding.title || "Untitled finding"}</strong>
                     <small>{finding.location || "No location"}{finding.scope_id ? ` · ${finding.scope_id}` : ""}</small>
+                    {(finding.occurrence_count ?? 1) > 1 ? <small className="occurrence-note">Seen in {plural(finding.occurrence_count ?? 1, "run")}</small> : null}
                     {duplicateOfLabel(finding) ? <small>{duplicateOfLabel(finding)}</small> : null}
                   </td>
                   <td className="evidence-cell">
@@ -5011,8 +5057,11 @@ function FindingTable({
                     </span>
                   </td>
                   <td className="workflow-cell">
-                    <span className={`label ${workflow.className}`}>{workflow.label}</span>
-                    <small>{workflow.detail}</small>
+                    {finding.source === "evaluation" ? (
+                      <><span className={`label ${workflow.className}`}>{workflow.label}</span><small>{workflow.detail}</small></>
+                    ) : (
+                      <FindingLifecycleRail finding={finding} onOpen={() => onOpenReport(finding)} />
+                    )}
                   </td>
                   <td className="tracking-cell">
                     {finding.source === "evaluation" ? (
@@ -5483,7 +5532,7 @@ function Field({ label, help, children, span }: { label: string; help?: string; 
   );
 }
 
-type BudgetForm = { digSamples: string; mapSteps: string; digSteps: string; digConcurrency: string };
+type BudgetForm = { digSamples: string; mapSteps: string; digSteps: string; digConcurrency: string; verifyConcurrency: string };
 type EngagementKindForm = "" | "bug-bounty" | "bug-bounty-contest";
 type EngagementForm = {
   engagementKind: EngagementKindForm;
@@ -5501,10 +5550,11 @@ function applyBudgetFields(config: ProjectConfig, form: BudgetForm): ProjectConf
   setOptionalNumber(next, "mapSteps", form.mapSteps);
   setOptionalNumber(next, "digSteps", form.digSteps);
   setOptionalNumber(next, "digConcurrency", form.digConcurrency);
+  setOptionalNumber(next, "verifyConcurrency", form.verifyConcurrency);
   return next;
 }
 
-function setOptionalNumber(config: ProjectConfig, key: keyof Pick<ProjectConfig, "digSamples" | "mapSteps" | "digSteps" | "digConcurrency">, value: string): void {
+function setOptionalNumber(config: ProjectConfig, key: keyof Pick<ProjectConfig, "digSamples" | "mapSteps" | "digSteps" | "digConcurrency" | "verifyConcurrency">, value: string): void {
   const parsed = numberOrUndefined(value);
   if (parsed === undefined) delete config[key];
   else config[key] = parsed;
@@ -5646,7 +5696,7 @@ function NewProjectModal({ providers, daemons, onClose, onCreated, onError }: { 
   const [advanced, setAdvanced] = useState(false);
   const [phaseOpen, setPhaseOpen] = useState(false);
   const firstDaemon = daemons.find((daemon) => daemonHealth(daemon) === "online") ?? daemons[0];
-  const [form, setForm] = useState({ intent: "", name: "", runAfterCreate: true, daemonId: firstDaemon?.id ? String(firstDaemon.id) : "", providerId: defaultProjectProviderId(providers), dir: "", sourcePaths: ".", buildRoot: ".", corpusPaths: "docs/specs", coverageMode: "standard" as CoverageMode, maxScopes: "30", digSamples: "1", mapSteps: "", digSteps: "", digConcurrency: "1", engagementKind: "" as EngagementKindForm, contestBatchScopes: "10", contestDigConcurrency: "5", contestStopAfterHours: "48", contestSkipConfirm: true, contestAppendMap: true });
+  const [form, setForm] = useState({ intent: "", name: "", runAfterCreate: true, daemonId: firstDaemon?.id ? String(firstDaemon.id) : "", providerId: defaultProjectProviderId(providers), dir: "", sourcePaths: ".", buildRoot: ".", corpusPaths: "docs/specs", coverageMode: "standard" as CoverageMode, maxScopes: "30", digSamples: "1", mapSteps: "", digSteps: "", digConcurrency: "1", verifyConcurrency: "2", engagementKind: "" as EngagementKindForm, contestBatchScopes: "10", contestDigConcurrency: "5", contestStopAfterHours: "48", contestSkipConfirm: true, contestAppendMap: true });
   const [phaseProviders, setPhaseProviders] = useState<PhaseProviderForm>({ prepare: "", map: "", dig: "", confirm: "" });
   const providerMissing = providers.length === 0;
   const daemonMissing = daemons.length === 0;
@@ -5796,6 +5846,7 @@ function NewProjectModal({ providers, daemons, onClose, onCreated, onError }: { 
               <Field label="Dig turn cap" help="Maximum model turns per scope; empty means unbounded."><input value={form.digSteps} onChange={(event) => setForm({ ...form, digSteps: event.target.value })} placeholder="unbounded" /></Field>
               <Field label="Dig samples" help="Independent dig passes per selected scope; findings are unioned."><input value={form.digSamples} onChange={(event) => setForm({ ...form, digSamples: event.target.value })} /></Field>
               <Field label="Dig concurrency" help="How many scopes run in parallel. 1 keeps digs sequential."><input value={form.digConcurrency} onChange={(event) => setForm({ ...form, digConcurrency: event.target.value })} /></Field>
+              <Field label="Verify concurrency" help="Independent findings verified in parallel; each keeps its own isolated workspace."><input value={form.verifyConcurrency} onChange={(event) => setForm({ ...form, verifyConcurrency: event.target.value })} /></Field>
             </div>
           </FormSection>
         ) : null}
@@ -5823,6 +5874,7 @@ function EditProjectModal({ detail, providers, daemons, onClose, onSaved, onErro
     mapSteps: cfg.cfg.mapSteps != null ? String(cfg.cfg.mapSteps) : "",
     digSteps: cfg.cfg.digSteps != null ? String(cfg.cfg.digSteps) : "",
     digConcurrency: String(cfg.cfg.digConcurrency ?? 1),
+    verifyConcurrency: String(cfg.cfg.verifyConcurrency ?? 2),
     engagementKind: initialEngagementKind,
     contestBatchScopes: String(initialContest.batchScopes),
     contestDigConcurrency: String(initialContest.digConcurrency),
@@ -5944,6 +5996,7 @@ function EditProjectModal({ detail, providers, daemons, onClose, onSaved, onErro
             <Field label="Dig turn cap" help="Maximum model turns per scope; empty means unbounded."><input value={form.digSteps} onChange={(event) => setForm({ ...form, digSteps: event.target.value })} placeholder="unbounded" /></Field>
             <Field label="Dig samples" help="Independent dig passes per selected scope; findings are unioned."><input value={form.digSamples} onChange={(event) => setForm({ ...form, digSamples: event.target.value })} /></Field>
             <Field label="Dig concurrency" help="How many scopes run in parallel. 1 keeps digs sequential."><input value={form.digConcurrency} onChange={(event) => setForm({ ...form, digConcurrency: event.target.value })} /></Field>
+            <Field label="Verify concurrency" help="Independent findings verified in parallel; each keeps its own isolated workspace."><input value={form.verifyConcurrency} onChange={(event) => setForm({ ...form, verifyConcurrency: event.target.value })} /></Field>
           </div>
         </FormSection>
       </form>
@@ -6288,11 +6341,16 @@ function ReportModal({ finding, onClose }: { finding: FindingRow; onClose: () =>
   const [markdown, setMarkdown] = useState(fallback);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [lifecycle, setLifecycle] = useState<FindingLifecycle | null>(null);
+  const [retrying, setRetrying] = useState<FindingPhase | null>(null);
+  const [retryMessage, setRetryMessage] = useState("");
   useEffect(() => {
     let cancelled = false;
     setMarkdown(fallback);
     setError("");
     setLoading(true);
+    setLifecycle(null);
+    setRetryMessage("");
     void api
       .findingReport(finding.id)
       .then((response) => {
@@ -6304,17 +6362,90 @@ function ReportModal({ finding, onClose }: { finding: FindingRow; onClose: () =>
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
+    void api.findingLifecycle(finding.id).then((response) => {
+      if (!cancelled) setLifecycle(response);
+    }).catch(() => {});
     return () => {
       cancelled = true;
     };
   }, [fallback, finding.id]);
+  async function retryPhase(phase: FindingPhase) {
+    setRetrying(phase);
+    setRetryMessage("");
+    try {
+      await api.retryFindingPhase(finding.id, phase);
+      setRetryMessage(`${lifecyclePhaseLabel(phase)} is reopened and will run on the next Continue.`);
+    } catch (err) {
+      setRetryMessage(String(err instanceof Error ? err.message : err));
+    } finally {
+      setRetrying(null);
+    }
+  }
   return (
     <Modal title={finding.source === "evaluation" ? `Evaluation evidence #${finding.id}` : `Finding report #${finding.id}`} wide onClose={onClose}>
       {loading ? <EmptyInline>Loading report...</EmptyInline> : null}
       {!loading && error ? <div className="inline-note">Showing the stored finding summary because the DB report endpoint could not be loaded.</div> : null}
+      {finding.source !== "evaluation" ? <LifecycleEvidencePanel finding={finding} lifecycle={lifecycle} retrying={retrying} retryMessage={retryMessage} onRetry={retryPhase} /> : null}
       <MarkdownReport markdown={markdown} fileName={`finding-${finding.id}.md`} />
     </Modal>
   );
+}
+
+function LifecycleEvidencePanel({
+  finding,
+  lifecycle,
+  retrying,
+  retryMessage,
+  onRetry,
+}: {
+  finding: FindingRow;
+  lifecycle: FindingLifecycle | null;
+  retrying: FindingPhase | null;
+  retryMessage: string;
+  onRetry: (phase: FindingPhase) => void;
+}) {
+  const findingAttempts = lifecycle?.attempts ?? finding.phase_attempts ?? [];
+  const decisionAttempts = lifecycle?.decisions.flatMap((decision) => decision.attempts ?? []) ?? [];
+  const attempts = [...findingAttempts, ...decisionAttempts];
+  const phaseRows: Array<{ phase: FindingPhase; label: string; attempt?: FindingPhaseAttempt }> = [
+    { phase: "verify", label: "Local evidence", attempt: latestAttempt(attempts, "verify") },
+    { phase: "confirm", label: "Real target", attempt: latestAttempt(attempts, "confirm") },
+    { phase: "report", label: "Formal report", attempt: latestAttempt(attempts, "report") },
+  ];
+  return (
+    <section className="lifecycle-panel" aria-label="Finding lifecycle evidence">
+      <div className="lifecycle-panel-head">
+        <div>
+          <strong>Evidence lifecycle</strong>
+          <small>{lifecycle ? `${plural(lifecycle.occurrences.length, "occurrence")} · canonical ${finding.canonical_key ?? finding.finding_key ?? `#${finding.id}`}` : "Loading attempt history..."}</small>
+        </div>
+        {finding.refutation_status ? <span className={`label refutation-${finding.refutation_status}`}>Independent review: {finding.refutation_status}</span> : null}
+      </div>
+      <div className="lifecycle-attempt-grid">
+        {phaseRows.map(({ phase, label, attempt }) => (
+          <div className="lifecycle-attempt" key={phase}>
+            <span className={`lifecycle-dot ${attemptState(attempt)}`} />
+            <div>
+              <strong>{label}</strong>
+              <small>{attempt ? `Attempt ${attempt.attempt_number} · ${attempt.outcome ?? attempt.state}${attempt.updated_at ? ` · ${fmtTime(attempt.updated_at)}` : ""}` : "Not attempted"}</small>
+              {attempt?.blocker ? <p>{attempt.blocker}</p> : null}
+            </div>
+            {attempt && (attempt.state === "blocked" || attempt.state === "error") ? (
+              <Button size="sm" icon="sync" disabled={retrying !== null} onClick={() => onRetry(phase)}>{retrying === phase ? "Reopening..." : `Retry ${lifecyclePhaseLabel(phase)}`}</Button>
+            ) : null}
+          </div>
+        ))}
+      </div>
+      {retryMessage ? <div className="inline-note">{retryMessage}</div> : null}
+      {finding.refutation_reason ? <details className="lifecycle-refutation"><summary>Independent review detail</summary><p>{finding.refutation_reason}</p></details> : null}
+    </section>
+  );
+}
+
+function lifecyclePhaseLabel(phase: FindingPhase): string {
+  if (phase === "verify") return "Verify";
+  if (phase === "confirm") return "Confirm";
+  return "Report";
 }
 
 function DecisionReportModal({ decision, onClose }: { decision: ConfirmDecision; onClose: () => void }) {

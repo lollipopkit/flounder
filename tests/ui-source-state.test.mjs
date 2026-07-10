@@ -61,6 +61,16 @@ test("ui: global findings default to project evidence and expose explicit evalua
   assert.match(appSource, />Evaluation only<\/span>/);
 });
 
+test("ui: findings expose a compact lifecycle summary and focused blocked-phase retry", () => {
+  assert.match(appSource, /function FindingLifecycleRail/);
+  assert.match(appSource, /Found.*Local.*Target.*Report.*Disclose/s);
+  assert.match(appSource, /lifecycle-summary-button/);
+  assert.doesNotMatch(appSource, /className="lifecycle-rail"/);
+  assert.match(appSource, /function LifecycleEvidencePanel/);
+  assert.match(appSource, /api\.retryFindingPhase/);
+  assert.match(appSource, /will run on the next Continue/);
+});
+
 test("ui: source setup is ready when prepare produced an audit-ready workspace", () => {
   const detail = {
     prepareSummary: {

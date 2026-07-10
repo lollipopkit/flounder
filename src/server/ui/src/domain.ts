@@ -433,6 +433,7 @@ export interface ProjectConfigShape {
   digSteps?: number;
   digSamples?: number;
   digConcurrency?: number;
+  verifyConcurrency?: number;
   phases?: PhaseConfig;
   phaseProviders?: Partial<Record<ProviderPhase, number>>;
   engagement?: EngagementConfig;

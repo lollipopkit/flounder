@@ -163,6 +163,7 @@ export interface DiscoveryBacklogRow {
 
 export interface FindingRow {
   id: number;
+  uuid?: string;
   project_name?: string;
   project_uuid?: string;
   source?: "project" | "evaluation" | string;
@@ -171,6 +172,8 @@ export interface FindingRow {
   project_id?: number;
   run_id?: number | null;
   finding_key?: string;
+  canonical_key?: string;
+  occurrence_count?: number;
   title?: string | null;
   location?: string | null;
   severity?: string | null;
@@ -187,9 +190,53 @@ export interface FindingRow {
   exploit_sketch?: string | null;
   fix?: string | null;
   confidence?: number | null;
+  refutation_status?: "pending" | "running" | "passed" | "refuted" | "blocked" | null;
+  refutation_reason?: string | null;
+  phase_attempts?: FindingPhaseAttempt[];
   created_at?: string | null;
   updated_at?: string | null;
   timeline?: FindingStatusEvent[];
+}
+
+export type FindingPhase = "verify" | "confirm" | "report";
+
+export interface FindingPhaseAttempt {
+  id: number;
+  subject_type: "finding" | "decision";
+  subject_id: number;
+  phase: FindingPhase;
+  input_fingerprint: string;
+  attempt_number: number;
+  run_id?: number | null;
+  state: "running" | "settled" | "blocked" | "error";
+  outcome?: string | null;
+  blocker?: string | null;
+  metrics_json?: string | null;
+  started_at?: string | null;
+  ended_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface FindingOccurrence {
+  id: number;
+  finding_id: number;
+  run_id?: number | null;
+  finding_key: string;
+  title?: string | null;
+  location?: string | null;
+  scope_id?: string | null;
+  status: string;
+  reason?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface FindingLifecycle {
+  finding: FindingRow;
+  timeline: FindingStatusEvent[];
+  occurrences: FindingOccurrence[];
+  attempts: FindingPhaseAttempt[];
+  decisions: Array<ConfirmDecision & { attempts?: FindingPhaseAttempt[] }>;
 }
 
 export interface FindingStatusEvent {
@@ -393,6 +440,7 @@ export interface TargetBundlePayload {
   maxScopes?: number;
   digSamples?: number;
   digConcurrency?: number;
+  verifyConcurrency?: number;
   capabilitySurface?: CapabilitySurfacePayload;
   claim?: unknown;
 }
@@ -559,6 +607,7 @@ export interface ProjectConfig {
   digSteps?: number;
   digSamples?: number;
   digConcurrency?: number;
+  verifyConcurrency?: number;
   phases?: PhaseConfig;
   phaseProviders?: PhaseProviderConfig;
   engagement?: EngagementConfig;
@@ -694,6 +743,8 @@ export const api = {
   bugs: (params: URLSearchParams) =>
     fetchJson<{ findings: FindingRow[]; total: number; limit: number; offset: number; stats: { total: number; active: number; byStatus: Record<string, number>; byTracking: Record<string, number> } }>(`/api/bugs?${params.toString()}`),
   findingReport: (id: number) => fetchJson<{ markdown: string; source: "db" | "generated" }>(`/api/findings/${id}/report`),
+  findingLifecycle: (id: number) => fetchJson<FindingLifecycle>(`/api/findings/${id}/lifecycle`),
+  retryFindingPhase: (id: number, phase: FindingPhase) => postJson<{ ok: true; phase: FindingPhase }>(`/api/findings/${id}/retry`, { phase }),
   decisionReport: (id: number) => fetchJson<{ markdown: string; source: "db" | "generated" }>(`/api/confirm-decisions/${id}/report`),
   trackFinding: (id: number, status: string, opts?: { duplicateOfFindingId?: number | null }) =>
     patchJson<unknown>(`/api/findings/${id}/tracking`, { status, duplicateOfFindingId: opts?.duplicateOfFindingId ?? null }),

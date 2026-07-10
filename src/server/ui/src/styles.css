@@ -5111,6 +5111,22 @@ small {
 }
 
 @media (max-width: 520px) {
+  .pagination {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .pagination > span {
+    flex: 1 0 auto;
+    white-space: nowrap;
+  }
+
+  .pagination-buttons {
+    width: 100%;
+    justify-content: space-between;
+  }
+
   .rail-head {
     align-items: stretch;
   }

@@ -21,6 +21,7 @@ export interface ProjectSnapshot {
   id?: number;
   uuid: string;
   name: string;
+  origin?: "project" | "evaluation" | string;
   provider_id?: number | null;
   daemon_id?: number | null;
   dir?: string | null;
@@ -55,6 +56,7 @@ export interface ProjectRow {
   id: number;
   uuid: string;
   name: string;
+  origin?: "project" | "evaluation" | string;
   source_paths?: string | null;
   build_root?: string | null;
   corpus_paths?: string | null;
@@ -163,6 +165,9 @@ export interface FindingRow {
   id: number;
   project_name?: string;
   project_uuid?: string;
+  source?: "project" | "evaluation" | string;
+  evaluation_name?: string | null;
+  evaluation_uuid?: string | null;
   project_id?: number;
   run_id?: number | null;
   finding_key?: string;

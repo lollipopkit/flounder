@@ -621,8 +621,9 @@ function safeJsonParse(text: string): unknown {
 
 // `flounder run <clue>` — the one-command pipeline. Orchestrates the distinct phases as SEPARATE
 // tracked runs (so each stays resumable + UI-visible and the dig stays network-sealed), feeding
-// each phase's output to the next: prepare (acquire, open-world) → run (map→dig, sealed) on the
-// staged source → confirm (reproduce, open-world) if the dig found anything. The user runs one
+// each phase's output to the next: prepare (acquire, open-world) → run
+// (map→dig→synthesize→verify, sealed) on the staged source → confirm (reproduce, open-world)
+// if the audit found anything. The user runs one
 // command and reads the final trail. --no-confirm stops after the dig; --posture/--no-match-deployed/
 // --endpoint tune prepare; --max-scopes/--dig-* tune the dig (via buildAuditSpec).
 async function runPipeline(rest: string[], cfg: AuditorConfig, clue: string): Promise<void> {
@@ -634,7 +635,7 @@ async function runPipeline(rest: string[], cfg: AuditorConfig, clue: string): Pr
   const endpoint = readFlag(rest, "--endpoint") ?? readFlag(rest, "--rpc");
   const noConfirm = rest.includes("--no-confirm");
   if (!noConfirm) {
-    console.log(`=== flounder run pipeline · target "${target}" · prepare → map → dig → confirm → report ===`);
+    console.log(`=== flounder run pipeline · target "${target}" · prepare → map → dig → synthesize → verify → confirm → report ===`);
     const spec: LaunchSpec = { verb: "run", target, sourcePaths: [], provider: cfg.provider, model: cfg.auditModel, thinking: cfg.thinkingLevel, clue, posture, matchDeployed, pipeline: true, out: cfg.outputDir, ...sandboxSpec(cfg) };
     if (endpoint !== undefined) spec.endpoint = endpoint;
     const result = await launchViaApi(server, spec);
@@ -1117,7 +1118,7 @@ function printHelp(): void {
 
 Usage:
   flounder prepare <clue> [--posture blind|informed] [--no-match-deployed] [--endpoint <url>]   open-world: clue (tx/address/project/repo/link) -> complete, deployment-matched scope; runs BEFORE map
-  flounder run     <clue>                                                         ONE-COMMAND PIPELINE from a tx/address/link: prepare -> map -> dig -> confirm -> report (--no-confirm to stop after the dig)
+  flounder run     <clue>                                                         ONE-COMMAND PIPELINE from a tx/address/link: prepare -> map -> dig -> synthesize -> verify -> confirm -> report (--no-confirm stops after the sealed audit)
   flounder run     --source <paths...> --target <name> [--corpus <paths...>]      sealed audit only: map -> dig on given source (--quick = one breadth pass)
   flounder map     --target <name> --source <paths...> [--corpus <paths...>]      enumerate the scope inventory only (writes audit_scopes.json)
   flounder audit   [<region> | --scope <id,...> | --verify <file>] --source ...   deep-audit a region, inventory scopes, or given claims

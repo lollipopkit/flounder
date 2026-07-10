@@ -66,6 +66,54 @@ test("store: project + run lifecycle is recorded and queryable", async () => {
   db.close();
 });
 
+test("store: evaluation tracking projects are isolated from the default project list", async () => {
+  const db = await tempDb();
+  db.upsertProject({ name: "operator-project" });
+  db.upsertProject({ name: "evaluation:item-1", origin: "evaluation" });
+
+  assert.deepEqual(db.listProjects().map((project) => project.name), ["operator-project"]);
+  assert.deepEqual(db.listProjects({ origin: "evaluation" }).map((project) => project.name), ["evaluation:item-1"]);
+  assert.equal(db.countProjects({ origin: "all" }), 2);
+  db.close();
+});
+
+test("store: global findings are source-filtered with evaluation provenance", async () => {
+  const db = await tempDb();
+  const projectId = db.upsertProject({ name: "product" });
+  const projectRun = db.startRun({ projectId, kind: "run", runDir: "/runs/product" });
+  db.upsertFindings(projectId, projectRun, [{ findingKey: "product-finding", title: "Product finding", status: "confirmed-executable" }]);
+
+  const evaluationId = db.upsertProject({ name: "evaluation:item-2", origin: "evaluation" });
+  const evaluationRun = db.startRun({ projectId: evaluationId, kind: "verify", runDir: "/runs/evaluation" });
+  db.upsertFindings(evaluationId, evaluationRun, [{ findingKey: "evaluation-finding", title: "Evaluation finding", status: "confirmed-differential" }]);
+
+  assert.deepEqual(db.listGlobalFindings().map((finding) => finding.finding_key), ["product-finding"]);
+  assert.deepEqual(db.listGlobalFindings({ source: "evaluation" }).map((finding) => finding.finding_key), ["evaluation-finding"]);
+  assert.equal(db.listGlobalFindings({ source: "evaluation" })[0].source, "evaluation");
+  assert.equal(db.listGlobalFindings({ source: "all" }).length, 2);
+  db.close();
+});
+
+test("store: startup hides pre-isolation projects that contain only evaluation runs", async () => {
+  const { dbPath } = await tempDbPath();
+  let db = new MetadataStore(dbPath);
+  const projectId = db.upsertProject({ name: "legacy-evaluation-target" });
+  const runId = db.startRun({ projectId, kind: "run", runDir: "/runs/legacy-evaluation" });
+  const group = db.createRunGroup({ name: "legacy-evaluation" });
+  const [workItem] = db.addWorkItems(group.id, [{ itemKey: "legacy", kind: "benchmark-case", targetBundle: {}, materialPolicy: {}, evidenceContract: {} }]);
+  const jobId = db.enqueueJob("legacy-evaluation-target", { verb: "run" });
+  assert.equal(db.attachWorkItemJob(workItem.id, jobId), true);
+  assert.equal(db.claimJob(db.createDaemonToken("legacy-evaluation-daemon").id)?.id, jobId);
+  db.setJobRun(jobId, runId);
+  db.close();
+
+  db = new MetadataStore(dbPath);
+  assert.equal(db.getProject("legacy-evaluation-target").origin, "evaluation");
+  assert.equal(db.listProjects().length, 0);
+  assert.equal(db.listProjects({ origin: "evaluation" }).length, 1);
+  db.close();
+});
+
 test("store: scope coverage tracks mapped vs audited", async () => {
   const db = await tempDb();
   const projectId = db.upsertProject({ name: "p" });
@@ -414,7 +462,7 @@ test("store: setScopeStatus marks a scope deferred (skipped) and counts it", asy
   db.close();
 });
 
-test("store: daemon tokens + job queue (claim is FIFO and one-shot; cancel is observable)", async () => {
+test("store: daemon tokens + job queue prioritizes project work and stays FIFO within each class", async () => {
   const db = await tempDb();
   const { token } = db.createDaemonToken("local");
   const { token: otherToken } = db.createDaemonToken("remote");
@@ -423,6 +471,16 @@ test("store: daemon tokens + job queue (claim is FIFO and one-shot; cancel is ob
   const daemonId = Number(db.getDaemonByToken(token).id);
   const otherDaemonId = Number(db.getDaemonByToken(otherToken).id);
 
+  const group = db.createRunGroup({ name: "background-evaluation" });
+  const [workItem] = db.addWorkItems(group.id, [{
+    itemKey: "case-1",
+    kind: "benchmark-case",
+    targetBundle: {},
+    materialPolicy: {},
+    evidenceContract: {},
+  }]);
+  const evaluationJob = db.enqueueJob("evaluation:item-1", { verb: "run" });
+  assert.equal(db.attachWorkItemJob(workItem.id, evaluationJob), true);
   const j1 = db.enqueueJob("proj", { verb: "run" });
   const pinned = db.enqueueJob("proj", { verb: "audit" }, otherDaemonId);
   const j2 = db.enqueueJob("proj", { verb: "map" });
@@ -431,6 +489,7 @@ test("store: daemon tokens + job queue (claim is FIFO and one-shot; cancel is ob
   assert.deepEqual(claim1.spec, { verb: "run" });
   assert.equal(db.getJob(j1).status, "dispatched");
   assert.equal(db.claimJob(daemonId).id, j2);
+  assert.equal(db.claimJob(daemonId).id, evaluationJob); // background work resumes after project FIFO drains
   assert.equal(db.claimJob(daemonId), undefined); // queue drained
   assert.equal(db.claimJob(otherDaemonId).id, pinned); // pinned work waits for its selected daemon
 

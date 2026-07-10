@@ -16,6 +16,14 @@ export interface WorkItemSettlement {
   error?: string;
 }
 
+/** Stable internal project identity for one evaluation item. The audit target remains the
+ * target bundle's public name; this identity exists only to isolate tracked runs/findings. */
+export function evaluationTrackingProjectName(item: Record<string, unknown>): string {
+  const uuid = stringValue(item.uuid);
+  if (!uuid) throw new Error("evaluation work item is missing its durable uuid");
+  return `evaluation:${uuid}`;
+}
+
 export function buildWorkItemLaunchSpec(item: Record<string, unknown>, group: Record<string, unknown>): LaunchSpec {
   const kind = String(item.kind) as WorkItemKind;
   if (kind === "custom") throw new Error("custom work items require an explicit product adapter and cannot execute through the generic scheduler");

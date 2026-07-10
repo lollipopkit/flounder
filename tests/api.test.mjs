@@ -59,6 +59,7 @@ test("api: GET /api is a self-describing catalog of every resource + operation",
     assert.match(projectList.query.offset, /default 0/);
     assert.match(projectList.query.q, /project-name search/);
     assert.match(projectList.query.status, /running/);
+    assert.match(projectList.query.origin, /evaluation/);
     const projectOrder = cat.endpoints.find((e) => e.method === "PATCH" && e.path === "/api/projects/order");
     assert.match(projectOrder.summary, /drag-and-drop/);
     const projectRun = cat.endpoints.find((e) => e.method === "POST" && e.path === "/api/projects/:uuid/runs");
@@ -88,6 +89,7 @@ test("api: GET /api is a self-describing catalog of every resource + operation",
     assert.match(projectFindings.query.status, /execution-confirmed/);
     assert.match(projectFindings.query.q, /#finding-id/);
     const globalFindings = cat.endpoints.find((e) => e.method === "GET" && e.path === "/api/bugs");
+    assert.match(globalFindings.query.source, /evaluation/);
     assert.match(globalFindings.summary, /execution-confirmed/);
     assert.match(globalFindings.query.project, /project uuid/);
     assert.match(globalFindings.query.tracking, /active/);
@@ -710,6 +712,7 @@ test("api: standard pipeline continue finishes pending verify work before openin
     assert.equal(pipelineSpec.coverageMode, "standard");
     assert.equal(pipelineSpec.coverageTarget, 30);
     assert.equal(pipelineSpec.maxScopes, 0);
+    assert.equal(pipelineSpec.pipelineStart, "settle");
     assert.equal(pipelineSpec.sandboxConfirmNetwork, "enabled");
   });
 });

@@ -30,7 +30,7 @@ import { confirmSelectorsForFinding } from "../util/confirm-selector.js";
 import { isResumeSettledDecision, isSubmissionReadyDecision, needsSubmissionReadinessWork } from "../util/submission-readiness.js";
 import { isSandboxBackend, type SandboxBackend } from "../security/sandbox.js";
 import { normalizeRunGroupManifest, normalizeWorkItemInput } from "../evaluation/contracts.js";
-import { buildWorkItemLaunchSpec, renderRunGroupReport, settleWorkItem } from "../evaluation/run-groups.js";
+import { buildWorkItemLaunchSpec, evaluationTrackingProjectName, renderRunGroupReport, settleWorkItem } from "../evaluation/run-groups.js";
 
 const UI_HTML_PATH = fileURLToPath(new URL("./public/index.html", import.meta.url));
 const UI_PUBLIC_DIR = path.dirname(UI_HTML_PATH);
@@ -192,19 +192,23 @@ const ROUTES: Route[] = [
 
   route({
     method: "GET", path: "/api/projects",
-    summary: "List projects with a live snapshot (scope coverage, finding counts, confirmed-bug count, latest run, active runs). Paginated with ?limit/&offset; pass ?archived=1 to list archived projects for Settings; pass ?status=running|needs-work|done|failed|not-started to filter by computed project status.",
+    summary: "List operator projects with a live snapshot (scope coverage, finding counts, confirmed-bug count, latest run, active runs). Evaluation tracking projects are hidden by default; pass ?origin=evaluation|all only for provenance/debugging.",
     query: {
       archived: "boolean? — when true, return archived projects instead of active projects",
       limit: "number? (default 100)",
       offset: "number? (default 0)",
       q: "string? — case-insensitive project-name search",
       status: "string? — one of running, needs-work, done, failed, not-started",
+      origin: "project|evaluation|all? — default project; evaluation rows are internal tracking",
     },
     handler: async (c) => {
       const limit = clampInt(c.url.searchParams.get("limit"), 100, 1, 500);
       const offset = clampInt(c.url.searchParams.get("offset"), 0, 0, 1_000_000);
+      const origin = normalizeProjectOriginFilter(c.url.searchParams.get("origin"));
+      if (!origin) return sendJson(c.res, 400, { error: "origin must be project, evaluation, or all" });
       const options: ProjectListOptions = {
         archived: truthyParam(c.url.searchParams.get("archived")),
+        origin,
         limit,
         offset,
         search: c.url.searchParams.get("q") ?? undefined,
@@ -481,18 +485,20 @@ const ROUTES: Route[] = [
 
   route({
     method: "GET", path: "/api/bugs",
-    summary: "Every finding across ALL projects (joined with project name) plus aggregate stats — the cross-project Bugs dashboard. Optional ?project=uuid, ?status= (exact or execution-confirmed), and ?tracking= filters; ?tracking=active hides ignored findings; ?limit/&offset paginate.",
-    query: { project: "string? — project uuid to scope findings and stats", status: "string? — exact status or execution-confirmed alias", tracking: "string? — tracking state, or active to hide ignored findings", limit: "number? (default 200)", offset: "number? (default 0)" },
+    summary: "Findings across operator projects plus aggregate stats, including execution-confirmed evidence. Evaluation findings are excluded by default; pass ?source=evaluation|all to inspect benchmark evidence with explicit provenance.",
+    query: { project: "string? — project uuid to scope findings and stats", source: "project|evaluation|all? — default project", status: "string? — exact status or execution-confirmed alias", tracking: "string? — tracking state, or active to hide ignored findings", limit: "number? (default 200)", offset: "number? (default 0)" },
     handler: (c) => {
       const projectUuid = c.url.searchParams.get("project") || c.url.searchParams.get("projectUuid") || undefined;
       const status = c.url.searchParams.get("status") || undefined;
       const exactStatus = status === "execution-confirmed" ? undefined : status;
       const tracking = c.url.searchParams.get("tracking") || undefined;
       const exactTracking = tracking === "active" ? undefined : tracking;
+      const source = normalizeFindingSourceFilter(c.url.searchParams.get("source"));
+      if (!source) return sendJson(c.res, 400, { error: "source must be project, evaluation, or all" });
       const limit = clampInt(c.url.searchParams.get("limit"), 200, 1, 500);
       const offset = clampInt(c.url.searchParams.get("offset"), 0, 0, 1_000_000);
-      const statsRows = reportableFindings(c.store.listGlobalFindings({ projectUuid, limit: 10_000, offset: 0 }));
-      const all = reportableFindings(c.store.listGlobalFindings({ projectUuid, status: exactStatus, tracking: exactTracking, limit: 10_000, offset: 0 }))
+      const statsRows = reportableFindings(c.store.listGlobalFindings({ projectUuid, source, limit: 10_000, offset: 0 }));
+      const all = reportableFindings(c.store.listGlobalFindings({ projectUuid, source, status: exactStatus, tracking: exactTracking, limit: 10_000, offset: 0 }))
         .filter((finding) => findingStatusMatches(finding, status))
         .filter((finding) => findingTrackingMatches(finding, tracking));
       sendJson(c.res, 200, { findings: all.slice(offset, offset + limit).map(findingSummaryRow), total: all.length, limit, offset, stats: globalFindingStats(statsRows) });
@@ -2317,6 +2323,17 @@ async function runLaunch(c: Ctx): Promise<void> {
     spec.nextActions = nextActions;
     applyNextActionRunDefaults(spec, nextActions, progress);
   }
+  if (
+    spec.verb === "run"
+    && spec.pipeline
+    && spec.maxScopes === 0
+    && pipelinePostAuditWorkPending(c.store, projectId, currentResultRunIds, materialBoundary, requiresRealTargetConfirmation)
+  ) {
+    // Continue the evidence tail directly. Starting runAudit with maxScopes=0 still copies and
+    // initializes the target and records a misleading empty Dig run before Verify/Confirm/Report.
+    spec.pipelineStart = "settle";
+    spec.maxScopes = 0;
+  }
   const materialDrift = verifyMaterialDrift(c.store, projectId, spec.verifyFindings, body.allowMaterialDrift === true);
   if (materialDrift) return sendJson(c.res, 409, materialDrift);
   if (spec.verb === "run" && spec.pipeline && pipelineRoundComplete(spec, progress, c.store, projectId, currentResultRunIds, materialBoundary, requiresRealTargetConfirmation)) {
@@ -3170,6 +3187,9 @@ function findingSummaryRow(row: Record<string, unknown>): Record<string, unknown
     "project_id",
     "project_name",
     "project_uuid",
+    "source",
+    "evaluation_name",
+    "evaluation_uuid",
     "run_id",
     "finding_key",
     "title",
@@ -3802,7 +3822,7 @@ function scheduleRunGroupWith(store: MetadataStore, plane: ControlPlane, runGrou
         const spec = buildWorkItemLaunchSpec(item, group);
         const bundle = parseStoredJson(item.target_bundle_json);
         const daemonId = typeof bundle?.daemonId === "number" ? bundle.daemonId : undefined;
-        const jobId = store.enqueueJob(spec.target, spec, daemonId);
+        const jobId = store.enqueueJob(evaluationTrackingProjectName(item), spec, daemonId);
         if (!store.attachWorkItemJob(Number(item.id), jobId)) {
           store.cancelJob(jobId, "work item was concurrently scheduled");
           continue;
@@ -4399,8 +4419,19 @@ async function daemonRunStart(c: Ctx): Promise<void> {
   if ((!additional && job.status !== "dispatched") || (additional && job.status !== "running")) {
     return sendJson(c.res, 409, { error: additional ? "pipeline phase can only be appended to a running job" : "job must be claimed before starting a run" });
   }
-  const existing = c.store.getProject(name);
-  const projectId = existing ? Number(existing.id) : c.store.upsertProject({ name, config: body.budgets });
+  const workItem = c.store.getWorkItemByJob(body.jobId);
+  // Evaluation jobs may carry an older target-shaped queue name from a pre-isolation DB.
+  // The durable work-item identity is authoritative, so both old queued jobs and new ones
+  // land in a hidden evaluation project instead of reusing a same-named operator project.
+  const trackingName = workItem ? evaluationTrackingProjectName(workItem) : name;
+  const existing = c.store.getProject(trackingName);
+  const expectedOrigin = workItem ? "evaluation" : "project";
+  if (existing && existing.origin !== expectedOrigin) {
+    return sendJson(c.res, 409, { error: `${expectedOrigin} tracking identity collides with an existing ${String(existing.origin)} project` });
+  }
+  const projectId = existing
+    ? Number(existing.id)
+    : c.store.upsertProject({ name: trackingName, origin: expectedOrigin, config: body.budgets });
   const runId = c.store.startRun({
     projectId,
     kind: body.kind ?? "run",
@@ -4774,6 +4805,16 @@ function normalizeProjectStatusFilter(value: string | null | undefined): Project
   return PROJECT_STATUS_FILTERS.includes(value as ProjectStatusFilter) ? value as ProjectStatusFilter : undefined;
 }
 
+function normalizeProjectOriginFilter(value: string | null | undefined): NonNullable<ProjectListOptions["origin"]> | undefined {
+  if (!value) return "project";
+  return value === "project" || value === "evaluation" || value === "all" ? value : undefined;
+}
+
+function normalizeFindingSourceFilter(value: string | null | undefined): "project" | "evaluation" | "all" | undefined {
+  if (!value) return "project";
+  return value === "project" || value === "evaluation" || value === "all" ? value : undefined;
+}
+
 function emptyProjectStatusCounts(total = 0): ProjectStatusCounts {
   return { all: total, running: 0, "needs-work": 0, done: 0, failed: 0, "not-started": 0 };
 }
@@ -4817,7 +4858,7 @@ function projectListResponse(
 ): { projects: Array<Record<string, unknown>>; total: number; limit: number; offset: number; statusCounts: ProjectStatusCounts } {
   const limit = typeof options.limit === "number" && Number.isFinite(options.limit) ? Math.max(1, Math.floor(options.limit)) : 100;
   const offset = typeof options.offset === "number" && Number.isFinite(options.offset) ? Math.max(0, Math.floor(options.offset)) : 0;
-  const allRows = projectSnapshots(store, { archived: options.archived, search: options.search });
+  const allRows = projectSnapshots(store, { archived: options.archived, origin: options.origin, search: options.search });
   const statusCounts = countProjectStatuses(allRows);
   const filteredRows = status ? allRows.filter((row) => projectSnapshotStatus(row) === status) : allRows;
   return { projects: filteredRows.slice(offset, offset + limit), total: filteredRows.length, limit, offset, statusCounts };
@@ -4826,7 +4867,10 @@ function projectListResponse(
 function projectSnapshots(store: MetadataStore, options: ProjectListOptions = {}): Array<Record<string, unknown>> {
   const runningJobs = store.runningJobs();
   const activeByTarget = new Map<string, number>();
-  for (const job of runningJobs) activeByTarget.set(String(job.project), (activeByTarget.get(String(job.project)) ?? 0) + 1);
+  for (const job of runningJobs) {
+    if (store.getWorkItemByJob(Number(job.id))) continue;
+    activeByTarget.set(String(job.project), (activeByTarget.get(String(job.project)) ?? 0) + 1);
+  }
   return store.listProjects(options).map((project) => {
     const id = Number(project.id);
     const allRuns = store.listRuns(id);
@@ -4862,6 +4906,7 @@ function projectSnapshots(store: MetadataStore, options: ProjectListOptions = {}
       id,
       uuid: project.uuid,
       name: project.name,
+      origin: project.origin ?? "project",
       provider_id: project.provider_id ?? null,
       daemon_id: project.daemon_id ?? null,
       dir: project.dir ?? null,

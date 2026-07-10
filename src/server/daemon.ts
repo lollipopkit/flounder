@@ -76,7 +76,7 @@ export async function runDaemon(opts: DaemonOptions): Promise<void> {
     let phaseStarts = 0;
     const sink = activitySink(() => tracker);
     const makeTracker = (cfg: AuditorConfig, runDir: string, kind: RunKind): RunTracker => {
-      tracker = new RemoteTracker(base, headers, { jobId: job.id, project: cfg.targetName, kind, runDir, provider: cfg.provider, model: cfg.auditModel, thinking: cfg.thinkingLevel, budgets: cfg.auditVerify ? { ...configSnapshot(cfg), verify: true, ...(cfg.auditVerifyFromStart ? { verifyFromStart: true } : {}) } : configSnapshot(cfg), additional: phaseStarts > 0 });
+      tracker = new RemoteTracker(base, headers, { jobId: job.id, project: job.project, kind, runDir, provider: cfg.provider, model: cfg.auditModel, thinking: cfg.thinkingLevel, budgets: cfg.auditVerify ? { ...configSnapshot(cfg), verify: true, ...(cfg.auditVerifyFromStart ? { verifyFromStart: true } : {}) } : configSnapshot(cfg), additional: phaseStarts > 0 });
       phaseStarts += 1;
       return tracker;
     };
@@ -92,7 +92,7 @@ export async function runDaemon(opts: DaemonOptions): Promise<void> {
       }
       if (!spec.mockLlm) await assertProviderAuthenticated(cfg.provider);
       if (spec.verb === "run" && spec.pipeline) {
-        await runPipelineJob(base, headers, spec, { out, workspace, signal: abort.signal, makeTracker, flushTracker, onActivity: sink.push, mockLlm: spec.mockLlm === true, runScopeTargets, jobId: job.id });
+        await runPipelineJob(base, headers, spec, { out, workspace, signal: abort.signal, makeTracker, flushTracker, onActivity: sink.push, mockLlm: spec.mockLlm === true, runScopeTargets, jobId: job.id, trackingProject: job.project });
       } else if (spec.verb === "report") {
         if (!spec.reportFindings?.length) throw new Error("report requires reproduced finding inputs");
         await runReport(cfg, { findings: spec.reportFindings, signal: abort.signal, makeTracker, onActivity: sink.push, ...(spec.maxSteps !== undefined ? { maxSteps: spec.maxSteps } : {}) });
@@ -124,7 +124,7 @@ export async function runDaemon(opts: DaemonOptions): Promise<void> {
         await requireSandboxReady(cfg, spec.verb, { makeTracker, flushTracker, onActivity: sink.push });
         try {
           await runAudit(cfg, {
-            kind: spec.verb,
+            kind: cfg.auditVerify ? "verify" : spec.verb,
             signal: abort.signal,
             makeTracker,
             onActivity: sink.push,
@@ -200,6 +200,7 @@ async function runPipelineJob(
     mockLlm: boolean;
     runScopeTargets: Map<number, number>;
     jobId: number;
+    trackingProject: string;
   },
 ): Promise<void> {
   let staged = spec.buildRoot ?? spec.sourcePaths[0];
@@ -230,19 +231,21 @@ async function runPipelineJob(
     buildRoot: staged,
     ...(scopeNote ? { scopeNote } : {}),
   };
-  const auditCfg = specToConfig(auditSpec, ctx.out, ctx.workspace);
-  await requireSandboxReady(auditCfg, "run", ctx);
-  await runAudit(auditCfg, {
-    kind: "run",
-    signal: ctx.signal,
-    makeTracker: ctx.makeTracker,
-    onActivity: ctx.onActivity,
-    control: { getRunScopesTarget: () => ctx.runScopeTargets.get(ctx.jobId) },
-    ...(ctx.mockLlm ? { llm: new MockAuditLlmClient() } : {}),
-  });
-  await ctx.flushTracker();
+  if (spec.pipelineStart !== "settle") {
+    const auditCfg = specToConfig(auditSpec, ctx.out, ctx.workspace);
+    await requireSandboxReady(auditCfg, "run", ctx);
+    await runAudit(auditCfg, {
+      kind: "run",
+      signal: ctx.signal,
+      makeTracker: ctx.makeTracker,
+      onActivity: ctx.onActivity,
+      control: { getRunScopesTarget: () => ctx.runScopeTargets.get(ctx.jobId) },
+      ...(ctx.mockLlm ? { llm: new MockAuditLlmClient() } : {}),
+    });
+    await ctx.flushTracker();
+  }
 
-  const verify = await pipelineWorklist(base, headers, ctx.jobId, spec.target, "verify", spec.verifyFromStart === true);
+  const verify = await pipelineWorklist(base, headers, ctx.jobId, ctx.trackingProject, "verify", spec.verifyFromStart === true);
   if (verify.verifyFindings.length > 0) {
     const verifySpec: LaunchSpec = {
       ...spec,
@@ -260,7 +263,7 @@ async function runPipelineJob(
       verifyCfg.auditVerify = vf;
       await requireSandboxReady(verifyCfg, "audit", ctx);
       await runAudit(verifyCfg, {
-        kind: "audit",
+        kind: "verify",
         signal: ctx.signal,
         makeTracker: ctx.makeTracker,
         onActivity: ctx.onActivity,
@@ -273,7 +276,7 @@ async function runPipelineJob(
   }
 
   await drainPipelineConfirmWork(
-    () => pipelineWorklist(base, headers, ctx.jobId, spec.target, "confirm"),
+    () => pipelineWorklist(base, headers, ctx.jobId, ctx.trackingProject, "confirm"),
     async (confirm) => {
       const confirmSpec: LaunchSpec = {
         ...spec,
@@ -305,7 +308,7 @@ async function runPipelineJob(
     },
   );
 
-  const report = await pipelineWorklist(base, headers, ctx.jobId, spec.target, "report");
+  const report = await pipelineWorklist(base, headers, ctx.jobId, ctx.trackingProject, "report");
   if (report.reportFindings.length > 0) {
     const reportSpec: LaunchSpec = {
       ...spec,

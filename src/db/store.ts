@@ -40,6 +40,7 @@ export type FindingStatus =
 
 export interface ProjectInput {
   name: string;
+  origin?: "project" | "evaluation" | undefined; // evaluation tracking projects stay out of the normal project surface
   sourcePaths?: string[] | undefined; // relative to the project dir
   buildRoot?: string | undefined; // relative to the project dir
   corpusPaths?: string[] | undefined; // relative to the project dir
@@ -51,6 +52,7 @@ export interface ProjectInput {
 
 export interface ProjectListOptions {
   archived?: boolean | "all" | undefined;
+  origin?: "project" | "evaluation" | "all" | undefined;
   limit?: number | undefined;
   offset?: number | undefined;
   search?: string | undefined;
@@ -203,7 +205,7 @@ export interface RunGroupInput {
   budget?: unknown;
 }
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -212,6 +214,7 @@ CREATE TABLE IF NOT EXISTS project(
   id INTEGER PRIMARY KEY,
   uuid TEXT NOT NULL,
   name TEXT UNIQUE NOT NULL,
+  origin TEXT NOT NULL DEFAULT 'project', -- project | evaluation; evaluation rows are internal run tracking
   source_paths TEXT,              -- now RELATIVE to the project dir (was absolute)
   build_root TEXT,                -- relative to the project dir
   corpus_paths TEXT,              -- relative to the project dir
@@ -430,6 +433,8 @@ CREATE TABLE IF NOT EXISTS work_item(
   UNIQUE(run_group_id, item_key)
 );
 CREATE INDEX IF NOT EXISTS idx_work_item_group_state ON work_item(run_group_id, state);
+CREATE INDEX IF NOT EXISTS idx_work_item_project ON work_item(project_id);
+CREATE INDEX IF NOT EXISTS idx_work_item_run ON work_item(run_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_work_item_job ON work_item(job_id) WHERE job_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS work_item_attempt(
@@ -450,9 +455,11 @@ CREATE TABLE IF NOT EXISTS work_item_attempt(
   UNIQUE(job_id)
 );
 CREATE INDEX IF NOT EXISTS idx_work_item_attempt_item ON work_item_attempt(work_item_id, attempt_number);
+CREATE INDEX IF NOT EXISTS idx_work_item_attempt_run ON work_item_attempt(run_id);
 `;
 
 const ADDITIVE_COLUMNS = [
+  ["project", "origin", "ALTER TABLE project ADD COLUMN origin TEXT NOT NULL DEFAULT 'project'"],
   ["project", "provider_id", "ALTER TABLE project ADD COLUMN provider_id INTEGER"],
   ["project", "daemon_id", "ALTER TABLE project ADD COLUMN daemon_id INTEGER"],
   ["project", "dir", "ALTER TABLE project ADD COLUMN dir TEXT"],
@@ -768,6 +775,7 @@ export class MetadataStore {
       for (const [table, column, alter] of ADDITIVE_COLUMNS) {
         if (!this.hasColumn(table, column)) this.db.exec(alter);
       }
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_project_origin ON project(origin)");
     }, "immediate");
     this.ensureProjectUuids();
     this.reconcileConfirmStatuses();
@@ -819,6 +827,17 @@ export class MetadataStore {
 
   private runDataMigrations(): void {
     this.transaction(() => {
+      this.db.exec("UPDATE work_item SET project_id = (SELECT project_id FROM run WHERE run.id = work_item.run_id) WHERE project_id IS NULL AND run_id IS NOT NULL");
+      this.db.exec("UPDATE project SET origin = 'evaluation' WHERE origin = 'project' AND name LIKE 'evaluation:%' AND EXISTS (SELECT 1 FROM work_item WHERE work_item.project_id = project.id)");
+      this.db.exec(`UPDATE project AS p SET origin = 'evaluation'
+        WHERE p.origin = 'project'
+          AND EXISTS (SELECT 1 FROM run r_any WHERE r_any.project_id = p.id)
+          AND NOT EXISTS (
+            SELECT 1 FROM run r_normal
+             WHERE r_normal.project_id = p.id
+               AND NOT EXISTS (SELECT 1 FROM work_item wi_run WHERE wi_run.run_id = r_normal.id)
+               AND NOT EXISTS (SELECT 1 FROM work_item_attempt wia_run WHERE wia_run.run_id = r_normal.id)
+          )`);
       this.reconcileFindingReportRunIds();
       this.reconcileRefutedVerifyArtifacts();
       this.reconcileConfirmDecisionReports();
@@ -994,8 +1013,8 @@ export class MetadataStore {
     const insertSortOrder = this.nextProjectSortOrder();
     this.db
       .prepare(
-        `INSERT INTO project(uuid, name, source_paths, build_root, corpus_paths, config_json, provider_id, daemon_id, dir, sort_order, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO project(uuid, name, origin, source_paths, build_root, corpus_paths, config_json, provider_id, daemon_id, dir, sort_order, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(name) DO UPDATE SET
            source_paths = excluded.source_paths,
            build_root   = excluded.build_root,
@@ -1011,6 +1030,7 @@ export class MetadataStore {
       .run(
         projectUuid,
         input.name,
+        input.origin ?? "project",
         jsonOrNull(input.sourcePaths),
         input.buildRoot ?? null,
         jsonOrNull(input.corpusPaths),
@@ -1053,7 +1073,7 @@ export class MetadataStore {
   }
 
   private nextProjectSortOrder(): number {
-    const row = this.db.prepare("SELECT MIN(sort_order) AS min_order FROM project WHERE archived_at IS NULL").get() as { min_order: number | null } | undefined;
+    const row = this.db.prepare("SELECT MIN(sort_order) AS min_order FROM project WHERE archived_at IS NULL AND origin = 'project'").get() as { min_order: number | null } | undefined;
     return typeof row?.min_order === "number" ? row.min_order - 10 : 0;
   }
 
@@ -1622,23 +1642,25 @@ export class MetadataStore {
   }
 
   getFinding(id: number): Record<string, unknown> | undefined {
-    return this.db.prepare("SELECT f.*, p.name AS project_name, p.uuid AS project_uuid FROM finding f JOIN project p ON p.id = f.project_id WHERE f.id = ?").get(id) as Record<string, unknown> | undefined;
+    return this.db.prepare(globalFindingSelect("WHERE f.id = ?") + " LIMIT 1").get(id) as Record<string, unknown> | undefined;
   }
 
   // --- global (cross-project) bug view -------------------------------------
 
-  /** Findings across ALL projects (joined with the project name), newest first, optionally
-   * filtered by project, status, and/or tracking state. The "Bugs" dashboard's table. */
-  listGlobalFindings(opts: { projectUuid?: string | undefined; status?: string | undefined; tracking?: string | undefined; limit?: number | undefined; offset?: number | undefined } = {}): Array<Record<string, unknown>> {
+  /** Findings across tracked projects, newest first. Evaluation findings are excluded by
+   * default so benchmark evidence cannot silently enter the product finding registry. */
+  listGlobalFindings(opts: { projectUuid?: string | undefined; status?: string | undefined; tracking?: string | undefined; source?: "project" | "evaluation" | "all" | undefined; limit?: number | undefined; offset?: number | undefined } = {}): Array<Record<string, unknown>> {
     const cond: string[] = [], params: Array<string | number> = [];
     if (opts.projectUuid) { cond.push("p.uuid = ?"); params.push(opts.projectUuid); }
     if (opts.status) { cond.push("f.status = ?"); params.push(opts.status); }
     if (opts.tracking) { cond.push("COALESCE(f.tracking_status, 'open') = ?"); params.push(opts.tracking); }
+    const source = opts.source ?? "project";
+    if (source !== "all") { cond.push(`${FINDING_SOURCE_SQL} = ?`); params.push(source); }
     const where = cond.length ? "WHERE " + cond.join(" AND ") : "";
     const limit = Math.max(1, Math.floor(opts.limit ?? 200));
     const offset = Math.max(0, Math.floor(opts.offset ?? 0));
     return this.db
-      .prepare("SELECT f.*, p.name AS project_name, p.uuid AS project_uuid FROM finding f JOIN project p ON p.id = f.project_id " + where + " ORDER BY f.updated_at DESC LIMIT ? OFFSET ?")
+      .prepare(globalFindingSelect(where) + " ORDER BY f.updated_at DESC LIMIT ? OFFSET ?")
       .all(...params, limit, offset) as Array<Record<string, unknown>>;
   }
 
@@ -2001,8 +2023,8 @@ export class MetadataStore {
     const ts = now();
     this.transaction(() => {
       this.db
-        .prepare("UPDATE work_item SET state = 'running', run_id = ?, started_at = COALESCE(started_at, ?), updated_at = ? WHERE job_id = ? AND state IN ('queued','claimed')")
-        .run(runId, ts, ts, jobId);
+        .prepare("UPDATE work_item SET state = 'running', run_id = ?, project_id = (SELECT project_id FROM run WHERE id = ?), started_at = COALESCE(started_at, ?), updated_at = ? WHERE job_id = ? AND state IN ('queued','claimed')")
+        .run(runId, runId, ts, ts, jobId);
       this.db
         .prepare("UPDATE work_item_attempt SET state = 'running', run_id = ?, started_at = COALESCE(started_at, ?), updated_at = ? WHERE job_id = ? AND state IN ('queued','claimed')")
         .run(runId, ts, ts, jobId);
@@ -2176,11 +2198,21 @@ export class MetadataStore {
     return Number(info.lastInsertRowid);
   }
 
-  /** Atomically claim the oldest queued job for a daemon (dispatched). Returns it (spec parsed) or undefined. */
+  /** Atomically claim queued work for a daemon. Operator-launched project work takes priority
+   * over background evaluation work; FIFO is preserved inside each class. Running work is never
+   * preempted, so a claimed evaluation keeps its isolated workspace until it settles. */
   claimJob(daemonId: number): { id: number; project: string; spec: unknown } | undefined {
     let claimed: { id: number; project: string; spec_json: string } | undefined;
     this.transaction(() => {
-      const row = this.db.prepare("SELECT id, project, spec_json FROM job WHERE status = 'queued' AND (daemon_id IS NULL OR daemon_id = ?) ORDER BY created_at LIMIT 1").get(daemonId) as
+      const row = this.db.prepare(
+        `SELECT j.id, j.project, j.spec_json
+           FROM job j
+          WHERE j.status = 'queued' AND (j.daemon_id IS NULL OR j.daemon_id = ?)
+          ORDER BY CASE WHEN EXISTS (SELECT 1 FROM work_item wi WHERE wi.job_id = j.id) THEN 1 ELSE 0 END,
+                   j.created_at,
+                   j.id
+          LIMIT 1`,
+      ).get(daemonId) as
         | { id: number; project: string; spec_json: string }
         | undefined;
       if (!row) return;
@@ -2435,9 +2467,46 @@ function toProviderProfile(row: Record<string, unknown>): ProviderProfile {
   };
 }
 
+const FINDING_SOURCE_SQL = `CASE
+  WHEN p.origin = 'evaluation'
+    OR EXISTS (SELECT 1 FROM work_item wi_source WHERE wi_source.run_id = f.run_id)
+    OR EXISTS (SELECT 1 FROM work_item_attempt wia_source WHERE wia_source.run_id = f.run_id)
+  THEN 'evaluation'
+  ELSE 'project'
+END`;
+
+function evaluationGroupFieldSql(field: "name" | "uuid"): string {
+  return `(SELECT rg_source.${field}
+    FROM work_item wi_group
+    JOIN run_group rg_source ON rg_source.id = wi_group.run_group_id
+   WHERE wi_group.project_id = p.id
+      OR wi_group.run_id = f.run_id
+      OR EXISTS (
+        SELECT 1 FROM work_item_attempt wia_group
+         WHERE wia_group.work_item_id = wi_group.id AND wia_group.run_id = f.run_id
+      )
+   ORDER BY wi_group.id DESC
+   LIMIT 1)`;
+}
+
+function globalFindingSelect(where: string): string {
+  return `SELECT f.*, p.name AS project_name, p.uuid AS project_uuid,
+      ${FINDING_SOURCE_SQL} AS source,
+      ${evaluationGroupFieldSql("name")} AS evaluation_name,
+      ${evaluationGroupFieldSql("uuid")} AS evaluation_uuid
+    FROM finding f
+    JOIN project p ON p.id = f.project_id
+    ${where}`;
+}
+
 function projectListWhere(options: ProjectListOptions): { where: string; args: string[] } {
   const clauses: string[] = [];
   const args: string[] = [];
+  const origin = options.origin ?? "project";
+  if (origin !== "all") {
+    clauses.push("origin = ?");
+    args.push(origin);
+  }
   if (options.archived !== "all") clauses.push(options.archived === true ? "archived_at IS NOT NULL" : "archived_at IS NULL");
   const search = typeof options.search === "string" ? options.search.trim().toLowerCase() : "";
   if (search) {

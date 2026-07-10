@@ -73,7 +73,7 @@ test("run-group API schedules bounded work and advances from daemon evidence", a
     await json(registered);
 
     const firstClaim = await json(await request(base, "POST", "/api/daemon/claim", {}, token));
-    assert.equal(firstClaim.job.project, "eval-c1-f1-s1");
+    assert.equal(firstClaim.job.project, `evaluation:${started.items[0].uuid}`);
     const firstRun = await json(await request(base, "POST", "/api/daemon/runs", {
       jobId: firstClaim.job.id,
       project: firstClaim.job.project,
@@ -88,14 +88,30 @@ test("run-group API schedules bounded work and advances from daemon evidence", a
     }, token));
     await json(await request(base, "POST", `/api/daemon/jobs/${firstClaim.job.id}/status`, { status: "done" }, token));
 
+    const operatorProjects = await json(await fetch(base + "/api/projects"));
+    assert.deepEqual(operatorProjects.projects, [], "evaluation tracking rows must not enter the normal project rail");
+    const evaluationProjects = await json(await fetch(base + "/api/projects?origin=evaluation"));
+    assert.equal(evaluationProjects.projects.length, 1);
+    assert.equal(evaluationProjects.projects[0].origin, "evaluation");
+    assert.equal(evaluationProjects.projects[0].name, `evaluation:${started.items[0].uuid}`);
+
+    const projectFindings = await json(await fetch(base + "/api/bugs"));
+    assert.equal(projectFindings.total, 0, "evaluation evidence must not enter Findings by default");
+    const evaluationFindings = await json(await fetch(base + "/api/bugs?source=evaluation"));
+    assert.equal(evaluationFindings.total, 1);
+    assert.equal(evaluationFindings.findings[0].source, "evaluation");
+    assert.equal(evaluationFindings.findings[0].evaluation_uuid, created.uuid);
+    assert.equal(evaluationFindings.findings[0].evaluation_name, "http-eval");
+
     let group = await json(await fetch(base + `/api/run-groups/${created.uuid}`));
     assert.equal(group.items[0].state, "finished");
+    assert.equal(group.items[0].project_id, evaluationProjects.projects[0].id);
     assert.equal(group.items[0].outcome, "findings_reported");
     assert.equal(group.items[0].result.accepted, true);
     assert.ok(group.items[1].job_id, "second item should be scheduled after the first frees the only slot");
 
     const secondClaim = await json(await request(base, "POST", "/api/daemon/claim", {}, token));
-    assert.equal(secondClaim.job.project, "eval-c1-f2-s1");
+    assert.equal(secondClaim.job.project, `evaluation:${group.items[1].uuid}`);
     const secondRun = await json(await request(base, "POST", "/api/daemon/runs", {
       jobId: secondClaim.job.id,
       project: secondClaim.job.project,

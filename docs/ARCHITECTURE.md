@@ -58,6 +58,15 @@ control pass. Group concurrency counts queued daemon jobs as occupied slots,
 and terminal item reconciliation plus next-item dispatch run again after a
 control-plane restart.
 
+Evaluation execution has explicit provenance. Each work item records its run in a
+hidden `origin=evaluation` tracking project keyed by the durable work-item UUID,
+while the audit kernel still uses the target bundle's target name for artifacts
+and reasoning context. Normal project lists and Findings queries default to
+`origin/source=project`; evaluation evidence is available only through an
+explicit filter and links back to its run group. The shared queue claims normal
+Project jobs before queued Evaluation jobs, preserving FIFO inside each class;
+already-running jobs are not preempted.
+
 Every dispatch also appends a `work_item_attempt` row. Retrying is limited to
 blocked failed/cancelled items and resets only the current item projection; the
 prior job, run, outcome, and diagnostic remain immutable attempt history.
@@ -82,6 +91,15 @@ and confirmation gate outside the optimization loop.
 ## Audit Flow
 
 The diagram below is the **inner per-session loop** — one agent session. The default `flounder run` wraps it in a **map → dig** orchestration (and `flounder confirm` runs it open-world); that orchestration, plus the resumable scope inventory, is described under [Audit Modes](#audit-modes).
+
+Dig and Verify share the same execution gate but have different inputs. Dig owns
+discovery for one scope and tries to prove a new claim immediately. Verify owns
+no discovery coverage: it receives unresolved Dig output, cross-scope synthesis
+output, or an imported claim, then gives each claim an isolated confirm-or-refute
+session. A pipeline Continue resumes an interrupted Dig batch first; otherwise,
+when only evidence-tail work remains, it skips the empty audit setup and starts
+at Verify/Confirm/Report. New verification runs persist as `kind=verify`; readers
+still recognize the historical `kind=audit` plus `budgets.verify=true` encoding.
 
 ```mermaid
 flowchart TD

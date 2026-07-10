@@ -624,6 +624,10 @@ export function confirmCommandTargetLinkForTest(command: ReproductionCommand, se
   return confirmCommandTargetLink(command, session as AgentSession);
 }
 
+export function splitCommandLineForTest(input: string): { argv: string[] } | { error: string } {
+  return splitCommandLine(input);
+}
+
 function addCommandFileArg(out: string[], value: string, roots: string[], session: Pick<AgentSession, "scratchFiles" | "baselineFiles">): void {
   if (looksLikeNonFileValue(value)) return;
   const normalized = normalizeRelativePath(value);

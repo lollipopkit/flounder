@@ -7,7 +7,7 @@ import test from "node:test";
 import { gzipSync } from "node:zlib";
 import { defaultConfig, resolveRole, withRole, normalizeRoleModels } from "../dist/config.js";
 import { ProjectMemory } from "../dist/agent/memory.js";
-import { buildTools, describeAction, ingestFindingsFromScratch, newSession, dedupeFindings, readScratchScopes, isReportFile, scratchHasFindings, scratchHasFindingsArtifact, commandFileArgsForTest, confirmCommandTargetLinkForTest } from "../dist/agent/tools.js";
+import { buildTools, describeAction, ingestFindingsFromScratch, newSession, dedupeFindings, readScratchScopes, isReportFile, scratchHasFindings, scratchHasFindingsArtifact, commandFileArgsForTest, confirmCommandTargetLinkForTest, splitCommandLineForTest } from "../dist/agent/tools.js";
 import { buildRunHealth, mergeFollowupScopes, readScratchCoverageGaps, readScratchFollowupScopes, readScratchResourceRequests } from "../dist/agent/discovery-artifacts.js";
 import { mergeScopeInventory } from "../dist/agent/scope-store.js";
 import { runAudit } from "../dist/agent/audit.js";
@@ -931,6 +931,12 @@ test("bash refuses non-local or non-inspection commands without touching the wor
   }
 });
 
+test("bash command parsing preserves POSIX regex escapes inside double quotes", () => {
+  assert.deepEqual(splitCommandLineForTest('rg -n "hello new value \\(" scratch.txt'), {
+    argv: ["rg", "-n", "hello new value \\(", "scratch.txt"],
+  });
+});
+
 test("read, write, edit, and bash operate on loaded material and the copied workspace", async () => {
   const dir = await tempDir();
   try {
@@ -949,9 +955,6 @@ test("read, write, edit, and bash operate on loaded material and the copied work
     assert.match(edited.observation, /edited scratch\.txt/);
     const scratch = await tool("read").run({ path: "scratch.txt" }, ctx);
     assert.match(scratch.observation, /hello new value/);
-    const regexInspect = await tool("bash").run({ cmd: 'rg -n "hello new value \\(" scratch.txt' }, ctx);
-    assert.equal(ctx.session.commandRuns.at(-1).exitCode, 0, "the escaped parenthesis must reach rg as a literal and match");
-    assert.doesNotMatch(regexInspect.observation, /regex parse error|unclosed group/i);
 
     await tool("write").run({
       path: "audit_repro.test.mjs",
@@ -960,7 +963,7 @@ test("read, write, edit, and bash operate on loaded material and the copied work
     const run = await tool("bash").run({ cmd: "node --test audit_repro.test.mjs", purpose: "confirm", success_patterns: ["local harness success"] }, ctx);
     assert.match(run.observation, /not confirmation-eligible/);
     assert.match(run.observation, /standalone file/);
-    assert.equal(ctx.session.commandRuns.length, 2);
+    assert.equal(ctx.session.commandRuns.length, 1);
     assert.equal(ctx.session.commandRuns.at(-1).passed, false);
     assert.equal(ctx.session.commandRuns.at(-1).targetLinked, false);
     const events = (await readFile(path.join(logger.runDir, "events.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);

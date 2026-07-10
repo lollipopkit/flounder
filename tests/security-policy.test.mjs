@@ -118,6 +118,7 @@ test("destructive filesystem commands stay blocked even in network-enabled confi
     cmd("git", "-C", "sources/repo", "clean", "-fdx"),
     cmd("git", "-C", "sources/repo", "reset", "--hard"),
     cmd("env", "FOO=bar", "rm", "-rf", "sources/tmp"),
+    cmd("env", "FOO=bar", "env", "BAR=baz", "rm", "-rf", "sources/tmp"),
   ]) {
     const decision = analyzeConfirmBashCommandSafety(c);
     assert.equal(decision.blocked, true, `${c.program} ${c.args.join(" ")} must be blocked`);

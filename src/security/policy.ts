@@ -435,19 +435,24 @@ function analyzeStructuredCommandBaseSafety(command: StructuredReproductionComma
 }
 
 function unwrapSafeEnvCommand(command: StructuredReproductionCommand): StructuredReproductionCommand | undefined {
-  const program = command.program.trim();
-  if (program.toLowerCase() !== "env") return command;
-  const args = command.args.map((arg) => String(arg));
-  let index = 0;
-  for (; index < args.length; index += 1) {
-    const arg = args[index] ?? "";
-    if (!/^[A-Za-z_][A-Za-z0-9_]*=/.test(arg)) break;
-    if (!isSafeEnvAssignment(arg)) return undefined;
+  let current: StructuredReproductionCommand = {
+    program: command.program.trim(),
+    args: command.args.map((arg) => String(arg)),
+  };
+  while (current.program.toLowerCase() === "env") {
+    const args = current.args.map((arg) => String(arg));
+    let index = 0;
+    for (; index < args.length; index += 1) {
+      const arg = args[index] ?? "";
+      if (!/^[A-Za-z_][A-Za-z0-9_]*=/.test(arg)) break;
+      if (!isSafeEnvAssignment(arg)) return undefined;
+    }
+    const wrappedProgram = args[index];
+    if (!wrappedProgram) return undefined;
+    if (wrappedProgram.startsWith("-") || wrappedProgram.includes("/") || wrappedProgram.includes("\\") || /[\s;&|`$<>]/.test(wrappedProgram)) return undefined;
+    current = { program: wrappedProgram, args: args.slice(index + 1) };
   }
-  const wrappedProgram = args[index];
-  if (!wrappedProgram) return undefined;
-  if (wrappedProgram.startsWith("-") || wrappedProgram.includes("/") || wrappedProgram.includes("\\") || /[\s;&|`$<>]/.test(wrappedProgram)) return undefined;
-  return { program: wrappedProgram, args: args.slice(index + 1) };
+  return current;
 }
 
 function isSafeEnvAssignment(arg: string): boolean {

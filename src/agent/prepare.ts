@@ -61,15 +61,16 @@ export interface ToolVersionCheck {
   reason?: string;
 }
 
-export async function prepareWorkspaceToolchain(input: { workspace: SandboxWorkspace; cfg: AuditorConfig; logger: RunLogger; cacheDir?: string; focusCommand?: ReproductionCommand; streamId?: string }): Promise<PrepareReport> {
+export async function prepareWorkspaceToolchain(input: { workspace: SandboxWorkspace; cfg: AuditorConfig; logger: RunLogger; cacheDir?: string; focusCommand?: ReproductionCommand; focusPaths?: string[]; streamId?: string }): Promise<PrepareReport> {
   const streamMeta = input.streamId ? { streamId: input.streamId } : {};
   const artifactName = input.streamId ? `audit_prepare-${slug(input.streamId)}.json` : "audit_prepare.json";
   const allPlans = await detectToolchains(input.workspace.absolute);
-  const plans = focusPlans(allPlans, input.focusCommand);
+  const pathFocusedPlans = focusPlansByPaths(allPlans, input.focusPaths);
+  const plans = focusPlans(pathFocusedPlans, input.focusCommand);
   const pinnedToolVersions = await detectPinnedToolVersions(input.workspace.absolute);
   const relevantPins = relevantPinnedToolVersions(pinnedToolVersions, plans);
-  if (pinnedToolVersions.length > 0) {
-    await input.logger.event("audit_prepare_tool_versions", { pins: pinnedToolVersions, ...streamMeta });
+  if (relevantPins.length > 0) {
+    await input.logger.event("audit_prepare_tool_versions", { pins: relevantPins, ...streamMeta });
   }
   const toolVersionChecks = await checkPinnedToolVersions(input, relevantPins);
   if (toolVersionChecks.length > 0) {
@@ -274,6 +275,29 @@ interface ToolchainPlan {
   toolchain: Toolchain;
   cwd?: string;
   commands: string[][];
+}
+
+function focusPlansByPaths(plans: ToolchainPlan[], focusPaths?: string[]): ToolchainPlan[] {
+  const dirs = (focusPaths ?? [])
+    .flatMap((value) => value.split(","))
+    .map(focusDirectory)
+    .filter((value): value is string => Boolean(value));
+  if (dirs.length === 0) return plans;
+  const focused = plans.filter((plan) => dirs.some((dir) => planCoversCommandCwd(plan.cwd, dir)));
+  if (focused.length === 0) return plans;
+  const focusDirs = focused.map((plan) => normalizePlanDir(plan.cwd ?? ""));
+  const dependencyPlans = plans.filter((plan) =>
+    ["npm", "pnpm", "yarn"].includes(plan.toolchain)
+    && focusDirs.some((dir) => sameOrNestedPlan(plan.cwd, dir)),
+  );
+  return uniquePlans([...dependencyPlans, ...focused]);
+}
+
+function focusDirectory(value: string): string | undefined {
+  const reference = value.trim().replace(/:\d+(?:-\d+)?(?:\s.*)?$/, "");
+  if (!reference) return undefined;
+  const normalized = normalizePlanDir(reference);
+  return normalizePlanDir(path.posix.dirname(normalized));
 }
 
 function focusPlans(plans: ToolchainPlan[], command?: ReproductionCommand): ToolchainPlan[] {

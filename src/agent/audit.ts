@@ -538,7 +538,13 @@ export async function runAudit(
     const maxSamples = Math.max(samples, Math.floor(cfg.auditDigMaxSamples));
     const concurrency = Math.max(1, Math.floor(cfg.auditDigConcurrency));
     if (cfg.auditEagerPrepare && session.workspace && toDig.length > 0) {
-      const report = await prepareWorkspaceToolchain({ workspace: session.workspace, cfg, logger, ...(session.buildCacheDir ? { cacheDir: session.buildCacheDir } : {}) });
+      const report = await prepareWorkspaceToolchain({
+        workspace: session.workspace,
+        cfg,
+        logger,
+        focusPaths: toDig.map((scope) => scope.region),
+        ...(session.buildCacheDir ? { cacheDir: session.buildCacheDir } : {}),
+      });
       const requests = prepareResourceRequests(report);
       if (requests.length > 0) session.resourceRequests = mergeResourceRequests(session.resourceRequests ?? [], requests);
       recorder.stage("build-readiness", {

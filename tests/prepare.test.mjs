@@ -167,6 +167,8 @@ test("prepareWorkspaceToolchain limits eager warm-up to the selected scope build
     await mkdir(path.join(workspace, "solidity", "contracts"), { recursive: true });
     await writeFile(path.join(workspace, "solidity", "foundry.toml"), "[profile.default]\nsrc = \"contracts\"\n");
     await writeFile(path.join(workspace, "solidity", "contracts", "Target.sol"), "contract Target {}\n");
+    await mkdir(path.join(workspace, "another-solidity-root"), { recursive: true });
+    await writeFile(path.join(workspace, "another-solidity-root", "foundry.toml"), "[profile.default]\nsrc = \"src\"\n");
     await mkdir(path.join(workspace, "vendor", "cairo"), { recursive: true });
     await writeFile(path.join(workspace, "vendor", "cairo", "Scarb.toml"), "[package]\nname = \"unrelated\"\nversion = \"0.1.0\"\n");
     await writeFile(path.join(workspace, "vendor", "cairo", ".tool-versions"), "scarb 2.12.0\n");
@@ -198,6 +200,42 @@ test("prepareWorkspaceToolchain limits eager warm-up to the selected scope build
     ]);
     assert.doesNotMatch(await readFile(logPath, "utf8"), /scarb/);
     assert.equal(log.events.some((event) => event.kind === "audit_prepare_tool_version_mismatch"), false);
+  } finally {
+    process.env.PATH = oldPath;
+    await rm(workspace, { recursive: true, force: true });
+    await rm(binDir, { recursive: true, force: true });
+    await rm(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("prepareWorkspaceToolchain does not report installer progress as an actual tool version", async () => {
+  const workspace = await tempDir("flounder-prepare-version-progress-");
+  const binDir = await tempDir("flounder-prepare-bin-");
+  const cacheDir = await tempDir("flounder-prepare-cache-");
+  const logPath = path.join(workspace, "tools.log");
+  const oldPath = process.env.PATH;
+  try {
+    await writeFile(path.join(workspace, "Scarb.toml"), "[package]\nname = \"audit_target\"\nversion = \"0.1.0\"\n");
+    await writeFile(path.join(workspace, ".tool-versions"), "scarb 2.12.0\n");
+    await writeFailingFakeTool(binDir, "scarb", logPath, "[0/6] [0s]\nfailed to install pinned tool");
+    process.env.PATH = `${binDir}${path.delimiter}${oldPath ?? ""}`;
+
+    const cfg = defaultConfig();
+    cfg.sandboxBackend = "host";
+    cfg.sandboxAllowHostFallback = true;
+    cfg.auditPrepareTimeoutMs = 10_000;
+    cfg.reproductionMaxLogBytes = 4000;
+    cfg.sourcePaths = [workspace];
+    const report = await prepareWorkspaceToolchain({
+      workspace: { absolute: workspace, relative: "workspace" },
+      cfg,
+      logger: logger(),
+      cacheDir,
+    });
+
+    assert.equal(report.ran, false);
+    assert.equal(report.toolVersionChecks[0]?.actual, undefined);
+    assert.equal(report.toolVersionChecks[0]?.reason, "version command exited 1");
   } finally {
     process.env.PATH = oldPath;
     await rm(workspace, { recursive: true, force: true });

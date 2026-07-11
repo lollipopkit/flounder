@@ -197,14 +197,16 @@ async function checkPinnedToolVersions(
       sandboxExecutionOptions(input.cfg, "none"),
     );
     const combined = `${run.stdout}\n${run.stderr}`.trim();
-    const actual = firstNonEmptyLine(combined);
+    const actual = firstVersionLine(combined);
     out.push({
       tool: spec.tool,
       command: spec.argv.join(" "),
       expected: spec.expected,
       ...(actual ? { actual } : {}),
       ok: run.exitCode === 0 && !run.timedOut && versionOutputMatches(combined, spec.expected),
-      ...(run.exitCode !== 0 || run.timedOut ? { reason: run.timedOut ? "version command timed out" : `version command exited ${run.exitCode}` } : {}),
+      ...(run.exitCode !== 0 || run.timedOut
+        ? { reason: run.timedOut ? "version command timed out" : `version command exited ${run.exitCode}` }
+        : (!actual ? { reason: "version command returned no parseable version" } : {})),
     });
   }
   return out;
@@ -233,8 +235,13 @@ function versionOutputMatches(output: string, expected: string): boolean {
   return new RegExp(`(^|[^0-9A-Za-z.])${escapeRegExp(expected)}([^0-9A-Za-z.]|$)`).test(output);
 }
 
-function firstNonEmptyLine(output: string): string | undefined {
-  return output.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+function firstVersionLine(output: string): string | undefined {
+  return output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => !/^\[[0-9]+\/[0-9]+\](?:\s+\[[^\]]+\])?/.test(line))
+    .find((line) => /\b\d+\.\d+(?:\.\d+)?\b/.test(line));
 }
 
 function prepareDiagnostic(stderr: string, stdout: string): string {
@@ -288,7 +295,7 @@ function focusPlansByPaths(plans: ToolchainPlan[], focusPaths?: string[]): Toolc
   const focusDirs = focused.map((plan) => normalizePlanDir(plan.cwd ?? ""));
   const dependencyPlans = plans.filter((plan) =>
     ["npm", "pnpm", "yarn"].includes(plan.toolchain)
-    && focusDirs.some((dir) => sameOrNestedPlan(plan.cwd, dir)),
+    && focusDirs.some((dir) => planCoversCommandCwd(plan.cwd, dir)),
   );
   return uniquePlans([...dependencyPlans, ...focused]);
 }
@@ -314,7 +321,7 @@ function focusPlans(plans: ToolchainPlan[], command?: ReproductionCommand): Tool
   const focusDirs = focused.map((plan) => normalizePlanDir(plan.cwd ?? ""));
   const dependencyPlans = plans.filter((plan) =>
     ["npm", "pnpm", "yarn"].includes(plan.toolchain)
-    && focusDirs.some((dir) => sameOrNestedPlan(plan.cwd, dir) || sameOrNestedPlan(dir, plan.cwd ?? "")),
+    && focusDirs.some((dir) => planCoversCommandCwd(plan.cwd, dir)),
   );
   focused = [...dependencyPlans, ...focused];
   return uniquePlans(focused);
@@ -411,10 +418,22 @@ async function detectToolchains(workspaceAbsolute: string): Promise<ToolchainPla
   const blueprintDir = shallowest((name) => isBlueprintManifest(name));
   if (blueprintDir !== undefined) plans.push({ toolchain: "blueprint", ...cwd(blueprintDir), commands: [["blueprint", "build", "--all"]] });
 
-  const foundryDir = shallowest((name) => name === "foundry.toml");
-  if (foundryDir !== undefined) plans.push({ toolchain: "forge", ...cwd(foundryDir), commands: [["forge", "build"]] });
+  // Independent Foundry packages commonly coexist under one audit build root.
+  // Keep every outermost project root so a scope-focused prepare can select the
+  // package it actually audits; nested vendored projects remain covered by their
+  // nearest parent and are not warmed independently.
+  for (const foundryDir of outermostManifestDirs(manifests, "foundry.toml")) {
+    plans.push({ toolchain: "forge", ...cwd(foundryDir), commands: [["forge", "build"]] });
+  }
 
   return plans;
+}
+
+function outermostManifestDirs(manifests: ManifestEntry[], name: string): string[] {
+  const dirs = [...new Set(manifests.filter((entry) => entry.name === name).map((entry) => normalizePlanDir(entry.dir)))];
+  return dirs
+    .filter((dir) => !dirs.some((candidate) => candidate !== dir && planCoversCommandCwd(candidate, dir)))
+    .sort((a, b) => a.localeCompare(b));
 }
 
 export async function detectPinnedToolVersions(workspaceAbsolute: string): Promise<PinnedToolVersion[]> {

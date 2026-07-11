@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import test from "node:test";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -420,6 +420,41 @@ test("store: duplicate tracking preserves the canonical finding link", async () 
   db.close();
 });
 
+test("store: startup repairs orphan duplicate labels and flattens legacy duplicate chains", async () => {
+  const { dbPath } = await tempDbPath();
+  const db = new MetadataStore(dbPath);
+  const projectId = db.upsertProject({ name: "legacy-duplicate-integrity" });
+  const runId = db.startRun({ projectId, kind: "run", runDir: "/runs/legacy-duplicate-integrity" });
+  db.upsertFindings(projectId, runId, [
+    { findingKey: "canonical", title: "Canonical issue", status: "confirmed-executable" },
+    { findingKey: "linked", title: "Linked duplicate", status: "confirmed-executable" },
+    { findingKey: "chained", title: "Chained duplicate", status: "confirmed-executable" },
+    { findingKey: "orphan", title: "Orphan duplicate", status: "confirmed-executable" },
+  ]);
+  const initial = db.listFindings(projectId);
+  const canonical = initial.find((finding) => finding.finding_key === "canonical");
+  const linked = initial.find((finding) => finding.finding_key === "linked");
+  const chained = initial.find((finding) => finding.finding_key === "chained");
+  const orphan = initial.find((finding) => finding.finding_key === "orphan");
+  assert.ok(canonical && linked && chained && orphan);
+  db.close();
+
+  const legacy = new DatabaseSync(dbPath);
+  legacy.prepare("UPDATE finding SET tracking_status = 'duplicate', duplicate_of_finding_id = ? WHERE id = ?").run(canonical.id, linked.id);
+  legacy.prepare("UPDATE finding SET tracking_status = 'duplicate', duplicate_of_finding_id = ? WHERE id = ?").run(linked.id, chained.id);
+  legacy.prepare("UPDATE finding SET tracking_status = 'duplicate', duplicate_of_finding_id = NULL WHERE id = ?").run(orphan.id);
+  legacy.close();
+
+  const repaired = new MetadataStore(dbPath);
+  assert.equal(repaired.getFinding(linked.id).duplicate_of_finding_id, canonical.id);
+  assert.equal(repaired.getFinding(chained.id).duplicate_of_finding_id, canonical.id);
+  assert.equal(repaired.getFinding(orphan.id).tracking_status, null);
+  assert.equal(repaired.getFinding(orphan.id).duplicate_of_finding_id, null);
+  assert.equal(repaired.setFindingTracking(orphan.id, "duplicate"), false, "new orphan duplicate labels are rejected");
+  assert.equal(repaired.setFindingTracking(orphan.id, "duplicate", linked.id), false, "new duplicate chains are rejected");
+  repaired.close();
+});
+
 test("record: verify REFUTED verdicts become structured refuted rows", () => {
   const base = {
     id: "f1",
@@ -648,14 +683,19 @@ test("store: daemon tokens + job queue prioritizes project work and stays FIFO w
   assert.equal(claim1.id, j1); // FIFO
   assert.deepEqual(claim1.spec, { verb: "run" });
   assert.equal(db.getJob(j1).status, "dispatched");
+  assert.equal(db.claimJob(daemonId).id, evaluationJob, "other projects can use spare daemon capacity while proj is active");
+  assert.equal(db.claimJob(daemonId), undefined, "a second job for the active project stays queued");
+  assert.equal(db.claimJob(otherDaemonId), undefined, "same-project serialization applies across daemons");
+  db.setJobStatus(j1, "done");
   assert.equal(db.claimJob(daemonId).id, j2);
-  assert.equal(db.claimJob(daemonId).id, evaluationJob); // background work resumes after project FIFO drains
+  assert.equal(db.claimJob(otherDaemonId), undefined, "the pinned same-project job waits for j2 to settle");
+  db.setJobStatus(j2, "done");
+  assert.equal(db.claimJob(otherDaemonId).id, pinned); // pinned work waits for its selected daemon and prior project work
   assert.equal(db.claimJob(daemonId), undefined); // queue drained
-  assert.equal(db.claimJob(otherDaemonId).id, pinned); // pinned work waits for its selected daemon
 
-  db.requestJobCancel(j1);
-  assert.deepEqual(db.canceledJobIds(), [j1]); // a daemon polls this to abort
-  db.setJobStatus(j1, "killed");
+  db.requestJobCancel(evaluationJob);
+  assert.deepEqual(db.canceledJobIds(), [evaluationJob]); // a daemon polls this to abort
+  db.setJobStatus(evaluationJob, "killed");
   assert.deepEqual(db.canceledJobIds(), []); // no longer running → not reported
   assert.equal(db.cancelJob(pinned), true); // queued/dispatched/running jobs are operator-cancelable
   assert.equal(db.getJob(pinned).status, "canceled");
@@ -984,6 +1024,42 @@ test("store: exact findings across runs keep one canonical row with occurrence a
   db.close();
 });
 
+test("store: repeated weaker rediscovery cannot take ownership and downgrade stronger evidence", async () => {
+  const db = await tempDb();
+  const projectId = db.upsertProject({ name: "canonical-evidence-owner" });
+  const firstRun = db.startRun({ projectId, kind: "run", runDir: "/runs/evidence-1", materialFingerprint: "sha256:same" });
+  db.upsertFindings(projectId, firstRun, [{ findingKey: "kfirst", title: "Quote leg ignores its risk class", location: "src/Provider.sol:41", severity: "high", status: "suspected" }]);
+  const verifyRun = db.startRun({ projectId, kind: "verify", runDir: "/runs/evidence-verify", materialFingerprint: "sha256:same" });
+  db.upsertFindings(projectId, verifyRun, [{
+    findingKey: "kverified",
+    title: "Quote leg ignores its risk class",
+    location: "src/Provider.sol:41",
+    severity: "high",
+    status: "confirmed-differential",
+    refutationStatus: "passed",
+    refutationReason: "The execution-backed claim survived independent review.",
+  }]);
+
+  const laterRun = db.startRun({ projectId, kind: "audit", runDir: "/runs/evidence-later", materialFingerprint: "sha256:same" });
+  const rediscovery = {
+    findingKey: "kverified",
+    title: "DISCHARGE OVERTURNED: Quote leg ignores its risk class",
+    location: "src/Provider.sol:41",
+    severity: "critical",
+    status: "suspected",
+  };
+  db.upsertFindings(projectId, laterRun, [rediscovery], "discharge-challenge");
+  db.upsertFindings(projectId, laterRun, [rediscovery], "run finalize");
+
+  const [finding] = db.listFindings(projectId);
+  assert.equal(finding.status, "confirmed-differential");
+  assert.equal(finding.run_id, verifyRun, "weaker evidence cannot take canonical ownership");
+  assert.equal(finding.title, "Quote leg ignores its risk class");
+  assert.equal(finding.refutation_status, "passed");
+  assert.equal(db.findingOccurrences(Number(finding.id)).length, 3, "weaker rediscovery remains durable provenance without duplicating checkpoints");
+  db.close();
+});
+
 test("store: completed finding identity migrations do not rewrite alias provenance on restart", async () => {
   const { dbPath } = await tempDbPath();
   const db = new MetadataStore(dbPath);
@@ -1002,6 +1078,46 @@ test("store: completed finding identity migrations do not rewrite alias provenan
   const alias = after.prepare("SELECT updated_at FROM finding_key_alias WHERE alias_key = 'stable-key'").get();
   after.close();
   assert.equal(alias.updated_at, "provenance-sentinel");
+});
+
+test("store: startup canonicalizes legacy confirm members through finding-key aliases", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "flounder-store-confirm-alias-"));
+  try {
+    let store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "confirm-member-alias" });
+    const auditRun = store.startRun({ projectId, kind: "audit", runDir: path.join(dir, "audit") });
+    store.upsertFindings(projectId, auditRun, [{
+      findingKey: "kcanonicalmember",
+      title: "Canonical member candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-executable",
+    }]);
+    const finding = store.queryFindings(projectId, { search: "Canonical member candidate" })[0];
+    const confirmRun = store.startRun({ projectId, kind: "confirm", runDir: path.join(dir, "confirm") });
+    store.upsertConfirmDecisions(projectId, confirmRun, [{
+      bug: "Canonical member candidate",
+      reproduced: "unknown",
+      recommendation: "needs-human",
+      members: ["klegacymember"],
+    }]);
+    store.upsertFindings(projectId, auditRun, [{
+      findingKey: "klegacymember",
+      originId: Number(finding.id),
+      title: "Canonical member candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-executable",
+    }]);
+    assert.deepEqual(JSON.parse(store.listConfirmDecisions(projectId)[0].members_json), ["klegacymember"]);
+    store.close();
+
+    store = MetadataStore.openForOutput(dir);
+    assert.deepEqual(JSON.parse(store.listConfirmDecisions(projectId)[0].members_json), ["kcanonicalmember"]);
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("store: blocked finding phases are idempotent until inputs change or an operator requests retry", async () => {
@@ -1023,5 +1139,89 @@ test("store: blocked finding phases are idempotent until inputs change or an ope
   db.recordFindingPhaseAttempt(projectId, retryRun, { subjectType: "finding", subjectId: Number(finding.id), phase: "verify", inputFingerprint: "sha256:input-a", state: "settled", outcome: "refuted" });
   const attempts = db.listFindingPhaseAttempts("finding", Number(finding.id));
   assert.deepEqual(attempts.map((attempt) => [attempt.attempt_number, attempt.state]), [[1, "blocked"], [2, "settled"]]);
+  db.close();
+});
+
+test("store: remote verify ownership survives later pipeline phases and artifact replay is idempotent", async () => {
+  const db = await tempDb();
+  const daemon = db.createDaemonToken("artifact-owner");
+  const projectId = db.upsertProject({ name: "artifact-replay" });
+  const jobId = db.enqueueJob("artifact-replay", { verb: "run", pipeline: true }, daemon.id);
+  assert.equal(db.claimJob(daemon.id).id, jobId);
+
+  const sourceRun = db.startRun({ projectId, kind: "run", runDir: "/runs/source", daemonId: daemon.id });
+  db.upsertFindings(projectId, sourceRun, [{
+    findingKey: "artifact-candidate",
+    title: "Artifact replay candidate",
+    location: "src/example.ts:1",
+    severity: "high",
+    status: "confirmed-executable",
+    reportPath: "/runs/source/report_f1.md",
+    reportMarkdown: "# stale report\n",
+  }]);
+  const finding = db.queryFindings(projectId, { search: "Artifact replay candidate" })[0];
+
+  const verifyRun = db.startRun({ projectId, kind: "audit", runDir: "/runs/verify", budgets: { verify: true }, daemonId: daemon.id });
+  db.setJobRun(jobId, verifyRun);
+  db.recordFindingPhaseAttempt(projectId, verifyRun, {
+    subjectType: "finding",
+    subjectId: Number(finding.id),
+    phase: "verify",
+    inputFingerprint: "sha256:artifact-replay",
+    state: "blocked",
+    blocker: "remote verdict was not ingested",
+    metrics: { findings: 1, steps: 3 },
+  });
+  db.finishRun(verifyRun, "error");
+
+  const reportRun = db.startRun({ projectId, kind: "report", runDir: "/runs/report", daemonId: daemon.id });
+  db.setJobRun(jobId, reportRun);
+  assert.equal(db.getJob(jobId).run_id, reportRun, "job.run_id remains the mutable active-phase pointer");
+  assert.equal(db.getRun(verifyRun).daemon_id, daemon.id, "the terminal verify keeps immutable executor ownership");
+
+  const work = db.listDaemonArtifactReconciliationRuns(daemon.id, 1);
+  assert.deepEqual(work.map((run) => run.id), [verifyRun]);
+  assert.equal(db.reconcileTerminalVerifyArtifacts(verifyRun, [{
+    originId: Number(finding.id),
+    title: "REFUTED: Artifact replay candidate",
+    location: "src/example.ts:1",
+    severity: "info",
+    confirmationStatus: "confirmed-executable",
+    evidence: "The executable check disproved the claim.",
+  }], 1), true);
+
+  const refuted = db.getFinding(Number(finding.id));
+  assert.equal(refuted.status, "refuted");
+  assert.equal(refuted.run_id, verifyRun);
+  assert.equal(refuted.report_path, null);
+  assert.equal(refuted.report_markdown, null);
+  const attempt = db.latestFindingPhaseAttempt("finding", Number(finding.id), "verify");
+  assert.equal(attempt.outcome, "refuted");
+  assert.equal(attempt.metrics_json, JSON.stringify({ findings: 1, steps: 3 }));
+  assert.equal(db.listDaemonArtifactReconciliationRuns(daemon.id, 1).length, 0);
+
+  const updatedAt = refuted.updated_at;
+  assert.equal(db.reconcileTerminalVerifyArtifacts(verifyRun, [], 1), true);
+  assert.equal(db.getFinding(Number(finding.id)).updated_at, updatedAt, "a versioned replay is a true no-op");
+  assert.equal(db.getJob(jobId).run_id, reportRun, "replay never rewrites the active job phase");
+  db.close();
+});
+
+test("store: legacy daemon ownership backfill uses only the run still linked by its job", async () => {
+  const { dbPath } = await tempDbPath();
+  let db = new MetadataStore(dbPath);
+  const daemon = db.createDaemonToken("legacy-owner");
+  const projectId = db.upsertProject({ name: "legacy-run-owner" });
+  const jobId = db.enqueueJob("legacy-run-owner", { verb: "run", pipeline: true }, daemon.id);
+  assert.equal(db.claimJob(daemon.id).id, jobId);
+  const olderPhase = db.startRun({ projectId, kind: "audit", runDir: "/runs/legacy-verify", budgets: { verify: true } });
+  db.setJobRun(jobId, olderPhase);
+  const currentPhase = db.startRun({ projectId, kind: "report", runDir: "/runs/legacy-report" });
+  db.setJobRun(jobId, currentPhase);
+  db.close();
+
+  db = new MetadataStore(dbPath);
+  assert.equal(db.getRun(olderPhase).daemon_id, null, "overwritten legacy phases are not attributed by unsafe inference");
+  assert.equal(db.getRun(currentPhase).daemon_id, daemon.id, "the exact current job link is safe to backfill");
   db.close();
 });

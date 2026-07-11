@@ -103,6 +103,7 @@ test("api: GET /api is a self-describing catalog of every resource + operation",
     const findingTracking = cat.endpoints.find((e) => e.method === "PATCH" && e.path === "/api/findings/:id/tracking");
     assert.match(findingTracking.body.status, /ignored/);
     assert.match(findingTracking.body.duplicateOfFindingId, /canonical finding id/);
+    assert.match(findingTracking.body.duplicateOfFindingId, /required/);
     const runLog = cat.endpoints.find((e) => e.method === "GET" && e.path === "/api/runs/:id/log");
     assert.match(runLog.query.tail, /JSON/);
     const runPatch = cat.endpoints.find((e) => e.method === "PATCH" && e.path === "/api/runs/:id");
@@ -1272,6 +1273,13 @@ test("api: verify launch links project finding rows back to the original finding
     assert.equal(idSpec.verifyFindings[0].originId, finding.id);
     assert.equal(idSpec.verifyFindings[0].title, "Proof input is not bound");
     assert.equal(idSpec.verifyFindings[0].location, "src/Rollup.sol:44");
+
+    const invalidOrigin = await post(`/api/projects/${created.uuid}/runs`, {
+      verb: "audit",
+      verifyFindings: [{ originId: String(finding.id), title: finding.title, location: finding.location }],
+    });
+    assert.equal(invalidOrigin.status, 400);
+    assert.match((await json(invalidOrigin)).error, /positive integer/);
   });
 });
 
@@ -1901,7 +1909,27 @@ test("api: report launch queues only reproduced real-target findings that were n
           severity: "high",
           status: "confirmed-executable",
         },
+        {
+          findingKey: "kconflict",
+          title: "Evidence-conflicted bug",
+          location: "src/Target.sol:78",
+          severity: "high",
+          status: "confirmed-executable",
+          refutationStatus: "conflict",
+          refutationReason: "Local verification conflicts with the real-target reproduction.",
+        },
       ]);
+      const conflictFinding = store.queryFindings(created.id, { search: "Evidence-conflicted bug" })[0];
+      store.upsertFindings(created.id, auditRun, [{
+        findingKey: "kconflictlegacy",
+        originId: Number(conflictFinding.id),
+        title: "Evidence-conflicted bug",
+        location: "src/Target.sol:78",
+        severity: "high",
+        status: "confirmed-executable",
+        refutationStatus: "conflict",
+        refutationReason: "Local verification conflicts with the real-target reproduction.",
+      }]);
       const confirmRun = store.startRun({ projectId: created.id, kind: "confirm", runDir: path.join(out, "report-launch-confirm") });
       store.upsertConfirmDecisions(created.id, confirmRun, [
         {
@@ -1942,6 +1970,14 @@ test("api: report launch queues only reproduced real-target findings that were n
           recommendation: "drop",
           members: ["knotreproduced"],
         },
+        {
+          bug: "Evidence-conflicted bug",
+          reproduced: "yes",
+          recommendation: "submit-candidate",
+          members: ["kconflictlegacy"],
+          reproEvidence: "purpose=confirm command cmd-conflict reproduced the real target effect",
+          reproCommandId: "cmd-conflict",
+        },
       ]);
     } finally {
       store.close();
@@ -1952,16 +1988,22 @@ test("api: report launch queues only reproduced real-target findings that were n
     const dropped = detail.allFindings.find((finding) => finding.finding_key === "kdrop");
     const existing = detail.allFindings.find((finding) => finding.finding_key === "kexisting");
     const needs = detail.allFindings.find((finding) => finding.finding_key === "kneeds");
+    const conflicted = detail.allFindings.find((finding) => finding.finding_key === "kconflict");
     const readyDecision = detail.confirmDecisions.find((decision) => decision.bug === "Ready bug");
     const existingDecision = detail.confirmDecisions.find((decision) => decision.bug === "Existing report bug");
+    const conflictDecision = detail.confirmDecisions.find((decision) => decision.bug === "Evidence-conflicted bug");
     assert.ok(ready);
     assert.ok(dropped);
     assert.ok(existing);
     assert.ok(needs);
+    assert.ok(conflicted);
     assert.ok(readyDecision);
     assert.ok(existingDecision);
+    assert.ok(conflictDecision);
+    assert.deepEqual(JSON.parse(conflictDecision.members_json), ["kconflict"], "decision members are canonicalized from historical aliases");
     assert.equal(existing.has_report, false);
     assert.equal(existingDecision.has_report, true);
+    assert.equal(conflicted.refutation_status, "conflict");
     const generatedDecisionReport = await json(await fetch(base + `/api/confirm-decisions/${readyDecision.id}/report`));
     assert.equal(generatedDecisionReport.source, "generated");
     assert.match(generatedDecisionReport.markdown, /^# Ready bug/);
@@ -2012,6 +2054,41 @@ test("api: report launch queues only reproduced real-target findings that were n
     const gateBlocked = await post(`/api/projects/${created.uuid}/runs`, { verb: "report", findingIds: [needs.id] });
     assert.equal(gateBlocked.status, 400);
     assert.match((await gateBlocked.json()).error, /submission-ready/);
+    const conflictBlocked = await post(`/api/projects/${created.uuid}/runs`, { verb: "report", findingIds: [conflicted.id] });
+    assert.equal(conflictBlocked.status, 400);
+    assert.match((await conflictBlocked.json()).error, /unresolved local\/real-target evidence conflict/);
+
+    const resolutionStore = MetadataStore.openForOutput(out);
+    try {
+      const verifyRetry = resolutionStore.startRun({ projectId: created.id, kind: "audit", runDir: path.join(out, "report-launch-conflict-retry"), budgets: { verify: true } });
+      resolutionStore.recordFindingPhaseAttempt(created.id, verifyRetry, {
+        subjectType: "finding",
+        subjectId: Number(conflicted.id),
+        phase: "verify",
+        inputFingerprint: "sha256:conflict-retry",
+        state: "running",
+      });
+      resolutionStore.upsertFindings(created.id, verifyRetry, [{
+        findingKey: "kconflict-reverified",
+        originId: Number(conflicted.id),
+        title: "Evidence-conflicted bug",
+        location: "src/Target.sol:78",
+        severity: "high",
+        status: "confirmed-executable",
+        phaseAttempt: {
+          subjectType: "finding",
+          subjectId: Number(conflicted.id),
+          inputFingerprint: "sha256:conflict-retry",
+        },
+      }]);
+      resolutionStore.finishRun(verifyRetry, "done");
+      assert.equal(resolutionStore.getFinding(Number(conflicted.id)).refutation_status, null);
+    } finally {
+      resolutionStore.close();
+    }
+    const conflictRecovered = await post(`/api/projects/${created.uuid}/runs`, { verb: "report", findingIds: [conflicted.id] });
+    assert.equal(conflictRecovered.status, 200);
+    assert.ok((await conflictRecovered.json()).jobId);
   });
 });
 
@@ -2064,7 +2141,29 @@ test("api: report launch accepts source-only execution-confirmed findings withou
           severity: "medium",
           status: "suspected",
         },
+        {
+          findingKey: "kreviewrefuted",
+          title: "Source-only independently refuted bug",
+          location: "src/Target.rs:56",
+          severity: "medium",
+          status: "confirmed-differential",
+          refutationStatus: "refuted",
+          refutationReason: "The execution passed, but the claimed invariant does not hold.",
+        },
+        {
+          findingKey: "kduplicate",
+          title: "Source-only duplicate bug",
+          location: "src/Target.rs:78",
+          severity: "medium",
+          status: "confirmed-executable",
+        },
       ]);
+      const rows = store.queryFindings(created.id);
+      const canonical = rows.find((finding) => finding.finding_key === "ksource");
+      const duplicate = rows.find((finding) => finding.finding_key === "kduplicate");
+      assert.ok(canonical);
+      assert.ok(duplicate);
+      store.setFindingTracking(Number(duplicate.id), "duplicate", Number(canonical.id));
     } finally {
       store.close();
     }
@@ -2073,8 +2172,12 @@ test("api: report launch accepts source-only execution-confirmed findings withou
     assert.equal(detail.prepareSummary.realTarget.requiresConfirmation, false);
     const ready = detail.allFindings.find((finding) => finding.finding_key === "ksource");
     const suspected = detail.allFindings.find((finding) => finding.finding_key === "ksuspected");
+    const reviewRefuted = detail.allFindings.find((finding) => finding.finding_key === "kreviewrefuted");
+    const duplicate = detail.allFindings.find((finding) => finding.finding_key === "kduplicate");
     assert.ok(ready);
     assert.ok(suspected);
+    assert.ok(reviewRefuted);
+    assert.ok(duplicate);
 
     const launched = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "report", findingIds: [ready.id] }));
     const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
@@ -2095,6 +2198,14 @@ test("api: report launch accepts source-only execution-confirmed findings withou
     const rejected = await post(`/api/projects/${created.uuid}/runs`, { verb: "report", findingIds: [suspected.id] });
     assert.equal(rejected.status, 400);
     assert.match((await rejected.json()).error, /not locally execution-confirmed/);
+
+    const reviewRejected = await post(`/api/projects/${created.uuid}/runs`, { verb: "report", findingIds: [reviewRefuted.id] });
+    assert.equal(reviewRejected.status, 400);
+    assert.match((await reviewRejected.json()).error, /independent review/);
+
+    const duplicateRejected = await post(`/api/projects/${created.uuid}/runs`, { verb: "report", findingIds: [duplicate.id] });
+    assert.equal(duplicateRejected.status, 400);
+    assert.match((await duplicateRejected.json()).error, /canonical finding/);
   });
 });
 
@@ -3744,6 +3855,7 @@ test("api: info-only audit ledgers are hidden from actionable findings", async (
       const runId = store.startRun({ projectId: created.id, kind: "run", runDir });
       store.upsertFindings(created.id, runId, [
         { findingKey: "ledger", title: "Obligation ledger: safe", location: "src/A.sol:1", severity: "info", status: "suspected" },
+        { findingKey: "refuted", title: "Checked claim is false", location: "src/A.sol:2", severity: "info", status: "refuted" },
         { findingKey: "bug", title: "Unbound value", location: "src/B.sol:2", severity: "high", status: "suspected", evidence: "full proof detail kept for the project findings endpoint" },
       ]);
     } finally {
@@ -3752,20 +3864,23 @@ test("api: info-only audit ledgers are hidden from actionable findings", async (
 
     const projectPath = "/api/projects/" + created.uuid;
     const detail = await json(await fetch(base + projectPath));
-    assert.equal(detail.findingsTotal, 1);
-    assert.deepEqual(detail.statusCounts, { suspected: 1 });
+    assert.equal(detail.findingsTotal, 2);
+    assert.deepEqual(detail.statusCounts, { refuted: 1, suspected: 1 });
     assert.equal(detail.auditConfirmedFindings, 0);
     assert.equal(detail.reproducedBugs, 0);
-    assert.deepEqual(detail.allFindings.map((finding) => finding.finding_key), ["bug"]);
+    assert.deepEqual(detail.allFindings.map((finding) => finding.finding_key), ["bug", "refuted"]);
     assert.equal("evidence" in detail.allFindings[0], false, "project overview should use lightweight finding summaries");
 
     const findings = await json(await fetch(base + projectPath + "/findings"));
-    assert.equal(findings.total, 1);
+    assert.equal(findings.total, 2);
     assert.equal(findings.findings[0].finding_key, "bug");
     assert.equal(findings.findings[0].evidence, "full proof detail kept for the project findings endpoint");
+    assert.equal(findings.findings[1].finding_key, "refuted");
+    assert.equal(findings.findings[1].status, "refuted");
 
     const bugs = await json(await fetch(base + "/api/bugs"));
-    assert.equal(bugs.findings.length, 1);
+    assert.equal(bugs.findings.length, 2);
+    assert.deepEqual(bugs.findings.map((finding) => finding.finding_key), ["bug", "refuted"]);
     assert.equal("evidence" in bugs.findings[0], false, "global findings list should use lightweight finding summaries");
   });
 });
@@ -3796,7 +3911,7 @@ test("api: project findings endpoint paginates detailed rows", async () => {
     assert.equal(page.findings.length, 2);
     assert.deepEqual(page.findings.map((finding) => finding.title), ["B", "A"]);
     assert.ok(page.findings.every((finding) => typeof finding.evidence === "string"));
-    assert.equal(page.findings[0].has_report, true);
+    assert.equal(page.findings[0].has_report, false, "suspected findings cannot retain disclosure reports");
     assert.equal("report_path" in page.findings[0], false);
     assert.equal("report_markdown" in page.findings[0], false);
   });
@@ -3915,12 +4030,45 @@ test("api: duplicate tracking can link to a canonical finding in the same projec
     assert.ok(canonical);
     assert.ok(variant);
 
+    const missingCanonicalResponse = await patch(`/api/findings/${variant.id}/tracking`, { status: "duplicate" });
+    assert.equal(missingCanonicalResponse.status, 400);
+    assert.match((await missingCanonicalResponse.json()).error, /required/);
+
     const linkedResponse = await patch(`/api/findings/${variant.id}/tracking`, { status: "duplicate", duplicateOfFindingId: canonical.id });
     assert.equal(linkedResponse.status, 200);
     const duplicates = await json(await fetch(base + `/api/projects/${created.uuid}/findings?tracking=duplicate`));
     assert.equal(duplicates.total, 1);
     assert.equal(duplicates.findings[0].finding_key, "variant");
     assert.equal(duplicates.findings[0].duplicate_of_finding_id, canonical.id);
+
+    const verifyDuplicate = await json(await post(`/api/projects/${created.uuid}/runs`, {
+      verb: "audit",
+      verifyFindings: [{ id: variant.id }],
+    }));
+    const verifyDuplicateJob = (await json(await fetch(base + `/api/jobs/${verifyDuplicate.jobId}`))).job;
+    const verifyDuplicateSpec = JSON.parse(verifyDuplicateJob.spec_json);
+    assert.equal(verifyDuplicateSpec.verifyFindings[0].id, variant.id, "the concrete variant remains the model-visible claim");
+    assert.equal(verifyDuplicateSpec.verifyFindings[0].originId, canonical.id, "the verdict settles on the canonical finding");
+
+    const secondRunId = (() => {
+      const db = MetadataStore.openForOutput(out);
+      try {
+        const runId = db.startRun({ projectId: created.id, kind: "audit", runDir: path.join(out, "duplicate-finding-links-second-run") });
+        db.upsertFindings(created.id, runId, [
+          { findingKey: "second-variant", title: "Second variant helper reentry", location: "src/Router.sol:3", severity: "medium", status: "confirmed-executable" },
+        ]);
+        return runId;
+      } finally {
+        db.close();
+      }
+    })();
+    assert.ok(secondRunId > 0);
+    const refreshed = await json(await fetch(base + `/api/projects/${created.uuid}/findings`));
+    const secondVariant = refreshed.findings.find((finding) => finding.finding_key === "second-variant");
+    assert.ok(secondVariant);
+    const chainedResponse = await patch(`/api/findings/${secondVariant.id}/tracking`, { status: "duplicate", duplicateOfFindingId: variant.id });
+    assert.equal(chainedResponse.status, 400);
+    assert.match((await chainedResponse.json()).error, /itself a duplicate/);
 
     const selfResponse = await patch(`/api/findings/${variant.id}/tracking`, { status: "duplicate", duplicateOfFindingId: variant.id });
     assert.equal(selfResponse.status, 400);

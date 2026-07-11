@@ -13,17 +13,18 @@ import type { AuditSummary, ConfirmationStatus, Doc, LlmClient, RankedFinding, S
 import { publicPath } from "../util/paths.js";
 import { materialFingerprint, phaseInputFingerprint } from "../util/material-fingerprint.js";
 import { canonicalFindingKey } from "../util/finding-identity.js";
+import { positiveIntegerId } from "../util/ids.js";
 import { listWorkspaceFiles, normalizeRelativePath, prepareSandboxWorkspace, writeSandboxFiles, type SandboxWorkspace } from "../security/sandbox.js";
 import { runDifferentialConfirmation, type DifferentialResult } from "./differential.js";
 import { runDischargeChallenge, runRefutation, type RefutationError, type RefutationVerdict } from "./refutation.js";
 import { runAuditLoop } from "./loop.js";
 import { ProjectMemory } from "./memory.js";
 import { loadScopeInventory, mergeScopeInventory, saveScopeInventory, scopeProgress } from "./scope-store.js";
-import { RunRecorder, toDiscoveryBacklogRows, type RunTrackerFactory } from "../db/record.js";
+import { RunRecorder, toDiscoveryBacklogRows, toFindingStatus, type RunTrackerFactory } from "../db/record.js";
 import type { RunKind } from "../db/store.js";
 import { isPiSessionProvider, runAuditSession, SessionLlmClient } from "./pi-session.js";
 import type { TranscriptStep } from "./prompts.js";
-import { buildTools, clearScratchFindings, dedupeFindings, ingestFindingsFromScratch, newSession, readScratchScopes, type AgentFinding, type AgentSession, type AuditScope, type ToolContext } from "./tools.js";
+import { buildTools, clearScratchFindings, dedupeFindings, ingestFindingsFromScratch, isRefutedFindingTitle, newSession, readScratchScopes, type AgentFinding, type AgentSession, type AuditScope, type ToolContext } from "./tools.js";
 import {
   COVERAGE_GAPS_FILE,
   FOLLOWUP_SCOPES_FILE,
@@ -276,8 +277,9 @@ export async function runAudit(
     // the same confirmation gate. Each claim gets its own workspace/session so one
     // candidate's generated PoC files cannot influence the next candidate's verdict.
     // This is exactly the confirmation tail of a dig, runnable standalone on a prior finding.
-    const toVerify = await loadFindingsToVerify(cfg.auditVerify);
-    await logger.event("audit_verify_start", { findings: toVerify.length });
+    const verifyInput = await loadFindingsToVerify(cfg.auditVerify);
+    const toVerify = dedupeVerifyInputs(verifyInput);
+    await logger.event("audit_verify_start", { findings: toVerify.length, inputFindings: verifyInput.length });
     const verifyCfg = withRole(cfg, "dig");
     const aggregated: AgentFinding[] = [];
     const aggregatedSteps: TranscriptStep[] = [];
@@ -292,7 +294,7 @@ export async function runAudit(
     }> => {
       const verifyLabel = `verify-${idx + 1}`;
       const claimLabel = String(finding.title ?? "").slice(0, 90);
-      const originId = typeof finding.originId === "number" ? finding.originId : typeof finding.origin_id === "number" ? finding.origin_id : undefined;
+      const originId = verifyOriginId(finding);
       const inheritedScopeId = typeof finding.scopeId === "string" ? finding.scopeId : typeof finding.scope_id === "string" ? finding.scope_id : undefined;
       const suppliedAttempt = (finding.phaseAttempt ?? finding._phaseAttempt) as Record<string, unknown> | undefined;
       const attempt = originId !== undefined
@@ -311,10 +313,21 @@ export async function runAudit(
       verifySession.baselineFiles = await listWorkspaceFiles(verifyWorkspace.absolute);
       if (session.buildCacheDir) verifySession.buildCacheDir = session.buildCacheDir;
       await copyCorpusIntoWorkspace(verifyWorkspace, corpus);
-      const verifyCtx: ToolContext = { cfg: verifyCfg, source, corpus, memory, logger, session: verifySession };
+      const verifyCtx: ToolContext = { cfg: verifyCfg, source, corpus, memory, logger, session: verifySession, activityStreamId: verifyLabel };
       clearScratchFindings(verifySession);
-      const phase = await runPhase(verifyCfg, { mode: "verify", verifySeed: buildVerifySeed(finding), maxSteps: cfg.auditDigSteps }, { ctx: verifyCtx, cwd: verifyWorkspace.absolute });
+      const phase = await runPhase(verifyCfg, { mode: "verify", verifySeed: buildVerifySeed(finding), maxSteps: cfg.auditDigSteps }, { ctx: verifyCtx, cwd: verifyWorkspace.absolute, activityStreamId: verifyLabel });
       ingestFindingsFromScratch(verifySession);
+      const normalizedVerdicts = normalizeVerifyVerdicts(verifySession.findings);
+      verifySession.findings = normalizedVerdicts.findings;
+      if (normalizedVerdicts.conflict) {
+        if (!phaseFailureReason) phaseFailureReason = "error";
+        await logger.event("audit_verify_conflicting_verdicts", {
+          index: idx + 1,
+          of: toVerify.length,
+          claim: claimLabel,
+          rawVerdicts: normalizedVerdicts.inputCount,
+        });
+      }
       if (verifySession.resourceRequests?.length) {
         session.resourceRequests = mergeResourceRequests(session.resourceRequests ?? [], verifySession.resourceRequests.map((request) => ({
           ...request,
@@ -338,7 +351,9 @@ export async function runAudit(
           phase: "verify",
           state: "blocked",
           outcome: "no-verdict",
-          blocker: verifySession.resourceRequests?.[0]?.reason || `verify ended ${phase.stoppedReason} without a verdict`,
+          blocker: normalizedVerdicts.conflict
+            ? "verify produced contradictory verdicts for the same claim"
+            : verifySession.resourceRequests?.[0]?.reason || `verify ended ${phase.stoppedReason} without a verdict`,
           metrics: { steps: phase.steps.length, commandRuns: verifySession.commandRuns.length },
         });
       }
@@ -364,7 +379,7 @@ export async function runAudit(
       recorder.findings(verifySession.findings, logger.runDir, `verify ${idx + 1}/${toVerify.length}`); // persist this verdict live (flips the original when originId is set)
       if (!missingVerdict) {
         verifyDone += 1;
-        if (attempt) recorder.phaseAttempt?.({ ...attempt, phase: "verify", state: "settled", outcome: primaryVerdict?.confirmationStatus ?? "verdict", metrics: { findings: verifySession.findings.length, steps: phase.steps.length } });
+        if (attempt) recorder.phaseAttempt?.({ ...attempt, phase: "verify", state: "settled", outcome: primaryVerdict ? toFindingStatus(primaryVerdict) : "verdict", metrics: { findings: verifySession.findings.length, steps: phase.steps.length } });
       }
       recorder.runScopes(verifyDone, toVerify.length); // verdict count, independent of completion order
       await logger.event("audit_verify_done", { index: idx + 1, of: toVerify.length, claim: claimLabel, produced: verifySession.findings.length, stoppedReason: phase.stoppedReason });
@@ -418,7 +433,7 @@ export async function runAudit(
     }
     stampScopeInventory(scopeInventory, cfg.materialFingerprint);
     for (const scope of scopeInventory) if (!scope.status) scope.status = "pending";
-    await saveScopeInventory(inventoryDir, scopeInventory);
+    await saveScopeInventory(inventoryDir, scopeInventory, { replace: !cfg.auditAppendMap });
     await logger.artifact("audit_scopes.json", scopeInventory);
     await logger.event("audit_scope_progress", { ...scopeProgress(scopeInventory), resumed: false });
     recorder.scopes(scopeInventory);
@@ -443,6 +458,20 @@ export async function runAudit(
     const appendExisting = cfg.auditAppendMap ? scopeInventory : [];
     const appendSeedScopes = cfg.auditAppendMap ? await loadAppendMapSeedScopes(cfg) : [];
     const resuming = scopeInventory.length > 0 && !cfg.auditAppendMap;
+    // Backfill inventories written by older releases that marked every finished
+    // DIG attempt audited even when its latest outcome explicitly left coverage
+    // incomplete. Requeue generally from durable evidence, never a local id list.
+    const latestOutcomesByScope = new Map(latestScopeOutcomes(scopeOutcomes).map((outcome) => [outcome.scopeId, outcome]));
+    const requeuedIncompleteScopes: string[] = [];
+    for (const scope of scopeInventory) {
+      const outcome = latestOutcomesByScope.get(scope.id);
+      if (scope.status !== "audited" || !outcome || !scopeOutcomeNeedsCoverage(outcome)) continue;
+      scope.status = "pending";
+      requeuedIncompleteScopes.push(scope.id);
+    }
+    if (requeuedIncompleteScopes.length > 0) {
+      await logger.event("audit_scope_coverage_requeued", { scopes: requeuedIncompleteScopes });
+    }
     if (!resuming && !cfg.auditAppendMap) {
       await clearCurrentMaterialScopeOutcomes(inventoryDir, cfg.materialFingerprint);
       scopeOutcomes = [];
@@ -472,7 +501,10 @@ export async function runAudit(
     // Persist the inventory BEFORE digging so a kill mid-run does not lose the map —
     // resume then skips MAP. Each dig below also checkpoints scope status + partial
     // findings, so a killed run only redoes the one in-flight dig.
-    await saveScopeInventory(inventoryDir, scopeInventory);
+    await saveScopeInventory(inventoryDir, scopeInventory, {
+      replace: !resuming && !cfg.auditAppendMap,
+      ...(requeuedIncompleteScopes.length > 0 ? { forceStatusIds: requeuedIncompleteScopes } : {}),
+    });
     recorder.scopes(scopeInventory);
 
     const digCfg = withRole(cfg, "dig");
@@ -515,7 +547,7 @@ export async function runAudit(
     // killed run keeps the completed digs' findings (raw confirmed-executable; the
     // end-of-run write replaces them with the differential/refutation-processed set).
     const checkpointFindings = async (): Promise<void> => {
-      const confirmedSoFar = aggregated.filter((finding) => isConfirmed(finding.confirmationStatus)).map((finding, idx) => ({ ...finding, id: `f${idx + 1}` }));
+      const confirmedSoFar = aggregated.filter(isExecutionConfirmedFinding).map((finding, idx) => ({ ...finding, id: `f${idx + 1}` }));
       await logger.artifact("audit_findings.json", confirmedSoFar);
       recorder.findings(aggregated, logger.runDir, "dig checkpoint"); // persist live so the UI shows findings as each scope lands (content-keyed, so statuses update in place later)
     };
@@ -523,7 +555,13 @@ export async function runAudit(
     const maxSamples = Math.max(samples, Math.floor(cfg.auditDigMaxSamples));
     const concurrency = Math.max(1, Math.floor(cfg.auditDigConcurrency));
     if (cfg.auditEagerPrepare && session.workspace && toDig.length > 0) {
-      const report = await prepareWorkspaceToolchain({ workspace: session.workspace, cfg, logger, ...(session.buildCacheDir ? { cacheDir: session.buildCacheDir } : {}) });
+      const report = await prepareWorkspaceToolchain({
+        workspace: session.workspace,
+        cfg,
+        logger,
+        focusPaths: toDig.map((scope) => scope.region),
+        ...(session.buildCacheDir ? { cacheDir: session.buildCacheDir } : {}),
+      });
       const requests = prepareResourceRequests(report);
       if (requests.length > 0) session.resourceRequests = mergeResourceRequests(session.resourceRequests ?? [], requests);
       recorder.stage("build-readiness", {
@@ -539,13 +577,17 @@ export async function runAudit(
     const buildDeepFocus = (scope: AuditScope): string =>
       `scope ${scope.id}; code region ${scope.region} — audit this WHOLE region: independently enumerate and discharge ALL of its security obligations; ` +
       `do NOT limit yourself to any single one. The map flagged one concern as a starting point (not a boundary): "${scope.obligation}"`;
+    const coverageCompleted = (outcomes: ScopeOutcome[]): boolean => {
+      const latest = outcomes.at(-1);
+      return Boolean(latest && !scopeOutcomeNeedsCoverage(latest));
+    };
     // Run a scope's dig `samples` times and union the findings. Per-pass recall on a
     // subtle obligation is < 1 and stochastic; K independent passes raise cumulative
     // recall (1 - (1-p)^K). `over` isolates a concurrent dig in its own session.
     const resetInFlightScope = async (scope: AuditScope): Promise<void> => {
       if (scope.status !== "auditing") return;
       scope.status = "pending";
-      await saveScopeInventory(inventoryDir, scopeInventory);
+      await saveScopeInventory(inventoryDir, scopeInventory, { forceStatusIds: [scope.id] });
       recorder.scopes(scopeInventory);
       await logger.event("audit_dig_requeued", { scope: scope.id, reason: options.signal?.aborted ? "aborted" : "interrupted" });
     };
@@ -626,12 +668,16 @@ export async function runAudit(
             if (finding.commandRunId) finding.commandRunId = `${scope.id}:${finding.commandRunId}`;
           }
           const scopedScratchFiles = [...digSession.scratchFiles.entries()].map(([scratchPath, content]) => [`dig-${scopeWorkspaceKey(scope.id)}/${scratchPath}`, content] as [string, string]);
-          scope.status = "audited";
+          const completed = coverageCompleted(outcomes);
+          // Finishing a model attempt is not the same as completing coverage. An
+          // incomplete handoff must remain resumable instead of disappearing from
+          // the next run's pending inventory.
+          scope.status = completed ? "audited" : "pending";
           scope.digSeconds = Math.max(1, Math.round((Date.now() - digT0) / 1000));
-          await logger.event("audit_dig_done", { scope: scope.id, samples, findings: unioned.length, concurrent: true, digSeconds: scope.digSeconds });
-          // Resume checkpoint: persist the audited status so a kill mid-run skips this scope
-          // on the next run (concurrent digs' findings live in their isolated workspaces).
-          await saveScopeInventory(inventoryDir, scopeInventory);
+          await logger.event("audit_dig_done", { scope: scope.id, samples, findings: unioned.length, concurrent: true, coverageComplete: completed, digSeconds: scope.digSeconds });
+          // Resume checkpoint: only complete coverage is skipped on the next run;
+          // incomplete attempts stay pending (their findings still survive below).
+          await saveScopeInventory(inventoryDir, scopeInventory, completed ? {} : { forceStatusIds: [scope.id] });
           await appendScopeOutcomes(inventoryDir, outcomes);
           recorder.scopes(scopeInventory);
           recorder.findings(unioned, logger.runDir, "dig checkpoint"); // persist this scope's findings live (content-keyed upsert)
@@ -675,12 +721,13 @@ export async function runAudit(
           aggregatedSteps.push(...digSteps);
           aggregated.push(...unioned);
           newScopeOutcomes.push(...outcomes);
-          scope.status = "audited";
+          const completed = coverageCompleted(outcomes);
+          scope.status = completed ? "audited" : "pending";
           scope.digSeconds = Math.max(1, Math.round((Date.now() - digT0) / 1000));
-          await logger.event("audit_dig_done", { scope: scope.id, samples, findings: unioned.length, digSeconds: scope.digSeconds });
-          // Resume checkpoint: persist the audited status + findings-so-far after each dig,
-          // so a kill mid-run resumes at the next pending scope and keeps completed work.
-          await saveScopeInventory(inventoryDir, scopeInventory);
+          await logger.event("audit_dig_done", { scope: scope.id, samples, findings: unioned.length, coverageComplete: completed, digSeconds: scope.digSeconds });
+          // Resume checkpoint: persist coverage status + findings-so-far after each
+          // attempt so incomplete coverage remains eligible for a later resume.
+          await saveScopeInventory(inventoryDir, scopeInventory, completed ? {} : { forceStatusIds: [scope.id] });
           await appendScopeOutcomes(inventoryDir, outcomes);
           await checkpointFindings();
           recorder.scopes(scopeInventory);
@@ -821,7 +868,7 @@ export async function runAudit(
   if (session.workspace && session.baselineFiles && !digDifferentialDone) {
     const differentials: DifferentialResult[] = [];
     for (const finding of session.findings) {
-      if (finding.confirmationStatus !== "confirmed-executable" || !finding.fixPatch || !finding.commandRunId) continue;
+      if (!isExecutionConfirmedFinding(finding) || finding.confirmationStatus !== "confirmed-executable" || !finding.fixPatch || !finding.commandRunId) continue;
       const exploitRun = session.commandRuns.find((run) => run.id === finding.commandRunId);
       if (!exploitRun) continue;
       options.onActivity?.({ kind: "step", tool: `differential ${finding.id}` }); // surface the post-dig stage in Live Activity
@@ -839,7 +886,7 @@ export async function runAudit(
   // is downgraded to a hypothesis; an execution-proven (differential) finding it
   // disputes is kept but flagged for humans (execution is ground truth).
   if (cfg.auditRefute) {
-    const candidates = session.findings.filter((finding) => isConfirmed(finding.confirmationStatus));
+    const candidates = session.findings.filter(isExecutionConfirmedFinding);
     if (candidates.length > 0) {
       const refuteCfg = withRole(cfg, "refute");
       // Session-only providers (e.g. openai-codex via OAuth) have no API key, so the
@@ -922,7 +969,7 @@ export async function runAudit(
           const appealOut = session.findings;
           session.findings = mainFindings;
           session.counters.finding = mainCount;
-          const reConfirmed = appealOut.find((produced) => isConfirmed(produced.confirmationStatus) && !/^REFUTED:/i.test(produced.title));
+          const reConfirmed = appealOut.find(isExecutionConfirmedFinding);
           let upheld = false;
           if (reConfirmed) {
             // Re-judge the NEW PoC by the same skeptic standard. Survives → real bug recovered.
@@ -977,7 +1024,12 @@ export async function runAudit(
   if (cfg.auditChallengeDischarges !== false && !options.signal?.aborted) {
     const sevRank = (s: string | undefined): number => ({ critical: 0, high: 1, medium: 2, low: 3, info: 4 } as Record<string, number>)[s ?? "info"] ?? 4;
     const legacyDischarged = session.findings.filter((f) => f.confirmationStatus === "discharged");
-    const outcomeDischarged = latestScopeOutcomes(scopeOutcomes).flatMap((outcome) => {
+    // Challenge only outcomes produced by THIS run. Persisted outcomes were already
+    // challenged when their scopes were audited; replaying the whole project on every
+    // one-scope continuation multiplies model work and can reopen unrelated historical
+    // obligations with no new evidence.
+    const challengeOutcomes = dischargeChallengeScopeOutcomes(scopeOutcomes, newScopeOutcomes);
+    const outcomeDischarged = challengeOutcomes.flatMap((outcome) => {
       const scope = scopeInventory.find((candidate) => candidate.id === outcome.scopeId);
       const severity = severityFromExposure(scope?.exposure);
       return outcome.obligations
@@ -1001,7 +1053,11 @@ export async function runAudit(
     if (discharged.length > 0) {
       const challengeCfg = withRole(cfg, "refute");
       const challengeLlm = options.llm ?? (isPiSessionProvider(challengeCfg.provider) ? new SessionLlmClient(challengeCfg, logger) : createLlmClient(challengeCfg, logger));
-      await logger.event("audit_discharge_challenge_start", { discharged: discharged.length });
+      await logger.event("audit_discharge_challenge_start", {
+        discharged: discharged.length,
+        runOutcomes: challengeOutcomes.length,
+        persistedOutcomes: latestScopeOutcomes(scopeOutcomes).length,
+      });
       const verdicts = await runDischargeChallenge({ findings: discharged, source, cfg: challengeCfg, llm: challengeLlm, logger, max: cfg.auditChallengeMax ?? 12, onProgress: (id) => options.onActivity?.({ kind: "step", tool: `challenge ${id}` }) });
       let overturned = 0;
       for (const v of verdicts) {
@@ -1014,7 +1070,7 @@ export async function runAudit(
           session.findings.push(finding);
         }
         finding.confirmationStatus = "suspected"; // no longer "safe" — re-open as a real lead (flows to verify)
-        finding.title = "DISCHARGE OVERTURNED: " + (finding.title || "").replace(/^(obligation\s+)?discharged:?\s*/i, "");
+        finding.title = "DISCHARGE OVERTURNED: " + dischargeChallengeFindingTitle(v, finding.title);
         finding.description = `An independent discharge-skeptic overturned this discharge — the cited enforcement does not clear the obligation end-to-end. Missed case: ${v.gap || v.reason}\n\n[original discharge reasoning] ${finding.description || ""}`.slice(0, 4000);
         if (sevRank(finding.severity) > 1) finding.severity = "high"; // a real missed obligation is not info-level
         overturned += 1;
@@ -1027,11 +1083,15 @@ export async function runAudit(
   }
 
   // Hard artifact semantics: only an execution-confirmed candidate is a finding.
-  // Everything else is a hypothesis. Hypotheses are surfaced as their own artifact
-  // (not buried), but they do not get disclosure reports and are not counted as
-  // findings — that is the whole point of the confirmation gate.
-  const confirmed = session.findings.filter((finding) => isConfirmed(finding.confirmationStatus));
-  const hypotheses = session.findings.filter((finding) => !isConfirmed(finding.confirmationStatus));
+  // Unresolved leads are hypotheses; explicit false-positive verdicts are terminal
+  // refutations. Neither gets a disclosure report or counts as a vulnerability.
+  const confirmed = session.findings.filter(isExecutionConfirmedFinding);
+  const refuted = session.findings.filter((finding) => isRefutedFindingTitle(finding.title));
+  const hypotheses = session.findings.filter((finding) => !isExecutionConfirmedFinding(finding) && !isRefutedFindingTitle(finding.title));
+  // Keep terminal refutations in the historical hypotheses artifact for backwards
+  // compatibility, while summary/report/run-health semantics distinguish them from
+  // unresolved leads that still need work.
+  const nonFindings = [...hypotheses, ...refuted];
   const runHealth: RunHealth = buildRunHealth({
     stoppedReason,
     steps,
@@ -1054,11 +1114,11 @@ export async function runAudit(
 
   await logger.artifact("audit_transcript.json", { stoppedReason, steps });
   await logger.artifact("audit_findings.json", confirmed);
-  await logger.artifact("audit_hypotheses.json", hypotheses);
+  await logger.artifact("audit_hypotheses.json", nonFindings);
   await logger.artifact("audit_command_runs.json", session.commandRuns);
   if (scopeInventory.length > 0) await logger.artifact("audit_scopes.json", scopeInventory);
 
-  const summary = buildSummary(confirmed, hypotheses, steps);
+  const summary = buildSummary(confirmed, hypotheses, refuted, steps);
   await logger.artifact("summary.json", summary);
 
   for (const finding of summary.findings) {
@@ -1077,6 +1137,7 @@ export async function runAudit(
       model: cfg.auditModel,
       confirmed,
       hypotheses,
+      refuted,
       scopes: scopeInventory,
       reportName: reportArtifactName,
       coverageGaps,
@@ -1086,13 +1147,14 @@ export async function runAudit(
     }),
   );
 
-  await nonFatalAuditMaintenance(logger, "finding_memory", () => persistFindingMemory(memory, confirmed, hypotheses, cfg.materialFingerprint, resourceRequests));
+  await nonFatalAuditMaintenance(logger, "finding_memory", () => persistFindingMemory(memory, confirmed, nonFindings, cfg.materialFingerprint, resourceRequests));
 
   await logger.event("audit_done", {
     stoppedReason,
     steps: steps.length,
     findings: confirmed.length,
     hypotheses: hypotheses.length,
+    refuted: refuted.length,
     confirmedExecutable: confirmed.length,
     commandRuns: session.commandRuns.length,
     runHealth: runHealth.status,
@@ -1136,6 +1198,16 @@ export async function runAudit(
   };
 }
 
+export function dischargeChallengeFindingTitle(verdict: { title?: string }, fallback: string): string {
+  const mechanism = (verdict.title ?? "").replace(/^\s*(?:DISCHARGE\s+OVERTURNED|DISCHARGED)\s*:\s*/i, "").replace(/\s+/g, " ").trim();
+  if (mechanism) return mechanism.slice(0, 240);
+  return (fallback || "Discharged obligation is unsound").replace(/^(obligation\s+)?discharged:?\s*/i, "").replace(/\s+/g, " ").trim().slice(0, 240);
+}
+
+export function dischargeChallengeScopeOutcomes(_persistedOutcomes: ScopeOutcome[], runOutcomes: ScopeOutcome[]): ScopeOutcome[] {
+  return latestScopeOutcomes(runOutcomes);
+}
+
 const SEVERITY_ORDER = ["critical", "high", "medium", "low", "info"];
 
 function renderRunReport(input: {
@@ -1144,6 +1216,7 @@ function renderRunReport(input: {
   model: string;
   confirmed: AgentFinding[];
   hypotheses: AgentFinding[];
+  refuted: AgentFinding[];
   scopes: AuditScope[];
   reportName: (id: string) => string;
   coverageGaps?: CoverageGap[];
@@ -1169,6 +1242,7 @@ function renderRunReport(input: {
   out.push(`- Provider / model: ${input.provider} / ${input.model}`);
   out.push(`- Confirmed findings: ${input.confirmed.length}${input.confirmed.length ? ` (${sevCounts(input.confirmed)})` : ""}`);
   out.push(`- Hypotheses (suspected, unconfirmed): ${input.hypotheses.length}`);
+  out.push(`- Refuted claims (terminal): ${input.refuted.length}`);
   if (input.runHealth) out.push(`- Run health: ${input.runHealth.status} — ${input.runHealth.reasons.join("; ")}`);
   if (input.scopes.length > 0) {
     const pending = input.scopes.length - audited;
@@ -1180,7 +1254,7 @@ function renderRunReport(input: {
   out.push("");
 
   out.push(`## Confirmed findings (${input.confirmed.length})`, "");
-  if (input.confirmed.length === 0) out.push("_None reached execution-confirmed status this run. See hypotheses below._", "");
+  if (input.confirmed.length === 0) out.push("_None reached execution-confirmed status this run._", "");
   for (const finding of [...input.confirmed].sort(bySeverity)) {
     out.push(`### [${finding.severity.toUpperCase()}] ${finding.title} — ${finding.confirmationStatus}${finding.disputed ? " — ⚠ DISPUTED by independent refutation" : ""}${finding.appeal?.upheld ? " — recovered on appeal (faithful PoC survived re-refutation)" : ""}`);
     if (finding.scopeId) out.push(`- Scope: \`${finding.scopeId}\``);
@@ -1195,6 +1269,14 @@ function renderRunReport(input: {
     out.push(`## Hypotheses — suspected, need a human or a test (${input.hypotheses.length})`, "");
     for (const finding of [...input.hypotheses].sort(bySeverity)) {
       out.push(`- **[${finding.severity.toUpperCase()}]** ${finding.title} — ${finding.location}${finding.scopeId ? ` (scope \`${finding.scopeId}\`)` : ""}${finding.appeal?.attempted ? " — refuted; appeal not upheld" : finding.disputed ? " — ⚠ disputed by refutation" : ""}`);
+    }
+    out.push("");
+  }
+
+  if (input.refuted.length > 0) {
+    out.push(`## Refuted claims — terminal, no further verification required (${input.refuted.length})`, "");
+    for (const finding of [...input.refuted].sort(bySeverity)) {
+      out.push(`- **${finding.title.replace(/^\s*REFUTED\s*:\s*/i, "")}** — ${finding.location}${finding.scopeId ? ` (scope \`${finding.scopeId}\`)` : ""}`);
     }
     out.push("");
   }
@@ -1224,13 +1306,13 @@ function renderRunReport(input: {
   return out.join("\n");
 }
 
-function buildSummary(confirmed: AgentFinding[], hypotheses: AgentFinding[], steps: { tool: string }[]): AuditSummary {
+function buildSummary(confirmed: AgentFinding[], hypotheses: AgentFinding[], refuted: AgentFinding[], steps: { tool: string }[]): AuditSummary {
   const ranked = confirmed.map(toRankedFinding).sort((a, b) => b.score - a.score);
   const bySeverity: Record<Severity, number> = { info: 0, low: 0, medium: 0, high: 0, critical: 0 };
   for (const finding of ranked) bySeverity[finding.severity] += 1;
   return {
     coverage: {
-      itemsTotal: ranked.length + hypotheses.length,
+      itemsTotal: ranked.length + hypotheses.length + refuted.length,
       itemsWithFinding: ranked.length,
       bySeverity,
       itemsNeedingRetry: 0,
@@ -1240,6 +1322,7 @@ function buildSummary(confirmed: AgentFinding[], hypotheses: AgentFinding[], ste
       verifiedFindings: ranked.length,
       unverifiedFindings: 0,
       hypotheses: hypotheses.length,
+      refuted: refuted.length,
     },
     findings: ranked,
   };
@@ -1264,7 +1347,7 @@ async function persistFindingMemory(
   // Remember hypotheses too, but as notes — a future run starts knowing which
   // leads were explored without treating them as established findings.
   for (const finding of hypotheses) {
-    const refuted = /^REFUTED:/i.test(finding.title);
+    const refuted = isRefutedFindingTitle(finding.title);
     await memory.remember({
       note: `${refuted ? "Refuted lead" : "Unconfirmed hypothesis"}: ${finding.title} at ${finding.location}: ${finding.description}`.slice(0, 600),
       kind: refuted ? "dead-end" : "note",
@@ -1300,6 +1383,38 @@ function isConfirmed(status: ConfirmationStatus): boolean {
   return status === "confirmed-executable" || status === "confirmed-differential";
 }
 
+/** Artifact/report semantics are stricter than the raw confirmation enum: a
+ * passed command attached to `REFUTED:` proves the mitigation, not the bug. */
+export function isExecutionConfirmedFinding(finding: AgentFinding): boolean {
+  return !isRefutedFindingTitle(finding.title) && isConfirmed(finding.confirmationStatus);
+}
+
+/** Collapse same-claim duplicates from one Verify worker and reject contradictory
+ * polarities before any row or phase outcome is persisted. Distinct extra findings
+ * remain independent, although the Verify prompt asks the model to stop after one. */
+export function normalizeVerifyVerdicts(findings: AgentFinding[]): { findings: AgentFinding[]; conflict: boolean; inputCount: number } {
+  const kept = new Map<string, { finding: AgentFinding; polarity: string }>();
+  for (const finding of findings) {
+    const cleanTitle = finding.title.replace(/^\s*(?:REFUTED|CONFIRMED|DISCHARGED)\s*:\s*/i, "").trim();
+    const key = canonicalFindingKey(cleanTitle, finding.location);
+    const polarity = isRefutedFindingTitle(finding.title)
+      ? "refuted"
+      : isExecutionConfirmedFinding(finding)
+        ? "confirmed"
+        : finding.confirmationStatus;
+    const prior = kept.get(key);
+    if (!prior) {
+      kept.set(key, { finding, polarity });
+      continue;
+    }
+    if (prior.polarity !== polarity) return { findings: [], conflict: true, inputCount: findings.length };
+    if (polarity === "confirmed" && finding.confirmationStatus === "confirmed-differential") {
+      kept.set(key, { finding, polarity });
+    }
+  }
+  return { findings: [...kept.values()].map((entry) => entry.finding), conflict: false, inputCount: findings.length };
+}
+
 // --verify input: a JSON file holding one suspected finding, an array of them, or
 // a {findings:[...]} object (so a prior run's audit_findings.json / audit_hypotheses.json
 // can be fed directly). Returns the loose finding records to confirm-or-refute.
@@ -1321,6 +1436,25 @@ async function loadFindingsToVerify(filePath: string): Promise<Array<Record<stri
   const findings = list.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item));
   if (findings.length === 0) throw new Error(`--verify: no finding objects found in ${filePath}`);
   return findings;
+}
+
+/** One durable finding must have at most one stochastic Verify worker per run.
+ * Duplicate anonymous leads remain independent, but repeated canonical origin ids
+ * are collapsed deterministically so concurrent workers cannot race contradictory
+ * verdicts into the same lifecycle row. */
+export function dedupeVerifyInputs(findings: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  const seenOrigins = new Set<number>();
+  return findings.filter((finding) => {
+    const originId = verifyOriginId(finding);
+    if (originId === undefined) return true;
+    if (seenOrigins.has(originId)) return false;
+    seenOrigins.add(originId);
+    return true;
+  });
+}
+
+function verifyOriginId(finding: Record<string, unknown>): number | undefined {
+  return positiveIntegerId(finding.originId ?? finding.origin_id);
 }
 
 // Format one suspected finding into the claim text the verify session must
@@ -1439,7 +1573,7 @@ function toRankedFinding(finding: AgentFinding): RankedFinding {
     confirmationStatus: finding.confirmationStatus,
     ...(finding.commandRunId ? { commandRunId: finding.commandRunId } : {}),
     ...(finding.patchedSuccessPatterns ? { patchedSuccessPatterns: finding.patchedSuccessPatterns } : {}),
-    ...(isConfirmed(finding.confirmationStatus) ? { reproductionStatus: "confirmed-executable" as const } : {}),
+    ...(isExecutionConfirmedFinding(finding) ? { reproductionStatus: "confirmed-executable" as const } : {}),
     ...(finding.disputed ? { disputed: true } : {}),
     ...(finding.refutation?.refuted ? { refutationReason: finding.refutation.reason } : {}),
     ...(finding.appeal ? { appeal: finding.appeal } : {}),

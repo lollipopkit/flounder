@@ -18,7 +18,7 @@ async function loadTsModule(relativePath) {
   return import(`data:text/javascript;base64,${Buffer.from(compiled.outputText).toString("base64")}`);
 }
 
-const { bugBountyEngagementLabel, contestReviewState, decisionHasUnresolvedEvidenceConflict, hasUnresolvedEvidenceConflict, isVerifyRun, normalizeActivityBody, splitActivitySummaries, phaseState, projectSourceState, reportableDecisions, reportableFindings, runProgress, sortConfirmDecisionsForSubmission } = await loadTsModule("../src/server/ui/src/domain.ts");
+const { bugBountyEngagementLabel, contestReviewState, decisionHasUnresolvedEvidenceConflict, hasUnresolvedEvidenceConflict, isVerifyRun, normalizeActivityBody, pendingConfirmFindings, splitActivitySummaries, phaseState, projectSourceState, reportableDecisions, reportableFindings, runProgress, sortConfirmDecisionsForSubmission } = await loadTsModule("../src/server/ui/src/domain.ts");
 const { nextDialogFocusIndex } = await loadTsModule("../src/server/ui/src/dialog-focus.ts");
 const appSource = readFileSync(new URL("../src/server/ui/src/App.tsx", import.meta.url), "utf8");
 const stylesSource = readFileSync(new URL("../src/server/ui/src/styles.css", import.meta.url), "utf8");
@@ -101,6 +101,19 @@ test("ui: unresolved local and real-target evidence conflicts require review and
   assert.match(appSource, /Retry Confirm/);
   assert.match(appSource, /Reporting stays held until the evidence agrees/);
   assert.match(stylesSource, /\.refutation-conflict/);
+});
+
+test("ui: independently refuted confirmations do not advance to confirm or report", () => {
+  const finding = {
+    id: 8,
+    finding_key: "kreviewrefuted",
+    status: "confirmed-differential",
+    confirm_status: null,
+    refutation_status: "refuted",
+  };
+
+  assert.deepEqual(pendingConfirmFindings([finding], true, []), []);
+  assert.deepEqual(reportableFindings([finding], false), []);
 });
 
 test("ui: source setup is ready when prepare produced an audit-ready workspace", () => {

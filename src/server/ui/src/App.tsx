@@ -944,7 +944,7 @@ function findingsSummary(detail: ProjectDetail): string {
   const suspected = detail.statusCounts.suspected ?? 0;
   const source = detail.statusCounts["confirmed-source"] ?? 0;
   const needsEvidence = detail.statusCounts["needs-evidence"] ?? 0;
-  const confirmed = (detail.statusCounts["confirmed-differential"] ?? 0) + (detail.statusCounts["confirmed-executable"] ?? 0);
+  const confirmed = detail.auditConfirmedFindings;
   const pieces = [];
   if (suspected) pieces.push(`${plural(suspected, "suspected lead")}`);
   if (source) pieces.push(`${plural(source, "source-confirmed lead")}`);
@@ -2747,10 +2747,10 @@ function ProjectDetailView(props: {
   const topCandidates = topCandidateFindings(allFindings);
   const verifyCandidates = pendingVerifyFindings(allFindings);
   const overviewCandidates = verifyCandidates.length ? verifyCandidates : topCandidates;
-  const confirmed = allFindings.filter((finding) => finding.status === "confirmed-executable" || finding.status === "confirmed-differential").length;
-  const uniqueConfirmed = allFindings.filter((finding) =>
-    (finding.status === "confirmed-executable" || finding.status === "confirmed-differential")
-    && finding.tracking_status !== "duplicate"
+  const locallyVerifiedRows = localVerifiedFindings(allFindings);
+  const confirmed = locallyVerifiedRows.length;
+  const uniqueConfirmed = locallyVerifiedRows.filter((finding) =>
+    finding.tracking_status !== "duplicate"
     && finding.tracking_status !== "ignored").length;
   const reproduced = confirmedDecisions(confirmDecisions).length;
   const runningRun = currentRuns.find((run) => run.status === "running");

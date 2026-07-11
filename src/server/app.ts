@@ -2514,6 +2514,12 @@ async function runLaunch(c: Ctx): Promise<void> {
     const findingIds = selectedFindingIds(body);
     if (findingIds.length > 0) {
       const selected = findingIds.map((id) => ({ id, row: c.store.getConfirmable(Number(project.id), id) }));
+      const reviewBlocked = selected
+        .filter((entry) => findingIndependentReviewBlocksProgress(c.store.getFinding(entry.id)))
+        .map((entry) => entry.id);
+      if (reviewBlocked.length > 0) {
+        return sendJson(c.res, 400, { error: `finding ${reviewBlocked.join(", ")} did not pass independent review` });
+      }
       const missing = selected.filter((entry) => !entry.row || !confirmableRunDir(entry.row as unknown as Record<string, unknown>)).map((entry) => entry.id);
       if (missing.length > 0) return sendJson(c.res, 400, { error: `finding ${missing.join(", ")} is not pending confirm for this project, or has no source run dir` });
       const stale = selected.filter((entry) => entry.row && !rowBelongsToCurrentMaterial(entry.row as unknown as Record<string, unknown>, currentResultRunIds, materialBoundary)).map((entry) => entry.id);
@@ -2535,6 +2541,8 @@ async function runLaunch(c: Ctx): Promise<void> {
       const pending = confirmWorkRows(c.store, Number(project.id), currentResultRunIds, materialBoundary, currentDecisions);
       if (pending.length === 0) return sendJson(c.res, 400, { error: "nothing to confirm — every audit-confirmed finding already has a real-target decision (use --fresh to redo)" });
       const context = c.store.confirmableContext(Number(project.id))
+        .filter((p) => !findingIndependentReviewBlocksProgress(p)
+          || (p.refutation_status === "conflict" && c.store.hasFindingPhaseRetry(Number(project.id), "finding", Number(p.id), "confirm")))
         .filter((p) => confirmableRunDir(p as unknown as Record<string, unknown>))
         .filter((p) => rowBelongsToCurrentMaterial(p as unknown as Record<string, unknown>, currentResultRunIds, materialBoundary));
       const rows = context.length > 0 ? context : pending;
@@ -2787,11 +2795,13 @@ function confirmWorkRows(
 ): Array<Record<string, unknown>> {
   const settledKeys = confirmDecisionKeySet(currentDecisions.filter((row) => !needsSubmissionReadinessWork(row)));
   const pending = store.pendingConfirmable(projectId)
+    .filter((row) => !findingIndependentReviewBlocksProgress(store.getFinding(Number(row.id))))
     .filter((row) => confirmableRunDir(row as unknown as Record<string, unknown>))
     .filter((row) => rowBelongsToCurrentMaterial(row as unknown as Record<string, unknown>, currentResultRunIds, materialBoundary))
     .filter((row) => !findingRowCoveredByDecision(row as unknown as Record<string, unknown>, settledKeys));
   const readinessKeys = new Set(currentDecisions.filter((row) => needsSubmissionReadinessWork(row)).flatMap(confirmDecisionMemberKeys));
   const readiness = readinessKeys.size === 0 ? [] : store.confirmableContext(projectId)
+    .filter((row) => !findingIndependentReviewBlocksProgress(row))
     .filter((row) => confirmableRunDir(row as unknown as Record<string, unknown>))
     .filter((row) => rowBelongsToCurrentMaterial(row as unknown as Record<string, unknown>, currentResultRunIds, materialBoundary))
     .filter((row) => {
@@ -2927,10 +2937,11 @@ function reportWorklist(
     return decisionReportWorklist(store, projectId, selectedIds, currentRunIds, materialBoundary, includeExistingReports);
   }
   const selected = selectedIds.length ? new Set(selectedIds) : undefined;
-  const rows = reportableFindings(store.listFindings(projectId)).filter((row) => {
+  const allRows = reportableFindings(store.listFindings(projectId));
+  const rows = allRows.filter((row) => {
     if (selected && !selected.has(Number(row.id))) return false;
     if (isIgnoredFinding(row)) return false;
-    if (row.refutation_status === "conflict") return false;
+    if (findingIndependentReviewBlocksProgress(row)) return false;
     if (!selected && !includeExistingReports && rowHasFormalReport(row)) return false;
     if (!rowBelongsToCurrentMaterial(row, currentRunIds ?? new Set(), materialBoundary)) return false;
     if (!isExecutionConfirmedFindingStatus(String(row.status ?? "").toLowerCase())) return false;
@@ -2939,6 +2950,10 @@ function reportWorklist(
   if (selected && rows.length !== selected.size) {
     const found = new Set(rows.map((row) => Number(row.id)));
     const missing = [...selected].filter((id) => !found.has(id));
+    const blocked = missing.filter((id) => allRows.some((row) => Number(row.id) === id && findingIndependentReviewBlocksProgress(row)));
+    if (blocked.length > 0) {
+      return { error: `finding ${blocked.join(", ")} did not pass independent review` };
+    }
     const reason = "is not locally execution-confirmed for this source-only target";
     return { error: `finding ${missing.join(", ")} ${reason}` };
   }
@@ -2989,7 +3004,7 @@ function decisionReportWorklist(
     .filter((decision) => isSubmissionReadyDecision(decision, { requireImpactInventory: false }))
     .filter((decision) => isRealTargetDecisionEvidence(stringValue(decision.evidence_level)))
     .filter((decision) => decisionLinkedFindingRows(decision, findingsByKey)
-      .every((finding) => finding.refutation_status !== "conflict"))
+      .every((finding) => !findingIndependentReviewBlocksProgress(finding)))
     .filter((decision) => selected || includeExistingReports || !decisionHasFormalReport(decision))
     .filter((decision) => Boolean(selected) || store.phaseEligible(projectId, "decision", Number(decision.id), "report", decisionReportFingerprint(store, decision, materialBoundary)))
     .filter((decision) => {
@@ -3007,6 +3022,10 @@ function decisionReportWorklist(
         const subject = conflicted.length === 1 ? "finding" : "findings";
         const verb = conflicted.length === 1 ? "has" : "have";
         return { error: `${subject} ${conflicted.join(", ")} ${verb} an unresolved local/real-target evidence conflict` };
+      }
+      const reviewBlocked = missing.filter((id) => findingIndependentReviewBlocksProgress(findingsById.get(id)));
+      if (reviewBlocked.length > 0) {
+        return { error: `finding ${reviewBlocked.join(", ")} did not pass independent review` };
       }
       const unknown = missing.filter((id) => !findingsById.has(id));
       const suffix = unknown.length > 0 ? " is not a current finding for this project" : " is not linked to a submission-ready decision";
@@ -3722,7 +3741,14 @@ function isExecutionConfirmedFindingStatus(status: string): boolean {
 }
 
 function countAuditConfirmedFindings(rows: Array<Record<string, unknown>>): number {
-  return rows.filter((row) => isConfirmedFindingStatus(String(row.status ?? "").toLowerCase())).length;
+  return rows.filter((row) =>
+    isConfirmedFindingStatus(String(row.status ?? "").toLowerCase())
+    && !findingIndependentReviewBlocksProgress(row)).length;
+}
+
+function findingIndependentReviewBlocksProgress(row: Record<string, unknown> | undefined): boolean {
+  const status = stringValue(row?.refutation_status).toLowerCase();
+  return Boolean(status && status !== "passed");
 }
 
 function findingStatusMatches(row: Record<string, unknown>, status?: string): boolean {
@@ -5380,7 +5406,9 @@ function projectSnapshots(store: MetadataStore, options: ProjectListOptions = {}
       ? findings.filter((finding) => {
           const status = String(finding.status ?? "");
           const key = stringValue(finding.finding_key).toLowerCase();
-          return (status === "confirmed-executable" || status === "confirmed-differential") && (!finding.confirm_status || (key && submissionWorkKeys.has(key)));
+          return !findingIndependentReviewBlocksProgress(finding)
+            && (status === "confirmed-executable" || status === "confirmed-differential")
+            && (!finding.confirm_status || (key && submissionWorkKeys.has(key)));
         }).length
       : 0;
     return {

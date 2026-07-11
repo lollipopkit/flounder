@@ -111,19 +111,28 @@ export function pendingConfirmFindings(rows: FindingRow[] | undefined, requiresC
   const decidedFindingKeys = new Set((decisions ?? []).flatMap(confirmDecisionMemberKeys));
   return activeFindings(rows).filter((finding) =>
     isExecutionConfirmedFinding(finding)
+    && !hasBlockingIndependentReview(finding)
     && !finding.confirm_status
     && !(finding.finding_key && decidedFindingKeys.has(finding.finding_key.toLowerCase()))
   );
 }
 
 export function localVerifiedFindings(rows: FindingRow[] | undefined): FindingRow[] {
-  return activeFindings(rows).filter(isExecutionConfirmedFinding);
+  return activeFindings(rows).filter((finding) =>
+    isExecutionConfirmedFinding(finding) && !hasBlockingIndependentReview(finding));
 }
 
 export function hasUnresolvedEvidenceConflict(
   finding: Pick<FindingRow, "refutation_status"> | null | undefined,
 ): boolean {
   return finding?.refutation_status === "conflict";
+}
+
+export function hasBlockingIndependentReview(
+  finding: Pick<FindingRow, "refutation_status"> | null | undefined,
+): boolean {
+  const status = finding?.refutation_status;
+  return Boolean(status && status !== "passed");
 }
 
 export function pendingVerifyFindings(rows: FindingRow[] | undefined): FindingRow[] {
@@ -136,7 +145,7 @@ export function rawPendingVerifyCount(rows: FindingRow[] | undefined): number {
 
 export function reportableFindings(rows: FindingRow[] | undefined, requiresConfirmation = true): FindingRow[] {
   return activeFindings(rows).filter((finding) =>
-    !hasUnresolvedEvidenceConflict(finding)
+    !hasBlockingIndependentReview(finding)
     && (requiresConfirmation ? finding.confirm_status === "reproduced" : isExecutionConfirmedFinding(finding))
   );
 }
@@ -157,6 +166,18 @@ function unresolvedConflictKeys(rows: FindingRow[] | undefined): Set<string> {
   return keys;
 }
 
+function blockingIndependentReviewKeys(rows: FindingRow[] | undefined): Set<string> {
+  const keys = new Set<string>();
+  for (const finding of rows ?? []) {
+    if (!hasBlockingIndependentReview(finding)) continue;
+    for (const key of [finding.finding_key, finding.canonical_key]) {
+      const normalized = key?.trim().toLowerCase();
+      if (normalized) keys.add(normalized);
+    }
+  }
+  return keys;
+}
+
 export function decisionHasUnresolvedEvidenceConflict(
   decision: ConfirmDecision,
   findings: FindingRow[] | undefined,
@@ -166,9 +187,10 @@ export function decisionHasUnresolvedEvidenceConflict(
 }
 
 export function reportableDecisions(decisions: ConfirmDecision[] | undefined, findings?: FindingRow[]): ConfirmDecision[] {
+  const blockedKeys = blockingIndependentReviewKeys(findings);
   return sortConfirmDecisionsForSubmission(decisions)
     .filter(isSubmissionReadyDecision)
-    .filter((decision) => !decisionHasUnresolvedEvidenceConflict(decision, findings));
+    .filter((decision) => !confirmDecisionMemberKeys(decision).some((key) => blockedKeys.has(key)));
 }
 
 export function pendingDecisionReports(decisions: ConfirmDecision[] | undefined, findings?: FindingRow[]): ConfirmDecision[] {
@@ -441,7 +463,7 @@ export function currentMaterialDetail(detail: ProjectDetail): ProjectDetail {
   const progress = currentMaterialProgress(detail);
   const allFindings = currentMaterialFindings(detail);
   const confirmDecisions = currentMaterialConfirmDecisions(detail);
-  const auditConfirmedFindings = allFindings.filter(isExecutionConfirmedFinding).length;
+  const auditConfirmedFindings = localVerifiedFindings(allFindings).length;
   const reproducedBugs = confirmedDecisions(confirmDecisions).length;
   const requiresConfirmation = needsRealTargetConfirmation(detail);
   return {

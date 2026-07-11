@@ -2140,6 +2140,15 @@ test("api: report launch accepts source-only execution-confirmed findings withou
           severity: "medium",
           status: "suspected",
         },
+        {
+          findingKey: "kreviewrefuted",
+          title: "Source-only independently refuted bug",
+          location: "src/Target.rs:56",
+          severity: "medium",
+          status: "confirmed-differential",
+          refutationStatus: "refuted",
+          refutationReason: "The execution passed, but the claimed invariant does not hold.",
+        },
       ]);
     } finally {
       store.close();
@@ -2149,8 +2158,10 @@ test("api: report launch accepts source-only execution-confirmed findings withou
     assert.equal(detail.prepareSummary.realTarget.requiresConfirmation, false);
     const ready = detail.allFindings.find((finding) => finding.finding_key === "ksource");
     const suspected = detail.allFindings.find((finding) => finding.finding_key === "ksuspected");
+    const reviewRefuted = detail.allFindings.find((finding) => finding.finding_key === "kreviewrefuted");
     assert.ok(ready);
     assert.ok(suspected);
+    assert.ok(reviewRefuted);
 
     const launched = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "report", findingIds: [ready.id] }));
     const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
@@ -2171,6 +2182,10 @@ test("api: report launch accepts source-only execution-confirmed findings withou
     const rejected = await post(`/api/projects/${created.uuid}/runs`, { verb: "report", findingIds: [suspected.id] });
     assert.equal(rejected.status, 400);
     assert.match((await rejected.json()).error, /not locally execution-confirmed/);
+
+    const reviewRejected = await post(`/api/projects/${created.uuid}/runs`, { verb: "report", findingIds: [reviewRefuted.id] });
+    assert.equal(reviewRejected.status, 400);
+    assert.match((await reviewRejected.json()).error, /independent review/);
   });
 });
 

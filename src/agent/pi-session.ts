@@ -99,12 +99,13 @@ export function verifyHasRequiredVerdict(session: ToolContext["session"]): boole
  * findings array). A provider transport error after that boundary must remain
  * visible in activity, but it must not turn the completed scope attempt into an
  * infrastructure failure. Incomplete handoffs still fail closed. */
-export function digSessionHasDurableHandoff(input: {
+export function auditSessionHasDurableHandoff(input: {
   deep: boolean;
   synthesize: boolean;
   hasScopeOutcome: boolean;
   hasFindingsArtifact: boolean;
 }): boolean {
+  if (input.synthesize) return input.hasFindingsArtifact;
   return input.deep
     && !input.synthesize
     && input.hasScopeOutcome
@@ -444,18 +445,20 @@ export async function runAuditSession(input: {
 
   const settleSessionError = async (message: string): Promise<SessionDriverResult> => {
     steps.push({ n: stepNo + 1, thought: "", tool: "(session-error)", args: {}, observation: message.slice(0, 500) });
-    const durableHandoff = digSessionHasDurableHandoff({
+    const hasScopeOutcome = scratchHasScopeOutcome(input.ctx.session);
+    const hasFindingsArtifact = scratchHasFindingsArtifact(input.ctx.session);
+    const durableHandoff = auditSessionHasDurableHandoff({
       deep: input.deep === true,
       synthesize: input.synthesize !== undefined,
-      hasScopeOutcome: scratchHasScopeOutcome(input.ctx.session),
-      hasFindingsArtifact: scratchHasFindingsArtifact(input.ctx.session),
+      hasScopeOutcome,
+      hasFindingsArtifact,
     });
     if (!durableHandoff) return { steps, stoppedReason: "error" };
     await input.logger.event("audit_session_error_after_terminal_handoff", {
       error: message.slice(0, 500),
-      phase: "dig",
-      hasScopeOutcome: true,
-      hasFindingsArtifact: true,
+      phase: input.synthesize !== undefined ? "synthesize" : "dig",
+      hasScopeOutcome,
+      hasFindingsArtifact,
       ...activityMeta,
     });
     return { steps, stoppedReason: "finished" };

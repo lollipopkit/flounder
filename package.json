@@ -47,6 +47,7 @@
     "check:public:commit": "node scripts/check-public-surface.mjs --head-only",
     "hooks:install": "git config core.hooksPath .githooks",
     "verify": "npm run check && npm test && npm run check:api-catalog:dist && npm run check:db-upgrade:dist && npm run mock-audit && npm run check:public",
+    "bundle": "node scripts/bundle-server.mjs",
     "docker:build": "docker build -f docker/flounder.Dockerfile -t flounder:latest .",
     "sandbox:build": "docker build -f docker/flounder-sandbox.Dockerfile -t flounder-sandbox:latest .",
     "sandbox:cairo:build": "docker build -f docker/flounder-sandbox-cairo.Dockerfile -t flounder-sandbox:cairo .",
@@ -129,6 +130,7 @@
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.2",
+    "esbuild": "0.28.1",
     "typebox": "1.2.0",
     "typescript": "^5.9.0",
     "vite": "^8.0.16"

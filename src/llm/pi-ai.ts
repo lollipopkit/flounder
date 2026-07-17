@@ -2,7 +2,7 @@ import { complete, getModel, getProviders, type KnownProvider } from "@earendil-
 import type { LlmClient } from "../types.js";
 import type { RunLogger } from "../trace/logger.js";
 import type { ThinkingLevel } from "../config.js";
-import { configureOpenAICompatibleEnv, getOpenAICompatibleModel } from "./openai-compatible.js";
+import { configureOpenAICompatibleEnv, getOpenAICompatibleModel, OPENAI_COMPAT_PROVIDER } from "./openai-compatible.js";
 
 export class PiAiClient implements LlmClient {
   constructor(
@@ -56,6 +56,10 @@ export class PiAiClient implements LlmClient {
 }
 
 function normalizeProvider(provider: string): KnownProvider {
+  // openai-compatible is resolved by getOpenAICompatibleModel (which returns a
+  // model whose internal provider is "openai"), so it never reaches getModel;
+  // let it pass the known-provider gate instead of throwing.
+  if (provider === OPENAI_COMPAT_PROVIDER) return provider as KnownProvider;
   const known = getProviders();
   if (known.includes(provider as KnownProvider)) return provider as KnownProvider;
   throw new Error(`Unknown pi-ai provider: ${provider}. Known providers: ${known.join(", ")}`);

@@ -4260,10 +4260,25 @@ function availableProviders(): string[] {
   } catch {
     pi = [];
   }
-  return [...new Set([...pi, ...CLI_FALLBACK_PROVIDERS])].sort();
+  // Surface openai-compatible as its own selectable type (its models come from
+  // FLOUNDER_OPENAI_COMPAT_* env, resolved in availableModels).
+  return [...new Set([...pi, ...CLI_FALLBACK_PROVIDERS, OPENAI_COMPAT_PROVIDER])].sort();
 }
 
 function availableModels(provider: string): Array<{ id: string; name: string; reasoning: boolean; thinkingLevels: ModelThinkingLevel[] }> {
+  if (provider === OPENAI_COMPAT_PROVIDER) {
+    // pi-ai has no catalog for this synthetic provider; the single model comes
+    // from FLOUNDER_OPENAI_COMPAT_* env. Empty list until it is configured.
+    const compatId = openAICompatibleModelId();
+    const compat = compatId ? getOpenAICompatibleModel(provider, compatId) : undefined;
+    if (!compat) return [];
+    return [{
+      id: compat.id,
+      name: compat.name,
+      reasoning: Boolean(compat.reasoning),
+      thinkingLevels: getSupportedThinkingLevels(compat),
+    }];
+  }
   if (provider === "claude-code") {
     return [
       { id: "opus", name: "Opus (latest)", reasoning: true, thinkingLevels: ["low", "medium", "high", "xhigh"] as ModelThinkingLevel[] },
@@ -4279,16 +4294,6 @@ function availableModels(provider: string): Array<{ id: string; name: string; re
       reasoning: Boolean((m as { reasoning?: unknown }).reasoning),
       thinkingLevels: getSupportedThinkingLevels(m),
     }));
-    const compatId = openAICompatibleModelId();
-    const compat = compatId ? getOpenAICompatibleModel(provider, compatId) : undefined;
-    if (provider === OPENAI_COMPAT_PROVIDER && compat && !out.some((m) => m.id === compat.id)) {
-      out.unshift({
-        id: compat.id,
-        name: compat.name,
-        reasoning: Boolean(compat.reasoning),
-        thinkingLevels: getSupportedThinkingLevels(compat),
-      });
-    }
     return out;
   } catch {
     return [];

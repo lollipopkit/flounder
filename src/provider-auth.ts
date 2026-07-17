@@ -32,7 +32,8 @@ const EXPECTED_ENV: Record<string, string[]> = {
   moonshotai: ["MOONSHOT_API_KEY"],
   "moonshotai-cn": ["MOONSHOT_API_KEY"],
   nvidia: ["NVIDIA_API_KEY"],
-  openai: ["OPENAI_API_KEY", "or FLOUNDER_OPENAI_COMPAT_API_KEY + FLOUNDER_OPENAI_COMPAT_BASE_URL + FLOUNDER_OPENAI_COMPAT_MODEL"],
+  openai: ["OPENAI_API_KEY"],
+  "openai-compatible": ["FLOUNDER_OPENAI_COMPAT_API_KEY (or OPENAI_API_KEY)", "FLOUNDER_OPENAI_COMPAT_BASE_URL", "FLOUNDER_OPENAI_COMPAT_MODEL"],
   openrouter: ["OPENROUTER_API_KEY"],
   opencode: ["OPENCODE_API_KEY"],
   "opencode-go": ["OPENCODE_API_KEY"],
@@ -80,7 +81,7 @@ export function knownRuntimeProviders(): string[] {
   } catch {
     piProviders = [];
   }
-  return [...new Set([...piProviders, ...LOCAL_FALLBACK_PROVIDERS])].sort();
+  return [...new Set([...piProviders, ...LOCAL_FALLBACK_PROVIDERS, OPENAI_COMPAT_PROVIDER])].sort();
 }
 
 export async function providerAuthStatus(provider: string): Promise<ProviderAuthStatus> {

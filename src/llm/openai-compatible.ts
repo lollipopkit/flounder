@@ -1,6 +1,11 @@
 import type { Model } from "@earendil-works/pi-ai";
 
-export const OPENAI_COMPAT_PROVIDER = "openai";
+// UI/config-facing provider id: shown as its own type in the provider list.
+export const OPENAI_COMPAT_PROVIDER = "openai-compatible";
+// Internal provider id stamped on the model object. pi-ai routes auth/base-url
+// off model.provider (getEnvApiKey -> OPENAI_API_KEY), so this MUST stay a
+// provider pi-ai knows ("openai"); only the outward-facing label is decoupled.
+const OPENAI_COMPAT_MODEL_PROVIDER = "openai";
 
 export function configureOpenAICompatibleEnv(): void {
   const apiKey = clean(process.env.FLOUNDER_OPENAI_COMPAT_API_KEY);
@@ -28,7 +33,7 @@ export function getOpenAICompatibleModel(provider: string, modelId?: string): Mo
     id,
     name: process.env.FLOUNDER_OPENAI_COMPAT_NAME || `OpenAI-compatible ${id}`,
     api: "openai-completions",
-    provider: OPENAI_COMPAT_PROVIDER,
+    provider: OPENAI_COMPAT_MODEL_PROVIDER,
     baseUrl,
     reasoning: process.env.FLOUNDER_OPENAI_COMPAT_REASONING === "1",
     input: readInputModes(),

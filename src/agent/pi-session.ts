@@ -10,7 +10,7 @@ import { AUDIT_CONFIRM_SYSTEM, AUDIT_PREPARE_SYSTEM, DISCOVERY_BACKLOG_RULES, MA
 import { describeAction, readScratchScopes, scratchHasFindings, scratchHasFindingsArtifact, type AgentTool, type ToolContext } from "./tools.js";
 import { SCOPE_OUTCOME_FILE, scratchHasScopeOutcome } from "./scope-outcomes.js";
 import { flounderAgentDir } from "../provider-auth.js";
-import { configureOpenAICompatibleEnv, getOpenAICompatibleModel } from "../llm/openai-compatible.js";
+import { configureOpenAICompatibleEnv, getOpenAICompatibleModel, OPENAI_COMPAT_PROVIDER } from "../llm/openai-compatible.js";
 
 // Continuous-session driver (point 5). Instead of re-driving a stateless
 // complete() once per step — which re-sends the whole transcript every turn and
@@ -31,6 +31,9 @@ export function isPiSessionProvider(provider: string): boolean {
   // CLI fallbacks and the mock are driven by the legacy complete() loop; only
   // real pi-ai providers can run a continuous AgentSession.
   if (provider === "claude-code" || provider === "codex-cli" || provider === "mock") return false;
+  // openai-compatible is our own label over the openai-completions API; it is
+  // not in getProviders() but drives a real AgentSession via its model object.
+  if (provider === OPENAI_COMPAT_PROVIDER) return true;
   try {
     return getProviders().includes(provider as never);
   } catch {

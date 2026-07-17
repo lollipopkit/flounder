@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import test from "node:test";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { toFindingRow } from "../dist/db/record.js";
 import { MetadataStore } from "../dist/db/store.js";
 
@@ -18,6 +20,121 @@ async function tempDb() {
 async function tempDbPath() {
   const dir = await mkdtemp(path.join(os.tmpdir(), "flounder-db-"));
   return { dir, dbPath: path.join(dir, "flounder.db") };
+}
+
+test("store: pre-release evaluation tables upgrade before current indexes are created", async () => {
+  const { dbPath } = await tempDbPath();
+  const legacy = new DatabaseSync(dbPath);
+  legacy.exec(`
+    CREATE TABLE run_group(
+      id INTEGER PRIMARY KEY,
+      uuid TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL UNIQUE,
+      kind TEXT NOT NULL,
+      state TEXT NOT NULL,
+      config_json TEXT,
+      budget_json TEXT,
+      summary_json TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      started_at TEXT,
+      finished_at TEXT
+    );
+    CREATE TABLE work_item(
+      id INTEGER PRIMARY KEY,
+      uuid TEXT NOT NULL UNIQUE,
+      run_group_id INTEGER NOT NULL,
+      item_key TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      state TEXT NOT NULL,
+      outcome TEXT,
+      target_bundle_json TEXT,
+      material_policy_json TEXT,
+      evidence_gate_json TEXT,
+      result_json TEXT,
+      project_id INTEGER,
+      run_id INTEGER,
+      finding_id INTEGER,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      started_at TEXT,
+      finished_at TEXT,
+      UNIQUE(run_group_id, item_key)
+    );
+    CREATE TABLE work_item_attempt(
+      id INTEGER PRIMARY KEY,
+      work_item_id INTEGER NOT NULL,
+      attempt_number INTEGER NOT NULL,
+      job_id INTEGER NOT NULL,
+      state TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(work_item_id, attempt_number),
+      UNIQUE(job_id)
+    );
+    INSERT INTO run_group(id, uuid, name, kind, state, created_at, updated_at, finished_at)
+    VALUES (1, 'legacy-group', 'legacy evaluation', 'evaluation', 'finished', '2026-01-01T00:00:00.000Z', '2026-01-01T00:01:00.000Z', '2026-01-01T00:01:00.000Z');
+    INSERT INTO work_item(id, uuid, run_group_id, item_key, kind, state, outcome, target_bundle_json, material_policy_json, evidence_gate_json, result_json, created_at, updated_at, finished_at)
+    VALUES (1, 'legacy-item', 1, 'case-1', 'benchmark-case', 'finished', 'no_findings',
+      '{"target":"legacy","targetClass":"logic","sourcePaths":["src"],"corpusPaths":[]}',
+      '{"posture":"blind","materials":[]}',
+      '{"kind":"benchmark-oracle","expectedOutcome":"reject-positive","requiresDifferential":false,"requiresRefutation":true,"networkPolicy":"sealed"}',
+      '{"accepted":true}', '2026-01-01T00:00:00.000Z', '2026-01-01T00:01:00.000Z', '2026-01-01T00:01:00.000Z');
+  `);
+  legacy.close();
+
+  const store = new MetadataStore(dbPath);
+  const group = store.getRunGroupByUuid("legacy-group");
+  assert.equal(group.parallelism, 1);
+  assert.equal(group.ended_at, "2026-01-01T00:01:00.000Z");
+  const item = store.getWorkItem(1);
+  assert.equal(item.job_id, null);
+  assert.equal(item.ended_at, "2026-01-01T00:01:00.000Z");
+  assert.match(String(item.evidence_contract_json), /reject-positive/);
+  assert.deepEqual(store.listWorkItemAttempts(1), []);
+  const migrated = new DatabaseSync(dbPath, { readOnly: true });
+  const attemptColumns = migrated.prepare("PRAGMA table_info(work_item_attempt)").all().map((row) => row.name);
+  migrated.close();
+  assert.equal(attemptColumns.includes("run_id"), true);
+  store.close();
+});
+
+test("store: harness score settlement cannot overwrite a replaced candidate", async () => {
+  const db = await tempDb();
+  const baseline = db.createRunGroup({ name: "harness baseline" });
+  const firstCandidate = db.createRunGroup({ name: "harness candidate one" });
+  const replacement = db.createRunGroup({ name: "harness candidate two" });
+  const experiment = db.createHarnessExperiment({
+    name: "candidate replacement race",
+    baselineRunGroupId: baseline.id,
+    candidateRunGroupId: firstCandidate.id,
+    editableFiles: ["src/agent/prompts.ts"],
+    promotionPolicy: { minimumSamplesPerClass: 2, minimumImprovedCases: 1, requireAllControlsPass: true, maxBlockedRate: 0, maxDurationRatio: 1.25, maxAttemptRatio: 1.25 },
+    failurePatterns: [],
+    preservedBehaviors: [],
+    state: "evaluating",
+  });
+
+  assert.equal(db.attachHarnessExperimentCandidate(experiment.id, replacement.id), true);
+  assert.equal(db.settleHarnessExperiment(experiment.id, firstCandidate.id, { decision: "promote" }, "promote"), false);
+  assert.equal(db.getHarnessExperimentById(experiment.id).decision, null);
+  assert.equal(db.settleHarnessExperiment(experiment.id, replacement.id, { decision: "reject" }, "reject"), true);
+  assert.equal(db.getHarnessExperimentById(experiment.id).decision, "reject");
+  db.close();
+});
+
+function waitForChild(child) {
+  return new Promise((resolve, reject) => {
+    let stderr = "";
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("exit", (code, signal) => {
+      if (code === 0) resolve();
+      else reject(new Error(`concurrent store process failed (${signal ?? code}): ${stderr}`));
+    });
+  });
 }
 
 test("store: project + run lifecycle is recorded and queryable", async () => {
@@ -48,6 +165,54 @@ test("store: project + run lifecycle is recorded and queryable", async () => {
   assert.equal(db.getProjectById(projectId).uuid, uuid);
   assert.equal(db.getProjectById(projectId).dir, uuid);
   assert.equal(db.listProjects().length, 1);
+  db.close();
+});
+
+test("store: evaluation tracking projects are isolated from the default project list", async () => {
+  const db = await tempDb();
+  db.upsertProject({ name: "operator-project" });
+  db.upsertProject({ name: "evaluation:item-1", origin: "evaluation" });
+
+  assert.deepEqual(db.listProjects().map((project) => project.name), ["operator-project"]);
+  assert.deepEqual(db.listProjects({ origin: "evaluation" }).map((project) => project.name), ["evaluation:item-1"]);
+  assert.equal(db.countProjects({ origin: "all" }), 2);
+  db.close();
+});
+
+test("store: global findings are source-filtered with evaluation provenance", async () => {
+  const db = await tempDb();
+  const projectId = db.upsertProject({ name: "product" });
+  const projectRun = db.startRun({ projectId, kind: "run", runDir: "/runs/product" });
+  db.upsertFindings(projectId, projectRun, [{ findingKey: "product-finding", title: "Product finding", status: "confirmed-executable" }]);
+
+  const evaluationId = db.upsertProject({ name: "evaluation:item-2", origin: "evaluation" });
+  const evaluationRun = db.startRun({ projectId: evaluationId, kind: "verify", runDir: "/runs/evaluation" });
+  db.upsertFindings(evaluationId, evaluationRun, [{ findingKey: "evaluation-finding", title: "Evaluation finding", status: "confirmed-differential" }]);
+
+  assert.deepEqual(db.listGlobalFindings().map((finding) => finding.finding_key), ["product-finding"]);
+  assert.deepEqual(db.listGlobalFindings({ source: "evaluation" }).map((finding) => finding.finding_key), ["evaluation-finding"]);
+  assert.equal(db.listGlobalFindings({ source: "evaluation" })[0].source, "evaluation");
+  assert.equal(db.listGlobalFindings({ source: "all" }).length, 2);
+  db.close();
+});
+
+test("store: startup hides pre-isolation projects that contain only evaluation runs", async () => {
+  const { dbPath } = await tempDbPath();
+  let db = new MetadataStore(dbPath);
+  const projectId = db.upsertProject({ name: "legacy-evaluation-target" });
+  const runId = db.startRun({ projectId, kind: "run", runDir: "/runs/legacy-evaluation" });
+  const group = db.createRunGroup({ name: "legacy-evaluation" });
+  const [workItem] = db.addWorkItems(group.id, [{ itemKey: "legacy", kind: "benchmark-case", targetBundle: {}, materialPolicy: {}, evidenceContract: {} }]);
+  const jobId = db.enqueueJob("legacy-evaluation-target", { verb: "run" });
+  assert.equal(db.attachWorkItemJob(workItem.id, jobId), true);
+  assert.equal(db.claimJob(db.createDaemonToken("legacy-evaluation-daemon").id)?.id, jobId);
+  db.setJobRun(jobId, runId);
+  db.close();
+
+  db = new MetadataStore(dbPath);
+  assert.equal(db.getProject("legacy-evaluation-target").origin, "evaluation");
+  assert.equal(db.listProjects().length, 0);
+  assert.equal(db.listProjects({ origin: "evaluation" }).length, 1);
   db.close();
 });
 
@@ -92,6 +257,114 @@ test("store: stage timing preserves startedAt across updates", async () => {
   db.close();
 });
 
+test("store: discovery health and backlog are persisted and operator-actionable", async () => {
+  const db = await tempDb();
+  const projectId = db.upsertProject({ name: "discovery-project" });
+  const runId = db.startRun({ projectId, kind: "run", runDir: "/runs/discovery-1" });
+
+  db.recordRunHealth(runId, {
+    status: "needs-resource",
+    reasons: ["1 resource request blocks confirmation"],
+    signals: { toolSteps: 9, resourceRequests: 1 },
+  });
+  db.replaceScopes(projectId, [
+    { scopeId: "S1", title: "Withdrawals must bind signer", location: "src/Vault.sol:10", status: "pending", source: "followup", parentScopeId: "S0" },
+  ]);
+  db.replaceDiscoveryBacklog(projectId, runId, [
+    { kind: "coverage-gap", status: "open", scopeId: "S1", title: "Replay domain not audited", location: "src/Vault.sol:10", reason: "Budget ended first", nextAction: "Dig the follow-up scope", priority: "high", payload: { id: "G1" } },
+    { kind: "resource-request", status: "open", title: "Foundry cache", location: "dependency", reason: "Build needs dependency install", nextAction: "Run forge install", priority: "high", payload: { id: "R1" } },
+  ]);
+
+  const health = db.latestRunHealth(projectId);
+  assert.equal(health.health_status, "needs-resource");
+  assert.deepEqual(JSON.parse(health.health_reasons_json), ["1 resource request blocks confirmation"]);
+  assert.equal(JSON.parse(health.health_signals_json).toolSteps, 9);
+
+  const scope = db.listScopes(projectId)[0];
+  assert.equal(scope.source, "followup");
+  assert.equal(scope.parent_scope_id, "S0");
+
+  assert.deepEqual(db.discoveryBacklogCounts(projectId), {
+    total: 2,
+    open: 2,
+    "coverage-gap:open": 1,
+    "coverage-gap": 1,
+    "resource-request:open": 1,
+    "resource-request": 1,
+  });
+  const resource = db.listDiscoveryBacklog(projectId, { kind: "resource-request", status: "open" })[0];
+  assert.equal(resource.title, "Foundry cache");
+  assert.equal(JSON.parse(resource.payload_json).id, "R1");
+
+  assert.equal(db.setDiscoveryBacklogStatus(resource.id, "resolved"), true);
+  assert.equal(db.discoveryBacklogCounts(projectId)["resource-request:resolved"], 1);
+  assert.equal(db.discoveryBacklogCounts(projectId).open, 1);
+
+  db.deleteRun(runId);
+  assert.equal(db.latestRunHealth(projectId), undefined);
+  assert.equal(db.discoveryBacklogCounts(projectId).total, 0);
+  assert.equal(db.listScopes(projectId).length, 1);
+  db.close();
+});
+
+test("store: a newer backlog snapshot supersedes only the identical open action", async () => {
+  const db = await tempDb();
+  const projectId = db.upsertProject({ name: "backlog-reconciliation" });
+  const runId = db.startRun({ projectId, kind: "run", runDir: "/runs/reconcile-1" });
+  db.replaceDiscoveryBacklog(projectId, runId, [
+    { kind: "coverage-gap", status: "open", scopeId: "S1", title: "Complete S1", location: "dig", reason: "Incomplete" },
+    { kind: "coverage-gap", status: "open", scopeId: "S1", title: "Review authority edge", location: "dig", reason: "Unresolved" },
+  ]);
+
+  const nextRunId = db.startRun({ projectId, kind: "run", runDir: "/runs/reconcile-2" });
+  db.replaceDiscoveryBacklog(projectId, nextRunId, [
+    { kind: "coverage-gap", status: "resolved", scopeId: "S1", title: "Complete S1", location: "dig", reason: "Complete" },
+  ]);
+
+  const all = db.listDiscoveryBacklog(projectId, { status: "all" });
+  assert.equal(all.filter((row) => row.title === "Complete S1" && row.status === "open").length, 0);
+  assert.equal(all.filter((row) => row.title === "Complete S1" && row.status === "resolved").length, 2);
+  assert.equal(all.filter((row) => row.title === "Review authority edge" && row.status === "open").length, 1);
+  db.close();
+});
+
+test("store: audited scopes resolve exact coverage backlog rows, including persisted legacy rows", async () => {
+  const { dbPath } = await tempDbPath();
+  let db = new MetadataStore(dbPath);
+  const projectId = db.upsertProject({ name: "scope-backlog-reconciliation" });
+  const runId = db.startRun({ projectId, kind: "run", runDir: "/runs/scope-backlog-1" });
+  db.replaceScopes(projectId, [
+    { scopeId: "S1", title: "Settlement coverage", status: "pending" },
+  ]);
+  db.replaceDiscoveryBacklog(projectId, runId, [
+    { kind: "followup-scope", status: "open", scopeId: "S1", title: "Audit settlement", location: "src/Settle.sol" },
+    { kind: "coverage-gap", status: "open", scopeId: "S1", title: "Complete settlement", location: "src/Settle.sol" },
+    { kind: "resource-request", status: "open", scopeId: "S1", title: "Install compiler", location: "toolchain" },
+  ]);
+
+  db.replaceScopes(projectId, [
+    { scopeId: "S1", title: "Settlement coverage", status: "audited" },
+  ]);
+  let rows = db.listDiscoveryBacklog(projectId, { status: "all" });
+  assert.equal(rows.find((row) => row.kind === "followup-scope").status, "resolved");
+  assert.equal(rows.find((row) => row.kind === "coverage-gap").status, "resolved");
+  assert.equal(rows.find((row) => row.kind === "resource-request").status, "open");
+  db.close();
+
+  // Simulate a database written by an older release: the scope is complete but
+  // its exact coverage backlog rows were left open. Startup migration repairs it.
+  const legacy = new DatabaseSync(dbPath);
+  legacy.exec("UPDATE discovery_backlog SET status = 'open' WHERE kind IN ('followup-scope', 'coverage-gap')");
+  legacy.close();
+
+  db = new MetadataStore(dbPath);
+  rows = db.listDiscoveryBacklog(projectId, { status: "all" });
+  assert.equal(rows.find((row) => row.kind === "followup-scope").status, "resolved");
+  assert.equal(rows.find((row) => row.kind === "coverage-gap").status, "resolved");
+  assert.equal(rows.find((row) => row.kind === "resource-request").status, "open");
+  db.close();
+});
+
 test("store: finding status transitions land on a timeline", async () => {
   const db = await tempDb();
   const projectId = db.upsertProject({ name: "p" });
@@ -118,6 +391,68 @@ test("store: finding status transitions land on a timeline", async () => {
   db.upsertFindings(projectId, runId, [{ findingKey: "F1", title: "unbound input", status: "refuted" }]);
   assert.equal(db.findingTimeline(findings[0].id).length, 3);
   db.close();
+});
+
+test("store: duplicate tracking preserves the canonical finding link", async () => {
+  const db = await tempDb();
+  const projectId = db.upsertProject({ name: "duplicates" });
+  const runId = db.startRun({ projectId, kind: "run", runDir: "/runs/duplicates-1" });
+  db.upsertFindings(projectId, runId, [
+    { findingKey: "canonical", title: "router payment helper reentry", status: "confirmed-executable" },
+    { findingKey: "variant", title: "alternate reentry path", status: "confirmed-executable" },
+  ]);
+
+  const findings = db.listFindings(projectId).sort((a, b) => String(a.finding_key).localeCompare(String(b.finding_key)));
+  const canonical = findings.find((finding) => finding.finding_key === "canonical");
+  const variant = findings.find((finding) => finding.finding_key === "variant");
+  assert.ok(canonical);
+  assert.ok(variant);
+
+  assert.equal(db.setFindingTracking(variant.id, "duplicate", canonical.id), true);
+  const duplicate = db.getFinding(variant.id);
+  assert.equal(duplicate.tracking_status, "duplicate");
+  assert.equal(duplicate.duplicate_of_finding_id, canonical.id);
+
+  assert.equal(db.setFindingTracking(variant.id, "triaging"), true);
+  const reopened = db.getFinding(variant.id);
+  assert.equal(reopened.tracking_status, "triaging");
+  assert.equal(reopened.duplicate_of_finding_id, null);
+  db.close();
+});
+
+test("store: startup repairs orphan duplicate labels and flattens legacy duplicate chains", async () => {
+  const { dbPath } = await tempDbPath();
+  const db = new MetadataStore(dbPath);
+  const projectId = db.upsertProject({ name: "legacy-duplicate-integrity" });
+  const runId = db.startRun({ projectId, kind: "run", runDir: "/runs/legacy-duplicate-integrity" });
+  db.upsertFindings(projectId, runId, [
+    { findingKey: "canonical", title: "Canonical issue", status: "confirmed-executable" },
+    { findingKey: "linked", title: "Linked duplicate", status: "confirmed-executable" },
+    { findingKey: "chained", title: "Chained duplicate", status: "confirmed-executable" },
+    { findingKey: "orphan", title: "Orphan duplicate", status: "confirmed-executable" },
+  ]);
+  const initial = db.listFindings(projectId);
+  const canonical = initial.find((finding) => finding.finding_key === "canonical");
+  const linked = initial.find((finding) => finding.finding_key === "linked");
+  const chained = initial.find((finding) => finding.finding_key === "chained");
+  const orphan = initial.find((finding) => finding.finding_key === "orphan");
+  assert.ok(canonical && linked && chained && orphan);
+  db.close();
+
+  const legacy = new DatabaseSync(dbPath);
+  legacy.prepare("UPDATE finding SET tracking_status = 'duplicate', duplicate_of_finding_id = ? WHERE id = ?").run(canonical.id, linked.id);
+  legacy.prepare("UPDATE finding SET tracking_status = 'duplicate', duplicate_of_finding_id = ? WHERE id = ?").run(linked.id, chained.id);
+  legacy.prepare("UPDATE finding SET tracking_status = 'duplicate', duplicate_of_finding_id = NULL WHERE id = ?").run(orphan.id);
+  legacy.close();
+
+  const repaired = new MetadataStore(dbPath);
+  assert.equal(repaired.getFinding(linked.id).duplicate_of_finding_id, canonical.id);
+  assert.equal(repaired.getFinding(chained.id).duplicate_of_finding_id, canonical.id);
+  assert.equal(repaired.getFinding(orphan.id).tracking_status, null);
+  assert.equal(repaired.getFinding(orphan.id).duplicate_of_finding_id, null);
+  assert.equal(repaired.setFindingTracking(orphan.id, "duplicate"), false, "new orphan duplicate labels are rejected");
+  assert.equal(repaired.setFindingTracking(orphan.id, "duplicate", linked.id), false, "new duplicate chains are rejected");
+  repaired.close();
 });
 
 test("record: verify REFUTED verdicts become structured refuted rows", () => {
@@ -226,6 +561,39 @@ test("store: startup migration repairs verify artifact refutations and report ru
   db.close();
 });
 
+test("store: concurrent startup serializes additive schema migrations", async () => {
+  const { dir, dbPath } = await tempDbPath();
+  const startFile = path.join(dir, "start");
+  const store = new MetadataStore(dbPath);
+  store.close();
+
+  const legacy = new DatabaseSync(dbPath);
+  legacy.exec("ALTER TABLE daemon DROP COLUMN workspace");
+  legacy.close();
+
+  const moduleUrl = new URL("../dist/db/store.js", import.meta.url).href;
+  const childSource = `
+    import { existsSync } from "node:fs";
+    import { MetadataStore } from ${JSON.stringify(moduleUrl)};
+    while (!existsSync(process.env.START_FILE)) {}
+    const store = new MetadataStore(process.env.DB_PATH);
+    store.close();
+  `;
+  const children = Array.from({ length: 8 }, () => spawn(
+    process.execPath,
+    ["--input-type=module", "--eval", childSource],
+    { env: { ...process.env, DB_PATH: dbPath, START_FILE: startFile }, stdio: ["ignore", "ignore", "pipe"] },
+  ));
+  const completions = children.map(waitForChild);
+  await writeFile(startFile, "go");
+  await Promise.all(completions);
+
+  const migrated = new DatabaseSync(dbPath, { readOnly: true });
+  const columns = migrated.prepare("PRAGMA table_info(daemon)").all().map((row) => row.name);
+  migrated.close();
+  assert.equal(columns.includes("workspace"), true);
+});
+
 test("store: finding aggregates + pagination + filter scale to many findings", async () => {
   const db = await tempDb();
   const projectId = db.upsertProject({ name: "big" });
@@ -289,7 +657,7 @@ test("store: setScopeStatus marks a scope deferred (skipped) and counts it", asy
   db.close();
 });
 
-test("store: daemon tokens + job queue (claim is FIFO and one-shot; cancel is observable)", async () => {
+test("store: daemon tokens + job queue prioritizes project work and stays FIFO within each class", async () => {
   const db = await tempDb();
   const { token } = db.createDaemonToken("local");
   const { token: otherToken } = db.createDaemonToken("remote");
@@ -298,6 +666,16 @@ test("store: daemon tokens + job queue (claim is FIFO and one-shot; cancel is ob
   const daemonId = Number(db.getDaemonByToken(token).id);
   const otherDaemonId = Number(db.getDaemonByToken(otherToken).id);
 
+  const group = db.createRunGroup({ name: "background-evaluation" });
+  const [workItem] = db.addWorkItems(group.id, [{
+    itemKey: "case-1",
+    kind: "benchmark-case",
+    targetBundle: {},
+    materialPolicy: {},
+    evidenceContract: {},
+  }]);
+  const evaluationJob = db.enqueueJob("evaluation:item-1", { verb: "run" });
+  assert.equal(db.attachWorkItemJob(workItem.id, evaluationJob), true);
   const j1 = db.enqueueJob("proj", { verb: "run" });
   const pinned = db.enqueueJob("proj", { verb: "audit" }, otherDaemonId);
   const j2 = db.enqueueJob("proj", { verb: "map" });
@@ -305,16 +683,33 @@ test("store: daemon tokens + job queue (claim is FIFO and one-shot; cancel is ob
   assert.equal(claim1.id, j1); // FIFO
   assert.deepEqual(claim1.spec, { verb: "run" });
   assert.equal(db.getJob(j1).status, "dispatched");
+  assert.equal(db.claimJob(daemonId).id, evaluationJob, "other projects can use spare daemon capacity while proj is active");
+  assert.equal(db.claimJob(daemonId), undefined, "a second job for the active project stays queued");
+  assert.equal(db.claimJob(otherDaemonId), undefined, "same-project serialization applies across daemons");
+  db.setJobStatus(j1, "done");
   assert.equal(db.claimJob(daemonId).id, j2);
+  assert.equal(db.claimJob(otherDaemonId), undefined, "the pinned same-project job waits for j2 to settle");
+  db.setJobStatus(j2, "done");
+  assert.equal(db.claimJob(otherDaemonId).id, pinned); // pinned work waits for its selected daemon and prior project work
   assert.equal(db.claimJob(daemonId), undefined); // queue drained
-  assert.equal(db.claimJob(otherDaemonId).id, pinned); // pinned work waits for its selected daemon
 
-  db.requestJobCancel(j1);
-  assert.deepEqual(db.canceledJobIds(), [j1]); // a daemon polls this to abort
-  db.setJobStatus(j1, "killed");
+  db.requestJobCancel(evaluationJob);
+  assert.deepEqual(db.canceledJobIds(), [evaluationJob]); // a daemon polls this to abort
+  db.setJobStatus(evaluationJob, "killed");
   assert.deepEqual(db.canceledJobIds(), []); // no longer running → not reported
   assert.equal(db.cancelJob(pinned), true); // queued/dispatched/running jobs are operator-cancelable
   assert.equal(db.getJob(pinned).status, "canceled");
+  db.close();
+});
+
+test("store: daemon terminal updates cannot overwrite an operator cancellation", async () => {
+  const db = await tempDb();
+  const { id: daemonId } = db.createDaemonToken("terminal-race");
+  const jobId = db.enqueueJob("proj", { verb: "run" }, daemonId);
+  assert.equal(db.claimJob(daemonId)?.id, jobId);
+  assert.equal(db.cancelJob(jobId), true);
+  assert.equal(db.setActiveJobTerminalStatus(jobId, "done"), false);
+  assert.equal(db.getJob(jobId).status, "canceled");
   db.close();
 });
 
@@ -372,6 +767,75 @@ test("store: confirm decisions are replaced per run, not duplicated", async () =
   db.close();
 });
 
+test("store: execution-equivalent confirm rows collapse linked findings without overriding operator tracking", async () => {
+  const db = await tempDb();
+  const projectId = db.upsertProject({ name: "execution-equivalent" });
+  const auditRun = db.startRun({ projectId, kind: "run", runDir: "/runs/equivalent-audit" });
+  db.upsertFindings(projectId, auditRun, [
+    { findingKey: "kpatha", title: "Variant A", status: "confirmed-differential" },
+    { findingKey: "kpathb", title: "Variant B", status: "confirmed-differential" },
+    { findingKey: "kpathc", title: "Variant C", status: "confirmed-differential" },
+  ]);
+  const before = db.listFindings(projectId);
+  const submitted = before.find((finding) => finding.finding_key === "kpathb");
+  const ignored = before.find((finding) => finding.finding_key === "kpathc");
+  db.setFindingTracking(submitted.id, "submitted");
+  db.setFindingTracking(ignored.id, "ignored");
+
+  const confirmRun = db.startRun({ projectId, kind: "confirm", runDir: "/runs/equivalent-confirm" });
+  db.upsertConfirmDecisions(projectId, confirmRun, [{
+    bug: "One execution-equivalent bug",
+    reproduced: "yes",
+    recommendation: "needs-human",
+    members: ["kpatha", "kpathb", "kpathc"],
+    mergedFrom: ["Variant A", "Variant B", "Variant C"],
+    evidenceLevel: "real-target-reproduced",
+    reproEvidence: "one fix neutralized every linked PoC against the real target",
+  }]);
+
+  const after = db.listFindings(projectId);
+  const openVariant = after.find((finding) => finding.finding_key === "kpatha");
+  const submittedAfter = after.find((finding) => finding.finding_key === "kpathb");
+  const ignoredAfter = after.find((finding) => finding.finding_key === "kpathc");
+  assert.equal(submittedAfter.tracking_status, "submitted");
+  assert.equal(submittedAfter.duplicate_of_finding_id, null);
+  assert.equal(openVariant.tracking_status, "duplicate");
+  assert.equal(openVariant.duplicate_of_finding_id, submittedAfter.id);
+  assert.equal(ignoredAfter.tracking_status, "ignored", "explicit operator decisions remain authoritative");
+  assert.equal(ignoredAfter.duplicate_of_finding_id, null);
+  db.close();
+});
+
+test("store: consolidation prefers an actionable canonical finding over an ignored variant", async () => {
+  const db = await tempDb();
+  const projectId = db.upsertProject({ name: "execution-equivalent-ignored" });
+  const auditRun = db.startRun({ projectId, kind: "run", runDir: "/runs/equivalent-ignored-audit" });
+  db.upsertFindings(projectId, auditRun, [
+    { findingKey: "kignored", title: "Ignored variant", status: "confirmed-differential" },
+    { findingKey: "kactionable", title: "Actionable variant", status: "confirmed-differential" },
+  ]);
+  const before = db.listFindings(projectId);
+  db.setFindingTracking(before.find((finding) => finding.finding_key === "kignored").id, "ignored");
+  const actionable = before.find((finding) => finding.finding_key === "kactionable");
+
+  const confirmRun = db.startRun({ projectId, kind: "confirm", runDir: "/runs/equivalent-ignored-confirm" });
+  db.upsertConfirmDecisions(projectId, confirmRun, [{
+    bug: "One bug",
+    reproduced: "yes",
+    recommendation: "needs-human",
+    members: ["kignored", "kactionable"],
+    mergedFrom: ["Ignored variant", "Actionable variant"],
+    evidenceLevel: "real-target-reproduced",
+    reproEvidence: "one fix neutralized both PoCs",
+  }]);
+
+  const after = db.listFindings(projectId);
+  assert.equal(after.find((finding) => finding.finding_key === "kignored").tracking_status, "ignored");
+  assert.equal(after.find((finding) => finding.finding_key === "kactionable").duplicate_of_finding_id, null);
+  assert.equal(after.find((finding) => finding.finding_key === "kactionable").id, actionable.id);
+  db.close();
+});
+
 test("store: confirm decisions persist decision reports without overwriting linked finding reports", async () => {
   const db = await tempDb();
   const projectId = db.upsertProject({ name: "p" });
@@ -396,6 +860,18 @@ test("store: confirm decisions persist decision reports without overwriting link
       reproCommandId: "cmd_1",
       novelty: "novel",
       humanGates: "venue scope still needs human review",
+      engagementProfile: {
+        policy_kind: "bug_bounty",
+        platform: "custom bounty portal",
+        selected_by: "Official policy page was supplied with the target.",
+      },
+      adjudication: {
+        gates: [
+          { id: "scope", status: "pass", evidence: "Asset is listed in scope." },
+          { id: "live_impact", status: "unknown", evidence: "Live funded exposure was not established." },
+        ],
+        payout_estimate: { status: "unknown", confidence: "low", basis: "Live impact gate is unresolved." },
+      },
       reportMarkdown: "# Missing verifier binding\n\n## Summary\nFormal report.",
     },
   ]);
@@ -407,10 +883,345 @@ test("store: confirm decisions persist decision reports without overwriting link
   assert.equal(decision.repro_evidence, "purpose=confirm command cmd_1 reproduced the real target effect");
   assert.equal(decision.repro_command_id, "cmd_1");
   assert.equal(decision.novelty, "novel");
-  assert.equal(decision.human_gates, "venue scope still needs human review");
+  assert.match(decision.human_gates, /venue scope still needs human review/);
+  assert.match(decision.human_gates, /Framework blocked submit-candidate/);
+  assert.equal(decision.recommendation, "needs-human");
+  assert.equal(JSON.parse(decision.engagement_profile_json).policy_kind, "bug_bounty");
+  assert.equal(JSON.parse(decision.adjudication_json).gates[1].status, "unknown");
   assert.equal(decision.severity, "high");
   assert.equal(decision.evidence_level, "real-target-reproduced");
-  assert.equal(decision.submission_confidence, "high");
+  assert.equal(decision.submission_confidence, "medium");
   assert.match(decision.report_markdown, /^# Missing verifier binding/);
+  db.close();
+});
+
+test("store: structured adjudication gates keep bounty confidence conservative", async () => {
+  const db = await tempDb();
+  const projectId = db.upsertProject({ name: "p" });
+  const auditRun = db.startRun({ projectId, kind: "run", runDir: "/runs/p-audit-1" });
+  db.upsertFindings(projectId, auditRun, [
+    {
+      findingKey: "kbounty",
+      title: "Live-funded bounty candidate",
+      severity: "critical",
+      status: "confirmed-executable",
+    },
+  ]);
+  const confirmRun = db.startRun({ projectId, kind: "confirm", runDir: "/runs/p-confirm-1" });
+  db.upsertConfirmDecisions(projectId, confirmRun, [
+    {
+      bug: "Live-funded bounty candidate",
+      reproduced: "yes",
+      recommendation: "submit-candidate",
+      members: ["kbounty"],
+      reproEvidence: "purpose=confirm command cmd_2 reproduced the real target effect on a local fork of the current deployment",
+      reproCommandId: "cmd_2",
+      novelty: "novel",
+      engagementProfile: { policy_kind: "bug_bounty", confidence: "medium" },
+      adjudication: {
+        gates: [
+          { id: "scope", status: "pass", evidence: "Listed asset." },
+          { id: "live_impact", status: "needs-human", evidence: "Funds at risk still need exact on-chain sizing." },
+        ],
+        payout_estimate: { status: "unknown", basis: "Do not estimate until live impact is sized." },
+      },
+    },
+  ]);
+
+  const [decision] = db.listConfirmDecisions(projectId);
+  assert.equal(decision.recommendation, "needs-human");
+  assert.match(decision.human_gates, /Framework blocked submit-candidate/);
+  assert.equal(decision.evidence_level, "local-fork-reproduced");
+  assert.equal(decision.submission_confidence, "medium");
+  db.close();
+});
+
+test("store: source-level confirm evidence is not promoted to real-target submission confidence", async () => {
+  const db = await tempDb();
+  const projectId = db.upsertProject({ name: "p" });
+  const auditRun = db.startRun({ projectId, kind: "run", runDir: "/runs/p-audit-1" });
+  db.upsertFindings(projectId, auditRun, [
+    {
+      findingKey: "ksourceonly",
+      title: "Mock-backed source reproduction",
+      severity: "high",
+      status: "confirmed-executable",
+    },
+  ]);
+  const confirmRun = db.startRun({ projectId, kind: "confirm", runDir: "/runs/p-confirm-1" });
+  db.upsertConfirmDecisions(projectId, confirmRun, [
+    {
+      bug: "Mock-backed source reproduction",
+      reproduced: "yes",
+      recommendation: "submit-candidate",
+      members: ["ksourceonly"],
+      reproEvidence: "Forge harness used published source and constrained mocks; this was source-level execution, not a live fork.",
+      humanGates: "Needs current deployment review and bounty eligibility confirmation.",
+    },
+  ]);
+
+  const [decision] = db.listConfirmDecisions(projectId);
+  assert.equal(decision.evidence_level, "source-only-local-confirmed");
+  assert.equal(decision.submission_confidence, "low");
+  assert.equal(decision.recommendation, "needs-human");
+  assert.match(decision.human_gates, /evidence level is source_only_local_confirmed|source-only-local-confirmed/);
+  const [finding] = db.listFindings(projectId);
+  assert.equal(finding.confirm_status, null);
+  db.close();
+});
+
+test("store: ambiguous reproduced decisions do not default to real-target evidence", async () => {
+  const db = await tempDb();
+  const projectId = db.upsertProject({ name: "p" });
+  const auditRun = db.startRun({ projectId, kind: "run", runDir: "/runs/p-audit-1" });
+  db.upsertFindings(projectId, auditRun, [
+    {
+      findingKey: "kambiguous",
+      title: "Ambiguous reproduction",
+      severity: "high",
+      status: "confirmed-executable",
+    },
+  ]);
+  const confirmRun = db.startRun({ projectId, kind: "confirm", runDir: "/runs/p-confirm-1" });
+  db.upsertConfirmDecisions(projectId, confirmRun, [
+    {
+      bug: "Ambiguous reproduction",
+      reproduced: "yes",
+      recommendation: "submit-candidate",
+      members: ["kambiguous"],
+      reproEvidence: "Prior settled row carried forward: cmd28 testAmbiguousPoC passed.",
+      reproCommandId: "cmd28",
+    },
+  ]);
+
+  const [decision] = db.listConfirmDecisions(projectId);
+  assert.equal(decision.evidence_level, "source-only-local-confirmed");
+  assert.equal(decision.submission_confidence, "low");
+  assert.equal(decision.recommendation, "needs-human");
+  const [finding] = db.listFindings(projectId);
+  assert.equal(finding.confirm_status, null);
+  assert.equal(db.countConfirmedBugs(projectId), 0);
+  db.close();
+});
+
+test("store: exact findings across runs keep one canonical row with occurrence and alias provenance", async () => {
+  const db = await tempDb();
+  const projectId = db.upsertProject({ name: "canonical" });
+  const firstRun = db.startRun({ projectId, kind: "run", runDir: "/runs/canonical-1", materialFingerprint: "sha256:same" });
+  assert.equal(db.getRun(firstRun).material_fingerprint, "sha256:same");
+  db.upsertFindings(projectId, firstRun, [{ findingKey: "kfirst", title: "Recipient is not bound", location: "src/Vault.sol:41", severity: "high", status: "suspected" }]);
+  const secondRun = db.startRun({ projectId, kind: "audit", runDir: "/runs/canonical-2", materialFingerprint: "sha256:same" });
+  db.upsertFindings(projectId, secondRun, [{ findingKey: "ksecond", title: "Recipient is not bound", location: "src/Vault.sol:41", severity: "high", status: "confirmed-executable" }]);
+
+  const rows = db.listFindings(projectId);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].finding_key, "kfirst", "the canonical key stays immutable");
+  assert.equal(rows[0].status, "confirmed-executable");
+  assert.equal(rows[0].occurrence_count, 2);
+  assert.equal(db.findingOccurrences(Number(rows[0].id)).length, 2);
+  assert.equal(db.setFindingConfirmStatus(projectId, "ksecond", "reproduced"), true, "a later occurrence key resolves through aliases");
+  assert.equal(db.getFinding(Number(rows[0].id)).confirm_status, "reproduced");
+  db.close();
+});
+
+test("store: repeated weaker rediscovery cannot take ownership and downgrade stronger evidence", async () => {
+  const db = await tempDb();
+  const projectId = db.upsertProject({ name: "canonical-evidence-owner" });
+  const firstRun = db.startRun({ projectId, kind: "run", runDir: "/runs/evidence-1", materialFingerprint: "sha256:same" });
+  db.upsertFindings(projectId, firstRun, [{ findingKey: "kfirst", title: "Quote leg ignores its risk class", location: "src/Provider.sol:41", severity: "high", status: "suspected" }]);
+  const verifyRun = db.startRun({ projectId, kind: "verify", runDir: "/runs/evidence-verify", materialFingerprint: "sha256:same" });
+  db.upsertFindings(projectId, verifyRun, [{
+    findingKey: "kverified",
+    title: "Quote leg ignores its risk class",
+    location: "src/Provider.sol:41",
+    severity: "high",
+    status: "confirmed-differential",
+    refutationStatus: "passed",
+    refutationReason: "The execution-backed claim survived independent review.",
+  }]);
+
+  const laterRun = db.startRun({ projectId, kind: "audit", runDir: "/runs/evidence-later", materialFingerprint: "sha256:same" });
+  const rediscovery = {
+    findingKey: "kverified",
+    title: "DISCHARGE OVERTURNED: Quote leg ignores its risk class",
+    location: "src/Provider.sol:41",
+    severity: "critical",
+    status: "suspected",
+  };
+  db.upsertFindings(projectId, laterRun, [rediscovery], "discharge-challenge");
+  db.upsertFindings(projectId, laterRun, [rediscovery], "run finalize");
+
+  const [finding] = db.listFindings(projectId);
+  assert.equal(finding.status, "confirmed-differential");
+  assert.equal(finding.run_id, verifyRun, "weaker evidence cannot take canonical ownership");
+  assert.equal(finding.title, "Quote leg ignores its risk class");
+  assert.equal(finding.refutation_status, "passed");
+  assert.equal(db.findingOccurrences(Number(finding.id)).length, 3, "weaker rediscovery remains durable provenance without duplicating checkpoints");
+  db.close();
+});
+
+test("store: completed finding identity migrations do not rewrite alias provenance on restart", async () => {
+  const { dbPath } = await tempDbPath();
+  const db = new MetadataStore(dbPath);
+  const projectId = db.upsertProject({ name: "stable-identity-migration" });
+  const runId = db.startRun({ projectId, kind: "run", runDir: "/runs/stable-identity" });
+  db.upsertFindings(projectId, runId, [{ findingKey: "stable-key", title: "Stable finding", location: "src/x.ts:1", status: "suspected" }]);
+  db.close();
+
+  const before = new DatabaseSync(dbPath);
+  before.prepare("UPDATE finding_key_alias SET updated_at = 'provenance-sentinel' WHERE alias_key = 'stable-key'").run();
+  before.close();
+
+  const reopened = new MetadataStore(dbPath);
+  reopened.close();
+  const after = new DatabaseSync(dbPath);
+  const alias = after.prepare("SELECT updated_at FROM finding_key_alias WHERE alias_key = 'stable-key'").get();
+  after.close();
+  assert.equal(alias.updated_at, "provenance-sentinel");
+});
+
+test("store: startup canonicalizes legacy confirm members through finding-key aliases", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "flounder-store-confirm-alias-"));
+  try {
+    let store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "confirm-member-alias" });
+    const auditRun = store.startRun({ projectId, kind: "audit", runDir: path.join(dir, "audit") });
+    store.upsertFindings(projectId, auditRun, [{
+      findingKey: "kcanonicalmember",
+      title: "Canonical member candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-executable",
+    }]);
+    const finding = store.queryFindings(projectId, { search: "Canonical member candidate" })[0];
+    const confirmRun = store.startRun({ projectId, kind: "confirm", runDir: path.join(dir, "confirm") });
+    store.upsertConfirmDecisions(projectId, confirmRun, [{
+      bug: "Canonical member candidate",
+      reproduced: "unknown",
+      recommendation: "needs-human",
+      members: ["klegacymember"],
+    }]);
+    store.upsertFindings(projectId, auditRun, [{
+      findingKey: "klegacymember",
+      originId: Number(finding.id),
+      title: "Canonical member candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-executable",
+    }]);
+    assert.deepEqual(JSON.parse(store.listConfirmDecisions(projectId)[0].members_json), ["klegacymember"]);
+    store.close();
+
+    store = MetadataStore.openForOutput(dir);
+    assert.deepEqual(JSON.parse(store.listConfirmDecisions(projectId)[0].members_json), ["kcanonicalmember"]);
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("store: blocked finding phases are idempotent until inputs change or an operator requests retry", async () => {
+  const db = await tempDb();
+  const projectId = db.upsertProject({ name: "attempts" });
+  const auditRun = db.startRun({ projectId, kind: "run", runDir: "/runs/attempts-audit" });
+  db.upsertFindings(projectId, auditRun, [{ findingKey: "kblocked", title: "Blocked claim", location: "x.ts:1", severity: "high", status: "suspected" }]);
+  const finding = db.listFindings(projectId)[0];
+  const verifyRun = db.startRun({ projectId, kind: "verify", runDir: "/runs/attempts-verify" });
+  db.recordFindingPhaseAttempt(projectId, verifyRun, { subjectType: "finding", subjectId: Number(finding.id), phase: "verify", inputFingerprint: "sha256:input-a", state: "blocked", outcome: "no-verdict", blocker: "toolchain unavailable" });
+
+  assert.equal(db.phaseEligible(projectId, "finding", Number(finding.id), "verify", "sha256:input-a"), false);
+  assert.equal(db.phaseEligible(projectId, "finding", Number(finding.id), "verify", "sha256:input-b"), true, "changed materials reopen the phase automatically");
+  assert.equal(db.requestFindingPhaseRetry(projectId, "finding", Number(finding.id), "verify"), true);
+  assert.equal(db.phaseEligible(projectId, "finding", Number(finding.id), "verify", "sha256:input-a"), true);
+
+  const retryRun = db.startRun({ projectId, kind: "verify", runDir: "/runs/attempts-retry" });
+  db.recordFindingPhaseAttempt(projectId, retryRun, { subjectType: "finding", subjectId: Number(finding.id), phase: "verify", inputFingerprint: "sha256:input-a", state: "running" });
+  db.recordFindingPhaseAttempt(projectId, retryRun, { subjectType: "finding", subjectId: Number(finding.id), phase: "verify", inputFingerprint: "sha256:input-a", state: "settled", outcome: "refuted" });
+  const attempts = db.listFindingPhaseAttempts("finding", Number(finding.id));
+  assert.deepEqual(attempts.map((attempt) => [attempt.attempt_number, attempt.state]), [[1, "blocked"], [2, "settled"]]);
+  db.close();
+});
+
+test("store: remote verify ownership survives later pipeline phases and artifact replay is idempotent", async () => {
+  const db = await tempDb();
+  const daemon = db.createDaemonToken("artifact-owner");
+  const projectId = db.upsertProject({ name: "artifact-replay" });
+  const jobId = db.enqueueJob("artifact-replay", { verb: "run", pipeline: true }, daemon.id);
+  assert.equal(db.claimJob(daemon.id).id, jobId);
+
+  const sourceRun = db.startRun({ projectId, kind: "run", runDir: "/runs/source", daemonId: daemon.id });
+  db.upsertFindings(projectId, sourceRun, [{
+    findingKey: "artifact-candidate",
+    title: "Artifact replay candidate",
+    location: "src/example.ts:1",
+    severity: "high",
+    status: "confirmed-executable",
+    reportPath: "/runs/source/report_f1.md",
+    reportMarkdown: "# stale report\n",
+  }]);
+  const finding = db.queryFindings(projectId, { search: "Artifact replay candidate" })[0];
+
+  const verifyRun = db.startRun({ projectId, kind: "audit", runDir: "/runs/verify", budgets: { verify: true }, daemonId: daemon.id });
+  db.setJobRun(jobId, verifyRun);
+  db.recordFindingPhaseAttempt(projectId, verifyRun, {
+    subjectType: "finding",
+    subjectId: Number(finding.id),
+    phase: "verify",
+    inputFingerprint: "sha256:artifact-replay",
+    state: "blocked",
+    blocker: "remote verdict was not ingested",
+    metrics: { findings: 1, steps: 3 },
+  });
+  db.finishRun(verifyRun, "error");
+
+  const reportRun = db.startRun({ projectId, kind: "report", runDir: "/runs/report", daemonId: daemon.id });
+  db.setJobRun(jobId, reportRun);
+  assert.equal(db.getJob(jobId).run_id, reportRun, "job.run_id remains the mutable active-phase pointer");
+  assert.equal(db.getRun(verifyRun).daemon_id, daemon.id, "the terminal verify keeps immutable executor ownership");
+
+  const work = db.listDaemonArtifactReconciliationRuns(daemon.id, 1);
+  assert.deepEqual(work.map((run) => run.id), [verifyRun]);
+  assert.equal(db.reconcileTerminalVerifyArtifacts(verifyRun, [{
+    originId: Number(finding.id),
+    title: "REFUTED: Artifact replay candidate",
+    location: "src/example.ts:1",
+    severity: "info",
+    confirmationStatus: "confirmed-executable",
+    evidence: "The executable check disproved the claim.",
+  }], 1), true);
+
+  const refuted = db.getFinding(Number(finding.id));
+  assert.equal(refuted.status, "refuted");
+  assert.equal(refuted.run_id, verifyRun);
+  assert.equal(refuted.report_path, null);
+  assert.equal(refuted.report_markdown, null);
+  const attempt = db.latestFindingPhaseAttempt("finding", Number(finding.id), "verify");
+  assert.equal(attempt.outcome, "refuted");
+  assert.equal(attempt.metrics_json, JSON.stringify({ findings: 1, steps: 3 }));
+  assert.equal(db.listDaemonArtifactReconciliationRuns(daemon.id, 1).length, 0);
+
+  const updatedAt = refuted.updated_at;
+  assert.equal(db.reconcileTerminalVerifyArtifacts(verifyRun, [], 1), true);
+  assert.equal(db.getFinding(Number(finding.id)).updated_at, updatedAt, "a versioned replay is a true no-op");
+  assert.equal(db.getJob(jobId).run_id, reportRun, "replay never rewrites the active job phase");
+  db.close();
+});
+
+test("store: legacy daemon ownership backfill uses only the run still linked by its job", async () => {
+  const { dbPath } = await tempDbPath();
+  let db = new MetadataStore(dbPath);
+  const daemon = db.createDaemonToken("legacy-owner");
+  const projectId = db.upsertProject({ name: "legacy-run-owner" });
+  const jobId = db.enqueueJob("legacy-run-owner", { verb: "run", pipeline: true }, daemon.id);
+  assert.equal(db.claimJob(daemon.id).id, jobId);
+  const olderPhase = db.startRun({ projectId, kind: "audit", runDir: "/runs/legacy-verify", budgets: { verify: true } });
+  db.setJobRun(jobId, olderPhase);
+  const currentPhase = db.startRun({ projectId, kind: "report", runDir: "/runs/legacy-report" });
+  db.setJobRun(jobId, currentPhase);
+  db.close();
+
+  db = new MetadataStore(dbPath);
+  assert.equal(db.getRun(olderPhase).daemon_id, null, "overwritten legacy phases are not attributed by unsafe inference");
+  assert.equal(db.getRun(currentPhase).daemon_id, daemon.id, "the exact current job link is safe to backfill");
   db.close();
 });

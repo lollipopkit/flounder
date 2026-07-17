@@ -4,29 +4,39 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    gnupg \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
     bash \
     build-essential \
-    ca-certificates \
     cmake \
     cargo \
     coreutils \
-    curl \
     findutils \
     gawk \
     git \
     golang-go \
     grep \
     jq \
+    libgmp-dev \
     nodejs \
-    npm \
     ninja-build \
     pkg-config \
     python3 \
+    python3-dev \
     python3-pip \
     python3-venv \
     ripgrep \
     rustc \
     sed \
+  && node --version \
+  && npm --version \
   && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g yarn@1.22.22 pnpm@9.15.9 \

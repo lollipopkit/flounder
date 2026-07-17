@@ -5,6 +5,7 @@
 export * from "./agent/audit.js";
 export * from "./agent/confirm.js";
 export * from "./agent/consolidate.js";
+export * from "./agent/discovery-artifacts.js";
 export * from "./agent/loop.js";
 export * from "./agent/memory.js";
 export * from "./agent/pi-session.js";
@@ -15,6 +16,9 @@ export * from "./agent/tools.js";
 export * from "./config.js";
 export * from "./db/store.js";
 export * from "./db/record.js";
+export * from "./evaluation/contracts.js";
+export * from "./evaluation/harness-experiments.js";
+export * from "./evaluation/run-groups.js";
 export * from "./ingest/source.js";
 export * from "./llm/client.js";
 export * from "./llm/claude-code.js";

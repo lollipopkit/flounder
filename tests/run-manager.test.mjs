@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { buildArgs, specToConfig, ActivityBus } from "../dist/server/run-manager.js";
@@ -45,8 +45,12 @@ test("buildArgs: a full run spec maps to the expected verb + flags", () => {
     thinking: "xhigh",
     maxScopes: 12,
     mapSteps: 60,
+    mapSamples: 2,
     digSteps: 60,
     digSamples: 2,
+    digMaxSamples: 4,
+    adaptiveDig: false,
+    eagerPrepare: true,
     out: "runs",
   });
   assert.deepEqual(args, [
@@ -60,8 +64,12 @@ test("buildArgs: a full run spec maps to the expected verb + flags", () => {
     "--thinking", "xhigh",
     "--max-scopes", "12",
     "--map-steps", "60",
+    "--map-samples", "2",
     "--dig-steps", "60",
     "--dig-samples", "2",
+    "--dig-max-samples", "4",
+    "--no-adaptive-dig",
+    "--eager-prepare",
     "--out", "runs",
   ]);
 });
@@ -86,6 +94,73 @@ test("buildArgs: verify-from-start is an explicit run pipeline flag", () => {
   assert.equal(specToConfig({ verb: "run", target: "p", sourcePaths: ["./s"], verifyFromStart: true }, "runs").auditVerifyFromStart, true);
 });
 
+test("verify concurrency is preserved across launch config and CLI args", () => {
+  const spec = { verb: "run", target: "p", sourcePaths: ["./s"], verifyConcurrency: 3 };
+  assert.equal(specToConfig(spec, "runs").auditVerifyConcurrency, 3);
+  const args = buildArgs(spec);
+  assert.deepEqual(args.slice(args.indexOf("--verify-concurrency"), args.indexOf("--verify-concurrency") + 2), ["--verify-concurrency", "3"]);
+});
+
+test("versioned coverage controls survive launch translation", () => {
+  const spec = {
+    verb: "run",
+    target: "p",
+    sourcePaths: ["./s"],
+    mapSamples: 3,
+    digSamples: 1,
+    digMaxSamples: 4,
+    adaptiveDig: true,
+    eagerPrepare: true,
+  };
+  const cfg = specToConfig(spec, "runs");
+  assert.equal(cfg.auditMapSamples, 3);
+  assert.equal(cfg.auditDigSamples, 1);
+  assert.equal(cfg.auditDigMaxSamples, 4);
+  assert.equal(cfg.auditAdaptiveDig, true);
+  assert.equal(cfg.auditEagerPrepare, true);
+  const args = buildArgs(spec);
+  assert.ok(args.includes("--map-samples"));
+  assert.ok(args.includes("--dig-max-samples"));
+  assert.ok(args.includes("--eager-prepare"));
+  assert.equal(args.includes("--no-adaptive-dig"), false);
+});
+
+test("specToConfig: launch next actions are preserved for the audit prompt", () => {
+  const cfg = specToConfig({
+    verb: "run",
+    target: "p",
+    sourcePaths: ["./s"],
+    nextActions: [
+      {
+        id: 7,
+        kind: "resource-request",
+        actionability: "agent-resource",
+        recommendedAction: "resolve-resource",
+        title: "Install Foundry dependencies",
+        summary: "forge build needs package install",
+        reason: "The agent should retry safe setup before asking for help.",
+      },
+    ],
+  }, "runs");
+  assert.equal(cfg.auditNextActions.length, 1);
+  assert.equal(cfg.auditNextActions[0].recommendedAction, "resolve-resource");
+  assert.equal(cfg.auditNextActions[0].actionability, "agent-resource");
+});
+
+test("buildArgs/specToConfig: append-map can carry extra seed inventories", () => {
+  const args = buildArgs({ verb: "map", target: "p", sourcePaths: ["./s"], appendMap: true, appendMapSeedPaths: ["/old/audit_scopes.json", "local/scopes.json"] });
+  assert.ok(args.includes("--append-map"));
+  assert.deepEqual(args.slice(args.indexOf("--append-map-seed")), ["--append-map-seed", "/old/audit_scopes.json", "--append-map-seed", "local/scopes.json", "--out", defaultOutputDir()]);
+
+  const cfg = specToConfig(
+    { verb: "map", target: "p", dir: "proj", sourcePaths: ["src"], appendMap: true, appendMapSeedPaths: ["/old/audit_scopes.json", "local/scopes.json"] },
+    "runs",
+    os.tmpdir(),
+  );
+  assert.equal(cfg.auditAppendMap, true);
+  assert.deepEqual(cfg.auditAppendMapSeedPaths, ["/old/audit_scopes.json", path.resolve(os.tmpdir(), "proj/local/scopes.json")]);
+});
+
 test("buildArgs: confirm without a run dir is rejected", () => {
   assert.throws(() => buildArgs({ verb: "confirm", target: "p", sourcePaths: ["./s"] }), /inputRunDir/);
 });
@@ -95,7 +170,7 @@ test("buildArgs/specToConfig: sandbox isolation settings round-trip through laun
     verb: "run",
     target: "p",
     sourcePaths: ["./s"],
-    sandboxBackend: "oci",
+    sandboxBackend: "apple-container",
     sandboxImage: "audit-sandbox:v1",
     sandboxAllowHostFallback: true,
     sandboxPrepareNetwork: "enabled",
@@ -104,7 +179,7 @@ test("buildArgs/specToConfig: sandbox isolation settings round-trip through laun
     sandboxCpus: 1.5,
   };
   assert.deepEqual(buildArgs(spec).slice(-15), [
-    "--sandbox-backend", "oci",
+    "--sandbox-backend", "apple-container",
     "--sandbox-image", "audit-sandbox:v1",
     "--allow-host-execution",
     "--prepare-network", "enabled",
@@ -115,7 +190,7 @@ test("buildArgs/specToConfig: sandbox isolation settings round-trip through laun
   ]);
 
   const cfg = specToConfig(spec, "runs");
-  assert.equal(cfg.sandboxBackend, "oci");
+  assert.equal(cfg.sandboxBackend, "apple-container");
   assert.equal(cfg.sandboxImage, "audit-sandbox:v1");
   assert.equal(cfg.sandboxAllowHostFallback, true);
   assert.equal(cfg.sandboxPrepareNetwork, "enabled");
@@ -157,33 +232,66 @@ test("specToConfig: posture per verb + unbounded budgets by default", () => {
   assert.equal(capped.auditMaxScopes, 8);
   assert.equal(capped.auditMapSteps, 50);
   assert.equal(capped.auditRemap, true);
+
+  const append = specToConfig({ ...base, verb: "map", appendMap: true }, "out");
+  assert.equal(append.auditMapOnly, true);
+  assert.equal(append.auditAppendMap, true);
 });
 
 test("specToConfig: a project dir + relative materials resolve under the daemon workspace", () => {
   const cfg = specToConfig(
     { verb: "run", target: "p", dir: "myproj", sourcePaths: ["src", "lib"], buildRoot: ".", corpusPaths: ["docs/specs"] },
     "runs",
-    "/ws",
+    os.tmpdir(),
   );
-  assert.equal(cfg.sourcePaths[0], path.resolve("/ws/myproj/src"));
-  assert.equal(cfg.sourcePaths[1], path.resolve("/ws/myproj/lib"));
-  assert.equal(cfg.buildRoot, path.resolve("/ws/myproj")); // "." resolves to the project root
-  assert.equal(cfg.corpusPaths[0], path.resolve("/ws/myproj/docs/specs"));
+  assert.equal(cfg.sourcePaths[0], path.resolve(os.tmpdir(), "myproj/src"));
+  assert.equal(cfg.sourcePaths[1], path.resolve(os.tmpdir(), "myproj/lib"));
+  assert.equal(cfg.buildRoot, path.resolve(os.tmpdir(), "myproj")); // "." resolves to the project root
+  assert.equal(cfg.corpusPaths[0], path.resolve(os.tmpdir(), "myproj/docs/specs"));
 });
 
 test("specToConfig: project-relative specs cannot escape the daemon workspace", () => {
   assert.throws(
-    () => specToConfig({ verb: "run", target: "p", dir: "../outside", sourcePaths: ["src"] }, "runs", "/ws"),
+    () => specToConfig({ verb: "run", target: "p", dir: "p", sourcePaths: ["src"] }, "runs", path.join(os.tmpdir(), `flounder-missing-workspace-${process.pid}-${Date.now()}`)),
+    /daemon workspace does not exist/,
+  );
+  assert.throws(
+    () => specToConfig({ verb: "run", target: "p", dir: "../outside", sourcePaths: ["src"] }, "runs", os.tmpdir()),
     /Unsafe project dir/,
   );
   assert.throws(
-    () => specToConfig({ verb: "run", target: "p", dir: "p", sourcePaths: ["../secret"] }, "runs", "/ws"),
+    () => specToConfig({ verb: "run", target: "p", dir: "p", sourcePaths: ["../secret"] }, "runs", os.tmpdir()),
     /Unsafe project material/,
   );
   assert.throws(
-    () => specToConfig({ verb: "run", target: "p", dir: "p", sourcePaths: ["/abs/secret"] }, "runs", "/ws"),
+    () => specToConfig({ verb: "run", target: "p", dir: "p", sourcePaths: ["/abs/secret"] }, "runs", os.tmpdir()),
     /absolute paths are not allowed/,
   );
+});
+
+test("specToConfig: real paths cannot escape through project or material symlinks", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "flounder-spec-realpath-"));
+  try {
+    const workspace = path.join(root, "workspace");
+    const outside = path.join(root, "outside");
+    await mkdir(workspace);
+    await mkdir(outside);
+    await symlink(outside, path.join(workspace, "linked-project"), "dir");
+    assert.throws(
+      () => specToConfig({ verb: "run", target: "p", dir: "linked-project", sourcePaths: ["."] }, "runs", workspace),
+      /symbolic link|outside the daemon workspace/,
+    );
+
+    const project = path.join(workspace, "project");
+    await mkdir(project);
+    await symlink(outside, path.join(project, "linked-source"), "dir");
+    assert.throws(
+      () => specToConfig({ verb: "run", target: "p", dir: "project", sourcePaths: ["linked-source"] }, "runs", workspace),
+      /symbolic link|outside the daemon workspace/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("specToConfig: per-phase models from the profile land on cfg.models; no dir = materials as-is", () => {

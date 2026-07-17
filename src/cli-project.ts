@@ -4,12 +4,15 @@ export function buildProjectContinueBody(args: readonly string[]): Record<string
   const body: Record<string, unknown> = { verb: "run" };
   if (args.includes("--verify-from-start")) body.verifyFromStart = true;
   if (args.includes("--remap")) body.remap = true;
+  if (args.includes("--append-map") || args.includes("--expand-map")) body.appendMap = true;
   if (args.includes("--quick")) body.quick = true;
   if (args.includes("--mock-llm")) body.mockLlm = true;
+  if (args.includes("--continue-coverage")) body.continueCoverage = true;
   const scopeCoverageMode = readFlag(args, "--scope-coverage-mode") ?? readFlag(args, "--coverage");
   if (scopeCoverageMode !== undefined) {
     if (!COVERAGE_MODES.has(scopeCoverageMode)) throw new Error("--coverage needs focused|standard|half|full|custom");
     body.scopeCoverageMode = scopeCoverageMode;
+    body.continueCoverage = true;
   }
   for (const [flag, key] of [
     ["--max-scopes", "maxScopes"],
@@ -20,7 +23,10 @@ export function buildProjectContinueBody(args: readonly string[]): Record<string
     ["--dig-concurrency", "digConcurrency"],
   ] as const) {
     const value = readIntFlag(args, flag);
-    if (value !== undefined) body[key] = value;
+    if (value !== undefined) {
+      body[key] = value;
+      if (flag === "--max-scopes") body.continueCoverage = true;
+    }
   }
   return body;
 }

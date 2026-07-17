@@ -9,6 +9,7 @@ provider, API, budget, output, and pi extension details.
 - [Setup Commands](#setup-commands)
 - [Audit Verbs](#audit-verbs)
 - [Materials](#materials)
+- [Engagement Config](#engagement-config)
 - [Coverage And Budget Controls](#coverage-and-budget-controls)
 - [Sandbox And Network](#sandbox-and-network)
 - [Provider Profiles](#provider-profiles)
@@ -31,6 +32,7 @@ provider, API, budget, output, and pi extension details.
 ```bash
 flounder ui                 # dashboard at http://127.0.0.1:4500 plus co-located daemon
 flounder ui --no-daemon     # control plane only
+flounder ui --maintainer    # explicitly enable maintainer-only Harness source-improvement surfaces
 flounder server daemon-token mint [name]
 flounder daemon start --server http://<server>:4500 --token <token>
 flounder daemon provider list
@@ -49,7 +51,8 @@ CLI naming convention:
 
 - Workflow verbs stay top-level: `flounder run`, `flounder continue`,
   `flounder map`, `flounder audit`, `flounder verify`,
-  `flounder confirm`, and `flounder report`.
+  `flounder confirm`, `flounder report`, `flounder group`, and
+  `flounder experiment`.
 - Server/control-plane resource commands live under `flounder server ...`.
 - `flounder daemon ...` commands run on the daemon machine and can touch local
   provider auth, workspace paths, and executor settings. Start executors with
@@ -65,9 +68,9 @@ CLI naming convention:
 | Verb | What it does |
 | --- | --- |
 | `flounder prepare <clue>` | Open-world acquisition before map: tx/address/project/repo/link -> staged source, corpus, dependency closure, and deployment match |
-| `flounder run <clue>` | One-command pipeline: prepare -> sealed map/dig -> confirm -> report unless disabled |
+| `flounder run <clue>` | One-command pipeline: prepare -> sealed map/dig/synthesize/verify -> confirm -> report unless disabled |
 | `flounder continue --project <uuid\|name>` | Continue a stored project pipeline; CLI equivalent of the UI Continue button |
-| `flounder run --source <paths...> --target <name>` | Source-provided sealed audit: map -> dig |
+| `flounder run --source <paths...> --target <name>` | Source-provided sealed audit: map -> dig -> synthesize -> verify |
 | `flounder map --target <name> --source <paths...>` | Enumerate and persist scope inventory only |
 | `flounder audit <region> --source ...` | Deep-audit one region |
 | `flounder audit --scope <id,...> --source ...` | Deep-audit selected inventory scopes |
@@ -75,6 +78,12 @@ CLI naming convention:
 | `flounder verify <file> --source ...` | Alias for `audit --verify`; confirm or refute suspected findings by local execution |
 | `flounder confirm <run-dir> --source <paths...>` | Open-world reproduction and submit/no-submit decision sheet |
 | `flounder report --project <uuid\|name> [--finding <id>...] [--all]` | Generate missing formal reports, or regenerate selected/all reportable findings |
+| `flounder group create --manifest <file>` | Create a durable validated evaluation, replay, batch, or multi-target group |
+| `flounder group start <uuid\|name> [--parallel <n>]` | Start/resume bounded group work through the existing daemon queue |
+| `flounder group status\|pause\|cancel\|report <uuid\|name>` | Inspect/control group state or regenerate its persisted evidence report |
+| `flounder group retry <work-item-id>` | Retry a blocked item after setup repair while retaining immutable prior attempt evidence |
+| `flounder experiment create --name <name> --baseline <group> [--candidate <group>] --editable-file <paths...>` | Maintainer mode only: mine verifier-grounded failures and create a bounded Flounder source candidate proposal |
+| `flounder experiment status\|attach\|proposal\|evaluate\|brief <uuid\|name>` | Maintainer mode only: inspect/refine a proposal, attach a paired candidate, apply the deterministic promotion gate, or export the candidate brief |
 | `flounder history import-run --target <name> --run <dir>` | Import an existing run directory into tracked history |
 
 ## Materials
@@ -87,6 +96,35 @@ CLI naming convention:
 | `--target <name>` | Project/run artifact key. |
 | `--config <file>` | Optional JSON profile. CLI flags override it. |
 | `--scope-note <text>` | One-line authorized-scope hint. |
+
+## Engagement Config
+
+Set `config.engagement.kind` on dashboard/API projects when the reportability
+rules matter:
+
+- `standard`: default authorized review.
+- `bug-bounty`: normal bounty work; keep real-target Confirm when a live target
+  exists and gate reports on scope, duplicate, known-issue, impact, payout, and
+  disclosure readiness.
+- `bug-bounty-contest`: time-limited contest work; run short settled batches,
+  optionally skip real-target Confirm when source-only rules allow it, and
+  append-map novel scopes when the inventory is exhausted.
+
+Contest strategy fields:
+
+```json
+{
+  "engagement": {
+    "kind": "bug-bounty-contest",
+    "strategy": {
+      "batchScopes": 10,
+      "digConcurrency": 5,
+      "skipRealTargetConfirm": true,
+      "appendMapWhenExhausted": true
+    }
+  }
+}
+```
 
 ## Coverage And Budget Controls
 
@@ -103,12 +141,14 @@ is done unless capped by launch config.
 | `--dig-concurrency <n>` | Deep-audit multiple scopes in isolated workspaces |
 | `--max-scopes <n>` | Scopes audited in the next dig batch; default 30 |
 | `--remap` | Re-enumerate scope inventory instead of resuming |
+| `--append-map`, `--expand-map` | Ask MAP to append novel scopes while preserving existing scope status |
+| `--append-map-seed <path>` | Add prior scope inventories as covered-reference material for append-map |
 
 ## Sandbox And Network
 
 | Flag | Meaning |
 | --- | --- |
-| `--sandbox-backend <auto,oci,host>` | Default `auto`; OCI is preferred for model-generated commands |
+| `--sandbox-backend <auto,oci,apple-container,host>` | Default `auto`; Apple container is preferred on Apple silicon macOS when ready, otherwise Docker-backed OCI |
 | `--sandbox-image <image>` | OCI image for sandboxed commands |
 | `--allow-host-execution` | Trusted-local opt-in fallback only |
 | `--prepare-network <none,enabled>` | Dependency warm-up/build network policy |
@@ -116,11 +156,31 @@ is done unless capped by launch config.
 | `--no-prepare` | Skip toolchain warm-up |
 | `--prepare-timeout-ms <n>` | Warm-up timeout |
 
-Real execution-confirming audits require Docker, or a Docker-compatible runtime
-that provides the `docker` CLI, plus a built or pulled sandbox image. Build the
-default image with `npm run sandbox:build`. Default `auto` mode fails closed if
-the image is unavailable; it does not silently run model-generated commands on
-the host.
+Real execution-confirming audits use a sandbox engine plus a built or pulled
+sandbox image. Default `auto` mode prefers Apple's `container` runtime on Apple
+silicon macOS when the selected image and sealed network are ready, then falls
+back to Docker-backed OCI. For the Docker path, build the default image with
+`npm run sandbox:build`.
+
+On Apple silicon macOS daemon hosts, `auto` can select Apple's `container`
+runtime after it is installed, started, and has the selected sandbox image
+available. Use `--sandbox-backend apple-container` to require that path
+explicitly.
+
+Build curated target-specific images when a bounty target needs native
+confirmation tools that are not in the baseline image:
+
+```bash
+npm run sandbox:cairo:build  # flounder-sandbox:cairo, Scarb + Starknet Foundry
+npm run sandbox:ton:build    # flounder-sandbox:ton, TON Blueprint + FunC/Tolk/Tact
+```
+
+Then pass the selected image explicitly:
+
+```bash
+flounder run --source ./src --build-root . --sandbox-image flounder-sandbox:cairo
+flounder run --source ./contracts --build-root . --sandbox-image flounder-sandbox:ton
+```
 
 Host execution is only for trusted local smoke tests and fixtures:
 
@@ -130,6 +190,13 @@ flounder run --source ./src --build-root . --sandbox-backend host --allow-host-e
 
 Host mode keeps the copied workspace and isolated `HOME` / package caches, but
 it does not provide kernel-level network or filesystem isolation.
+
+Prepare and toolchain warm-up failures are surfaced as `resource-request`
+backlog rows with a diagnostic and retry command. A `needs-resource` run should
+make the agent inspect the blocker and retry safe sandbox, toolchain, dependency,
+source, or fork setup where possible. Ask the operator only for explicit
+credentials, authorization, or unavailable external resources, then mark the row
+resolved.
 
 Sealed `run --source`, `map`, and `audit` inspection/confirmation commands
 should not use public network access. `prepare` and `confirm` may fetch, fork,
@@ -141,7 +208,7 @@ broadcast or write to live systems.
 The dashboard stores provider profiles:
 
 - provider id, such as `openai-codex`
-- model, such as `gpt-5.5`
+- model, such as `gpt-5.6-sol`
 - thinking level, such as `xhigh`
 - optional role defaults
 
@@ -149,7 +216,7 @@ Projects select a default provider profile and may override it per phase:
 prepare, map, dig, confirm. The selected daemon must authenticate every provider
 profile the project can use.
 
-Fresh stores seed starter profiles named `openai-codex · gpt-5.5 · xhigh` and
+Fresh stores seed starter profiles named `openai-codex · gpt-5.6-sol · xhigh` and
 `claude-code · opus 4.8 max`.
 
 ## REST API
@@ -167,10 +234,27 @@ curl http://127.0.0.1:4500/api/projects
 curl http://127.0.0.1:4500/api/providers
 curl http://127.0.0.1:4500/api/daemons
 curl http://127.0.0.1:4500/api/projects/<uuid>
+curl 'http://127.0.0.1:4500/api/projects/<uuid>/backlog?status=open'
 curl 'http://127.0.0.1:4500/api/projects/<uuid>/findings?tracking=active'
 curl 'http://127.0.0.1:4500/api/projects/<uuid>/findings?tracking=ignored'
 curl http://127.0.0.1:4500/api/projects/<uuid>/confirm-decisions
 curl http://127.0.0.1:4500/api/runs/<id>/log
+```
+
+Discovery backlog rows can be filtered with
+`kind=coverage-gap|resource-request|followup-scope` and
+`status=open|resolved|stale|ignored|all`. Rows include `actionability`,
+`action_owner`, `recommended_action`, and `primary_action_label`: agents should
+advance `agent-runnable` coverage rows, resolve `agent-resource` setup rows when
+safe local work can do so, and route `agent-review` rows to the next safe
+workflow action. Ask the operator only for explicit credentials, authorization,
+or unavailable external resources. Update operator state without deleting
+provenance:
+
+```bash
+curl -X PATCH http://127.0.0.1:4500/api/backlog/<id> \
+  -H 'content-type: application/json' \
+  -d '{"status":"resolved"}'
 ```
 
 Creating a project requires both a provider profile and a daemon. `dir` is the
@@ -180,7 +264,7 @@ relative to that directory.
 ```bash
 curl -X POST http://127.0.0.1:4500/api/projects \
   -H 'content-type: application/json' \
-  -d '{"name":"p","providerId":1,"daemonId":1,"dir":"p","sourcePaths":["."],"buildRoot":".","corpusPaths":["docs/specs"],"config":{"prepareClue":"audit this project","maxScopes":30}}'
+  -d '{"name":"p","providerId":1,"daemonId":1,"dir":"p","sourcePaths":["."],"buildRoot":".","corpusPaths":["docs/specs"],"config":{"prepareClue":"audit this project","maxScopes":30,"engagement":{"kind":"bug-bounty"}}}'
 ```
 
 If `dir` is omitted, the project directory under the selected daemon workspace
@@ -227,6 +311,10 @@ Each audit run writes:
 - `audit_findings.json`
 - `audit_hypotheses.json`
 - `audit_command_runs.json`
+- `run_health.json`
+- `coverage_gaps.json`
+- `resource_requests.json`
+- `followup_scopes.json`
 - `audit_report.md`
 - `summary.json`
 - `events.jsonl`
@@ -256,7 +344,7 @@ only for short-lived scratch.
 When loaded through pi, Flounder registers:
 
 - `flounder_prepare`: open-world target acquisition from a clue
-- `flounder_run`: with a clue, prepare -> sealed map/dig -> confirm -> report; with source paths, sealed map/dig source audit
+- `flounder_run`: with a clue, prepare -> sealed map/dig/synthesize/verify -> confirm -> report; with source paths, sealed map/dig/synthesize/verify source audit
 - `flounder_map`: sealed scope inventory only
 - `flounder_audit`: sealed dig, pinned region audit, selected scope audit, or inline finding verification
 - `flounder_confirm`: open-world reproduction for a finished run

@@ -1,26 +1,29 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { gzipSync } from "node:zlib";
 import { defaultConfig, resolveRole, withRole, normalizeRoleModels } from "../dist/config.js";
 import { ProjectMemory } from "../dist/agent/memory.js";
-import { buildTools, describeAction, ingestFindingsFromScratch, newSession, dedupeFindings, readScratchScopes, scratchHasFindings, scratchHasFindingsArtifact } from "../dist/agent/tools.js";
-import { runAudit } from "../dist/agent/audit.js";
+import { buildTools, describeAction, ingestFindingsFromScratch, newSession, dedupeFindings, readScratchScopes, isReportFile, scratchHasFindings, scratchHasFindingsArtifact, commandFileArgsForTest, confirmCommandTargetLinkForTest, splitCommandLineForTest } from "../dist/agent/tools.js";
+import { buildRunHealth, mergeFollowupScopes, readScratchCoverageGaps, readScratchFollowupScopes, readScratchResourceRequests } from "../dist/agent/discovery-artifacts.js";
+import { mergeScopeInventory } from "../dist/agent/scope-store.js";
+import { dedupeVerifyInputs, dischargeChallengeFindingTitle, dischargeChallengeScopeOutcomes, normalizeVerifyVerdicts, runAudit, verifyBatchStoppedReason } from "../dist/agent/audit.js";
 import { normalizePrepareManifest, prepareValidationBlockingIssues, readPrepareManifest } from "../dist/agent/acquire.js";
 import { runAuditLoop, isTransientError } from "../dist/agent/loop.js";
 import { MetadataStore } from "../dist/db/store.js";
-import { buildConfirmKickoff, buildDeepKickoff, buildMapKickoff, buildVerifyKickoff, AUDIT_CONFIRM_SYSTEM, AUDIT_DEEP_SYSTEM, AUDIT_SYSTEM, AUDIT_VERIFY_SYSTEM, MAP_GRANULARITY_RULES, MAP_SYSTEM, POC_TRUST_RULE } from "../dist/agent/prompts.js";
-import { runDifferentialConfirmation } from "../dist/agent/differential.js";
-import { runRefutation } from "../dist/agent/refutation.js";
+import { buildConfirmKickoff, buildDeepKickoff, buildMapKickoff, buildVerifyKickoff, AUDIT_CONFIRM_SYSTEM, AUDIT_DEEP_SYSTEM, AUDIT_SYSTEM, AUDIT_VERIFY_SYSTEM, DISCOVERY_BACKLOG_RULES, MAP_GRANULARITY_RULES, MAP_SYSTEM, POC_TRUST_RULE } from "../dist/agent/prompts.js";
+import { differentialNetworkForExploitRun, runDifferentialConfirmation } from "../dist/agent/differential.js";
+import { runDischargeChallenge, runRefutation } from "../dist/agent/refutation.js";
 import { renderReportFileManifest } from "../dist/agent/report.js";
 import { stagePackageSource } from "../dist/agent/package-source.js";
-import { buildSessionPrompt, createIsolatedResourceLoader, FINDINGS_FINALIZE_PROMPT, isPiSessionProvider, mapCheckpointDirective, mapThinkingLevel, prepareCheckpointDirective, promptWithWallClockAbort, resolveFinalizePromptTimeoutMs, toolSchemas } from "../dist/agent/pi-session.js";
+import { assistantMessageError, auditSessionHasDurableHandoff, buildSessionPrompt, createIsolatedResourceLoader, FINDINGS_FINALIZE_PROMPT, isPiSessionProvider, mapCheckpointDirective, mapThinkingLevel, prepareCheckpointDirective, promptWithWallClockAbort, resolveFinalizePromptTimeoutMs, toolSchemas, withDetailedCodexReasoningSummary } from "../dist/agent/pi-session.js";
 import { MockAuditLlmClient } from "../dist/llm/mock.js";
 import { RunLogger } from "../dist/trace/logger.js";
 import { renderDisclosure } from "../dist/reports/disclosure.js";
+import { remoteFindingRows } from "../dist/server/daemon.js";
 
 process.env.FLOUNDER_SANDBOX_BACKEND = "host";
 process.env.FLOUNDER_ALLOW_HOST_EXECUTION = "1";
@@ -71,6 +74,374 @@ class VerifyIsolationLlmClient {
   }
 }
 
+class VerifyProgressLlmClient {
+  async complete(input) {
+    const action = (thought, toolName, args) => JSON.stringify({ thought, tool: toolName, args });
+    if (input.user.includes("first missing verdict")) {
+      if (!input.user.includes('"path":"findings.json"')) return action("No executable verdict is available.", "write", { path: "findings.json", content: "[]" });
+      return JSON.stringify({ done: true, summary: "no verdict" });
+    }
+    if (input.user.includes("second settled verdict")) {
+      if (!input.user.includes("refuted_repro.test.mjs")) {
+        return action("Write a local mitigation check.", "write", {
+          path: "refuted_repro.test.mjs",
+          content: "import test from 'node:test'; import assert from 'node:assert/strict'; import { confirmsMissingConstraintHarness } from './mock_target.mjs'; test('mitigation evidence passed', () => { assert.equal(confirmsMissingConstraintHarness(), true); console.log('mitigation evidence passed'); });",
+        });
+      }
+      if (!input.user.includes("action: bash")) {
+        return action("Execute the mitigation check before refuting the claim.", "bash", {
+          cmd: "node --test refuted_repro.test.mjs",
+          purpose: "confirm",
+          expected_exit_code: 0,
+          success_patterns: ["mitigation evidence passed"],
+        });
+      }
+      if (!input.user.includes('"path":"findings.json"')) {
+        return action("Record a refutation verdict.", "write", {
+          path: "findings.json",
+          content: JSON.stringify([{
+            id: "f1",
+            title: "REFUTED: second settled verdict",
+            severity: "info",
+            location: "halo2_missing_constraint.rs:5",
+            description: "The nearby binding check refutes the claim.",
+            evidence: "The value is compared before use.",
+            exploitSketch: "Not reproducible.",
+            fix: "No change required.",
+            confidence: 0.95,
+            command_id: "cmd1",
+          }]),
+        });
+      }
+      return JSON.stringify({ done: true, summary: "settled" });
+    }
+    return JSON.stringify({ done: true, summary: "unexpected" });
+  }
+}
+
+test("remote daemon preserves semantic refutations while filtering ordinary info rows", () => {
+  const common = {
+    location: "src/Foo.sol:1",
+    description: "description",
+    evidence: "evidence",
+    exploitSketch: "not reproducible",
+    fix: "no change",
+    confidence: 0.99,
+  };
+  const rows = remoteFindingRows([
+    {
+      ...common,
+      id: "f1",
+      title: "REFUTED: Explicit design intent makes the seeded claim false",
+      severity: "info",
+      confirmationStatus: "confirmed-executable",
+      commandRunId: "cmd1",
+      originId: 42,
+    },
+    { ...common, id: "f2", title: "Informational note", severity: "info", confirmationStatus: "suspected" },
+    { ...common, id: "f3", title: "Discharged obligation", severity: "medium", confirmationStatus: "discharged" },
+    {
+      ...common,
+      id: "f4",
+      title: "Differentially confirmed finding with a skeptic objection",
+      severity: "high",
+      confirmationStatus: "confirmed-differential",
+      commandRunId: "cmd2",
+      disputed: true,
+      refutation: { refuted: true, reason: "Human review must resolve the remaining model disagreement." },
+    },
+  ], "/runs/verify", "test target");
+
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].status, "refuted");
+  assert.equal(rows[0].originId, 42);
+  assert.equal(rows[0].reportPath, undefined, "an execution-backed refutation must not get a confirmed report path");
+  assert.equal(rows[0].reportMarkdown, undefined, "an execution-backed refutation must not get disclosure markdown");
+  assert.equal(rows[1].status, "confirmed-differential", "a differential proof survives a non-vacuity skeptic disagreement");
+  assert.match(rows[1].reportMarkdown, /DISPUTED by independent refutation/);
+});
+
+test("verify input deduplicates durable finding origins before concurrent execution", () => {
+  const first = { originId: 42, title: "first representation" };
+  const duplicate = { origin_id: 42, title: "duplicate representation" };
+  const anonymousA = { title: "anonymous lead" };
+  const anonymousB = { title: "anonymous lead" };
+  assert.deepEqual(dedupeVerifyInputs([first, duplicate, anonymousA, anonymousB]), [first, anonymousA, anonymousB]);
+});
+
+test("verify normalization rejects contradictory same-claim verdicts before persistence", () => {
+  const common = {
+    id: "f1",
+    title: "Candidate invariant failure",
+    severity: "high",
+    location: "src/Foo.sol:7",
+    description: "description",
+    evidence: "evidence",
+    exploitSketch: "exploit",
+    fix: "fix",
+    confidence: 0.9,
+  };
+  const normalized = normalizeVerifyVerdicts([
+    { ...common, confirmationStatus: "confirmed-differential", commandRunId: "cmd1" },
+    { ...common, id: "f2", title: `REFUTED: ${common.title}`, severity: "info", confirmationStatus: "confirmed-executable", commandRunId: "cmd2" },
+  ]);
+
+  assert.equal(normalized.conflict, true);
+  assert.equal(normalized.inputCount, 2);
+  assert.deepEqual(normalized.findings, []);
+});
+
+test("refuted finding transitions atomically clear stale disclosure reports", async () => {
+  const dir = await tempDir();
+  try {
+    const store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "refuted-report-cleanup" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: path.join(dir, "source-run") });
+    store.upsertFindings(projectId, sourceRunId, [{
+      findingKey: "report-cleanup",
+      title: "Candidate with a stale report",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-executable",
+      reportPath: path.join(dir, "source-run", "report_f1.md"),
+      reportMarkdown: "# Security disclosure\n",
+      refutationStatus: "passed",
+      refutationReason: "An earlier reviewer accepted the confirmation.",
+    }]);
+    const original = store.queryFindings(projectId, { search: "Candidate with a stale report" })[0];
+    store.upsertFindings(projectId, sourceRunId, [{
+      findingKey: "report-cleanup",
+      title: "Candidate with a stale report",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-executable",
+    }]);
+    assert.equal(store.getFinding(Number(original.id)).refutation_status, "passed", "same-run final persistence preserves reviewer metadata");
+    const verifyRunId = store.startRun({ projectId, kind: "audit", runDir: path.join(dir, "verify-run"), budgets: { verify: true } });
+    store.recordFindingPhaseAttempt(projectId, verifyRunId, {
+      subjectType: "finding",
+      subjectId: Number(original.id),
+      phase: "verify",
+      inputFingerprint: "sha256:report-cleanup",
+      state: "settled",
+      outcome: "refuted",
+      metrics: { findings: 1, steps: 9 },
+    });
+    store.upsertFindings(projectId, verifyRunId, [{
+      findingKey: "report-cleanup-refuted",
+      originId: Number(original.id),
+      title: "Candidate with a stale report",
+      location: "src/Foo.sol:1",
+      severity: "info",
+      status: "refuted",
+      phaseAttempt: { subjectType: "finding", subjectId: Number(original.id), inputFingerprint: "sha256:report-cleanup" },
+    }]);
+
+    const refuted = store.getFinding(Number(original.id));
+    assert.equal(refuted.status, "refuted");
+    assert.equal(refuted.report_path, null);
+    assert.equal(refuted.report_markdown, null);
+    assert.equal(refuted.refutation_status, null, "a new authoritative verdict clears stale reviewer state");
+    assert.equal(refuted.refutation_reason, null);
+    assert.equal(store.latestFindingPhaseAttempt("finding", Number(original.id), "verify").metrics_json, JSON.stringify({ findings: 1, steps: 9 }), "final finding persistence preserves attempt metrics");
+    assert.equal(store.queryFindings(projectId, { reportable: true }).some((finding) => finding.id === original.id), true);
+    assert.equal(store.listGlobalFindings({ source: "all" }).some((finding) => finding.id === original.id), true);
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+class ManyScopeRefutationLlmClient {
+  constructor() {
+    this.mock = new MockAuditLlmClient();
+    this.refutedTags = [];
+  }
+
+  async complete(input) {
+    if (input.tag?.startsWith("refute_")) {
+      this.refutedTags.push(input.tag);
+      return JSON.stringify({ refuted: false, unrealistic: false, reason: "The execution-backed claim survives independent review." });
+    }
+    if (input.user.includes("Phase: MAP")) {
+      if (!input.user.includes("wrote scopes.json")) {
+        return JSON.stringify({
+          thought: "Checkpoint a complete synthetic inventory.",
+          tool: "write",
+          args: {
+            path: "scopes.json",
+            content: JSON.stringify(Array.from({ length: 9 }, (_, index) => ({
+              id: `S${index + 1}`,
+              obligation: `Region ${index + 1} must preserve its security invariant`,
+              region: "halo2_missing_constraint.rs:1-20",
+              lenses: ["spec"],
+              exposure: "high",
+              difficulty: "medium",
+              score: 100 - index,
+              why: "Synthetic full-refutation coverage fixture.",
+            }))),
+          },
+        });
+      }
+      return JSON.stringify({ done: true, summary: "mapped nine scopes" });
+    }
+    return this.mock.complete(input);
+  }
+}
+
+class AppendMapLlmClient {
+  async complete(input) {
+    const action = (thought, toolName, args) => JSON.stringify({ thought, tool: toolName, args });
+    if (input.user.includes("Phase: MAP")) {
+      if (!input.user.includes("wrote scopes.json")) {
+        const appendMode = input.user.includes("map_existing_scopes.json");
+        return action(appendMode ? "Append only scopes absent from the existing inventory." : "Create the initial scope inventory.", "write", {
+          path: "scopes.json",
+          content: JSON.stringify(appendMode ? [
+            {
+              id: "S2",
+              obligation: "secondary advice region must bind to its source",
+              region: "halo2_missing_constraint.rs:5",
+              lenses: ["unbound-input"],
+              exposure: "high",
+              difficulty: "medium",
+              score: 80,
+              why: "duplicate of the existing S2 should be ignored by the merge.",
+            },
+            {
+              id: "S3",
+              obligation: "tertiary advice region must bind to its source",
+              region: "halo2_missing_constraint.rs:7",
+              lenses: ["unbound-input"],
+              exposure: "medium",
+              difficulty: "medium",
+              score: 70,
+              why: "new scope discovered by append-map.",
+            },
+          ] : [
+            {
+              id: "S1",
+              obligation: "the advice cell must be constrained to its trusted source value",
+              region: "halo2_missing_constraint.rs:5",
+              lenses: ["unbound-input"],
+              exposure: "critical",
+              difficulty: "high",
+              score: 95,
+              why: "initial scope.",
+            },
+            {
+              id: "S2",
+              obligation: "secondary advice region must bind to its source",
+              region: "halo2_missing_constraint.rs:5",
+              lenses: ["unbound-input"],
+              exposure: "high",
+              difficulty: "medium",
+              score: 76,
+              why: "initial second scope.",
+            },
+          ]),
+        });
+      }
+      return JSON.stringify({ done: true, summary: "scopes written" });
+    }
+    return new MockAuditLlmClient().complete(input);
+  }
+}
+
+class OutcomeOnlySynthesisLlmClient {
+  constructor() {
+    this.synthesisCalls = 0;
+    this.sawOutcomeArtifact = false;
+  }
+
+  async complete(input) {
+    const action = (thought, toolName, args) => JSON.stringify({ thought, tool: toolName, args });
+    if (input.system.includes("doing the MAP phase")) {
+      if (!input.user.includes("wrote scopes.json")) {
+        return action("Checkpoint one complete scope.", "write", {
+          path: "scopes.json",
+          content: JSON.stringify([
+            { id: "S1", obligation: "principal binding survives the producer boundary", region: "producer-region-marker", score: 90 },
+            { id: "S2", obligation: "consumer preserves the upstream principal", region: "consumer-region-marker", score: 80 },
+          ]),
+        });
+      }
+      return JSON.stringify({ done: true, summary: "map complete" });
+    }
+    if (input.system.includes("SYNTHESIS mode")) {
+      this.synthesisCalls += 1;
+      this.sawOutcomeArtifact ||= input.user.includes("synthesis_scope_outcomes.json");
+      if (!input.user.includes('"path":"findings.json"')) return action("No execution-backed composition claim is available.", "write", { path: "findings.json", content: "[]" });
+      return JSON.stringify({ done: true, summary: "composition checked" });
+    }
+    if (input.system.includes("DEEP, NARROW-SCOPE audit")) {
+      const scopeId = input.user.match(/scope (region-[a-f0-9]{12})/)?.[1] ?? (input.user.includes("consumer-region-marker") ? "S2" : "S1");
+      if (!input.user.includes('"path":"scope_outcome.json"')) {
+        return action("Persist checked obligations separately from findings.", "write", {
+          path: "scope_outcome.json",
+          content: JSON.stringify({
+            scope_id: scopeId,
+            coverage_complete: true,
+            obligations: [{ id: "O1", statement: "principal binding survives the region boundary", status: "discharged", evidence: "the value is checked before export" }],
+            composition_edges: [{ id: "E1", kind: "boundary", description: `${scopeId} participates in the checked producer-to-consumer principal flow`, status: "observed", from: "producer", to: "consumer" }],
+            blockers: [],
+          }),
+        });
+      }
+      if (!input.user.includes('"path":"findings.json"')) return action("Record that this isolated scope produced no finding.", "write", { path: "findings.json", content: "[]" });
+      return JSON.stringify({ done: true, summary: "scope complete" });
+    }
+    return JSON.stringify({ done: true, summary: "no action" });
+  }
+}
+
+class IncompleteOutcomeLlmClient extends OutcomeOnlySynthesisLlmClient {
+  async complete(input) {
+    if (input.system.includes("DEEP, NARROW-SCOPE audit") && !input.user.includes('"path":"scope_outcome.json"')) {
+      const scopeId = input.user.includes("consumer-region-marker") ? "S2" : "S1";
+      return JSON.stringify({
+        thought: "Persist the unresolved coverage handoff.",
+        tool: "write",
+        args: {
+          path: "scope_outcome.json",
+          content: JSON.stringify({
+            scope_id: scopeId,
+            coverage_complete: false,
+            obligations: [{ id: "O1", statement: "the external build-dependent edge is checked", status: "blocked" }],
+            composition_edges: [],
+            blockers: ["required local build fixture is unavailable"],
+          }),
+        },
+      });
+    }
+    return super.complete(input);
+  }
+}
+
+class FirstIncompleteThenCompleteOutcomeLlmClient extends OutcomeOnlySynthesisLlmClient {
+  async complete(input) {
+    if (input.system.includes("DEEP, NARROW-SCOPE audit")
+      && input.user.includes("producer-region-marker")
+      && !input.user.includes('"path":"scope_outcome.json"')) {
+      return JSON.stringify({
+        thought: "Persist the first scope's unresolved coverage handoff.",
+        tool: "write",
+        args: {
+          path: "scope_outcome.json",
+          content: JSON.stringify({
+            scope_id: "S1",
+            coverage_complete: false,
+            obligations: [{ id: "O1", statement: "the blocked edge is checked", status: "blocked" }],
+            composition_edges: [],
+            blockers: ["required local fixture is unavailable"],
+          }),
+        },
+      });
+    }
+    return super.complete(input);
+  }
+}
+
 function tarGz(files) {
   const blocks = [];
   for (const [name, contentText] of Object.entries(files)) {
@@ -112,6 +483,7 @@ test("driver routing: real pi providers use the continuous session, mock/CLI fal
 });
 
 test("pi session preserves the configured xhigh thinking level", () => {
+  assert.equal(defaultConfig().auditModel, "gpt-5.6-sol");
   assert.equal(defaultConfig().thinkingLevel, "xhigh");
   assert.equal(mapThinkingLevel("off"), "off");
   assert.equal(mapThinkingLevel("minimal"), "minimal");
@@ -190,6 +562,170 @@ test("readScratchScopes accepts scope/spec/value/input map schema", () => {
   assert.equal(scopes[1].score, 20);
 });
 
+test("discovery backlog artifacts parse and merge without becoming findings", () => {
+  const session = newSession();
+  session.scratchFiles.set("coverage_gaps.json", JSON.stringify({
+    coverage_gaps: [
+      {
+        id: "G1",
+        scope_id: "S1",
+        region: "src/Vault.sol:10-80",
+        obligation: "Withdrawal authorization must bind signer to recipient.",
+        reason: "The dig found the sink but did not audit the signature domain separator.",
+        next_action: "Deep-audit the signature construction and caller path.",
+      },
+    ],
+  }));
+  session.scratchFiles.set("dig-S1/resource_requests.json", JSON.stringify([
+    {
+      id: "R1",
+      kind: "sandbox-image",
+      scope_id: "S1",
+      needed: "Foundry image with solc 0.7.6",
+      reason: "The native tests cannot compile in the baseline sandbox.",
+      unblock: "Run the PoC against the project test suite.",
+      priority: "high",
+    },
+  ]));
+  session.scratchFiles.set("dig-S1/followup_scopes.json", JSON.stringify({
+    followup_scopes: [
+      {
+        parent_scope_id: "S1",
+        obligation: "Domain separator construction must bind chain and verifying contract.",
+        region: "src/Permit.sol:40-95",
+        lenses: ["spec", "unbound-input"],
+        exposure: "high",
+        difficulty: "medium",
+        score: 8,
+        why: "An adjacent authorization precondition gates the withdrawal sink.",
+      },
+    ],
+  }));
+
+  const gaps = readScratchCoverageGaps(session);
+  assert.equal(gaps.length, 1);
+  assert.equal(gaps[0].scopeId, "S1");
+  assert.match(gaps[0].nextAction, /Deep-audit/);
+
+  const resources = readScratchResourceRequests(session);
+  assert.equal(resources.length, 1);
+  assert.equal(resources[0].kind, "sandbox-image");
+  assert.equal(resources[0].priority, "high");
+
+  const followups = readScratchFollowupScopes(session);
+  assert.equal(followups.length, 1);
+  assert.equal(followups[0].parentScopeId, "S1");
+  assert.equal(followups[0].source, "followup");
+
+  const merged = mergeFollowupScopes([
+    {
+      id: "S1",
+      obligation: "Withdrawal sink must enforce authorization.",
+      region: "src/Vault.sol:10-80",
+      lenses: ["value-flow"],
+      exposure: "critical",
+      difficulty: "high",
+      score: 10,
+      why: "Funds leave the system.",
+      status: "audited",
+    },
+  ], followups);
+  assert.equal(merged.added, 1);
+  assert.equal(merged.scopes.length, 2);
+  assert.equal(merged.scopes[1].status, "pending");
+
+  assert.equal(isReportFile("coverage_gaps.json"), true);
+  assert.equal(isReportFile("resource_requests.json"), true);
+  assert.equal(isReportFile("followup_scopes.json"), true);
+  assert.equal(isReportFile("scope_outcome.json"), true);
+});
+
+test("run health distinguishes blocked, shallow, and coverage-incomplete runs", () => {
+  const base = {
+    stoppedReason: "finished",
+    steps: [{ tool: "read" }, { tool: "bash" }, { tool: "write" }, { tool: "read" }],
+    commandRuns: [],
+    scopes: [],
+    confirmed: [],
+    hypotheses: [],
+    coverageGaps: [],
+    resourceRequests: [],
+    followupScopes: [],
+    mode: "breadth",
+  };
+
+  assert.equal(buildRunHealth(base).status, "healthy");
+  assert.equal(buildRunHealth({ ...base, steps: [{ tool: "read" }], mode: "map" }).status, "shallow");
+  assert.equal(buildRunHealth({
+    ...base,
+    resourceRequests: [{ id: "R1", status: "open", kind: "environment", needed: "FreeBSD VM", reason: "PoC needs platform-specific socket behavior" }],
+  }).status, "needs-resource");
+  assert.equal(buildRunHealth({
+    ...base,
+    coverageGaps: [{ id: "G1", status: "open", obligation: "Parser length must bind payload bytes", reason: "Budget ended before parser sink was audited" }],
+  }).status, "needs-coverage");
+  assert.equal(buildRunHealth({ ...base, stoppedReason: "error" }).status, "infra-failed");
+  assert.equal(buildRunHealth({ ...base, mode: "verify", steps: [...base.steps, { tool: "(session-error)" }] }).status, "healthy");
+  assert.equal(buildRunHealth({ ...base, infraErrors: 1 }).status, "infra-failed");
+  assert.equal(verifyBatchStoppedReason("error", 7, 7), "finished");
+  assert.equal(verifyBatchStoppedReason("error", 6, 7), "error");
+});
+
+test("audit sessions settle post-handoff transport errors only after phase-required artifacts exist", () => {
+  assert.equal(auditSessionHasDurableHandoff({
+    deep: true,
+    synthesize: false,
+    hasScopeOutcome: true,
+    hasFindingsArtifact: true,
+  }), true);
+  assert.equal(auditSessionHasDurableHandoff({
+    deep: true,
+    synthesize: false,
+    hasScopeOutcome: false,
+    hasFindingsArtifact: true,
+  }), false);
+  assert.equal(auditSessionHasDurableHandoff({
+    deep: true,
+    synthesize: false,
+    hasScopeOutcome: true,
+    hasFindingsArtifact: false,
+  }), false);
+  assert.equal(auditSessionHasDurableHandoff({
+    deep: true,
+    synthesize: true,
+    hasScopeOutcome: true,
+    hasFindingsArtifact: true,
+  }), true);
+  assert.equal(auditSessionHasDurableHandoff({
+    deep: true,
+    synthesize: true,
+    hasScopeOutcome: true,
+    hasFindingsArtifact: false,
+  }), false);
+  assert.equal(auditSessionHasDurableHandoff({
+    deep: false,
+    synthesize: false,
+    hasScopeOutcome: true,
+    hasFindingsArtifact: true,
+  }), false);
+});
+
+test("scope inventory merge appends novel scopes while preserving existing status", () => {
+  const existing = [
+    { id: "S1", obligation: "bind source", region: "src/A.sol:10", lenses: [], exposure: "high", difficulty: "low", score: 90, why: "old", status: "audited", digSeconds: 12 },
+  ];
+  const merged = mergeScopeInventory(existing, [
+    { id: "S1", obligation: "bind source", region: "src/A.sol:10", lenses: [], exposure: "high", difficulty: "low", score: 100, why: "duplicate" },
+    { id: "S1", obligation: "check recipient", region: "src/B.sol:20", lenses: [], exposure: "medium", difficulty: "low", score: 70, why: "new" },
+  ]);
+  assert.equal(merged.added, 1);
+  assert.equal(merged.skippedDuplicate, 1);
+  assert.equal(merged.scopes[0].status, "audited");
+  assert.equal(merged.scopes[0].digSeconds, 12);
+  assert.equal(merged.scopes[1].status, "pending");
+  assert.notEqual(merged.scopes[1].id, "S1", "new scope id is made unique");
+});
+
 test("prepare checkpoint guard blocks optional work after source is staged but manifest components are empty", () => {
   const state = { hasManifest: true, componentCount: 0, hasStagedSource: true };
   const blocked = prepareCheckpointDirective("Clue: official source", 18, state, "bash", { cmd: "find sources -type f" });
@@ -215,6 +751,8 @@ test("prompt contract keeps attacker-faithful PoC rule on legacy and pi-session 
   }
   assert.ok(AUDIT_SYSTEM.includes("findings.json is not an audit notebook"), "legacy prompt should keep audit notes out of findings");
   assert.ok(AUDIT_DEEP_SYSTEM.includes("Discharged-with-line obligations are useful reasoning, but they are not findings"), "legacy deep prompt should not emit safe obligations as findings");
+  assert.ok(DISCOVERY_BACKLOG_RULES.includes("followup_scopes.json"), "discovery backlog prompt should expose follow-up scope artifacts");
+  assert.ok(DISCOVERY_BACKLOG_RULES.includes("score is an integer 0-100"), "follow-up scope scores should use the same 100-point ordering scale as map scopes");
 
   const sessionPrompt = buildSessionPrompt({ cfg: defaultConfig(), fileManifest: "x.rs" });
   assert.ok(sessionPrompt.includes(POC_TRUST_RULE), "real pi session prompt is missing the shared PoC trust rule");
@@ -232,6 +770,10 @@ test("prompt contract keeps attacker-faithful PoC rule on legacy and pi-session 
 
   const mapPrompt = buildSessionPrompt({ cfg: defaultConfig(), fileManifest: "x.rs", map: true });
   assert.ok(!mapPrompt.includes("Record candidates by writing findings.json"), "map prompt should not inherit findings-report instructions");
+  const appendMapPrompt = buildSessionPrompt({ cfg: defaultConfig(), fileManifest: "x.rs", map: true, mapExistingScopesPath: "map_existing_scopes.json", mapExistingScopesCount: 2 });
+  assert.match(appendMapPrompt, /APPEND-MAP MODE/);
+  assert.match(appendMapPrompt, /map_existing_scopes\.json/);
+  assert.match(appendMapPrompt, /ONLY newly discovered/i);
   for (const prompt of [
     MAP_SYSTEM,
     mapPrompt,
@@ -325,19 +867,29 @@ test("prompt contract keeps attacker-faithful PoC rule on legacy and pi-session 
   assert.ok(confirmKickoff.includes("Do not write report_*.md"), "confirm kickoff should reserve formal reports for Report");
 });
 
-test("pi session resource loader isolates audits from host agent context", () => {
-  const loader = createIsolatedResourceLoader("Mode-specific rules.");
+test("pi session resource loader isolates audits from host agent context", async () => {
+  const loader = await createIsolatedResourceLoader("Mode-specific rules.");
   assert.deepEqual(loader.getSkills(), { skills: [], diagnostics: [] });
   assert.deepEqual(loader.getPrompts(), { prompts: [], diagnostics: [] });
   assert.deepEqual(loader.getAgentsFiles(), { agentsFiles: [] });
   assert.deepEqual(loader.getAppendSystemPrompt(), []);
-  assert.equal(loader.getExtensions().extensions.length, 0);
+  assert.deepEqual(loader.getExtensions().extensions.map((extension) => extension.path), ["<inline:flounder-reasoning-summary>"]);
   const prompt = loader.getSystemPrompt();
   assert.ok(prompt.includes("Flounder's isolated audit worker"));
   assert.ok(prompt.includes("Mode-specific rules."));
   assert.ok(prompt.includes("Do not load, apply, or ask for host agent instructions"));
   assert.ok(prompt.includes("SKILL.md"));
   assert.ok(prompt.includes("~/.codex"));
+});
+
+test("openai-codex sessions request detailed reasoning summaries without changing other providers", () => {
+  const payload = { model: "gpt-5.6-sol", reasoning: { effort: "xhigh", summary: "auto" } };
+  assert.deepEqual(withDetailedCodexReasoningSummary(payload, "openai-codex"), {
+    model: "gpt-5.6-sol",
+    reasoning: { effort: "xhigh", summary: "detailed" },
+  });
+  assert.equal(withDetailedCodexReasoningSummary(payload, "openai"), payload);
+  assert.equal(withDetailedCodexReasoningSummary({ model: "gpt-4.1" }, "openai-codex").reasoning, undefined);
 });
 
 test("empty findings.json is a completed artifact, not a forced-finalize miss", () => {
@@ -616,6 +1168,12 @@ test("bash refuses non-local or non-inspection commands without touching the wor
   }
 });
 
+test("bash command parsing preserves POSIX regex escapes inside double quotes", () => {
+  assert.deepEqual(splitCommandLineForTest('rg -n "hello new value \\(" scratch.txt'), {
+    argv: ["rg", "-n", "hello new value \\(", "scratch.txt"],
+  });
+});
+
 test("read, write, edit, and bash operate on loaded material and the copied workspace", async () => {
   const dir = await tempDir();
   try {
@@ -623,13 +1181,13 @@ test("read, write, edit, and bash operate on loaded material and the copied work
     cfg.sourcePaths = [fixtures];
     const logger = await tempLogger(dir);
     const source = [{ path: "circuit.rs", kind: "source", content: "fn assign() {\n  region.assign_advice(x);\n}\n" }];
-    const ctx = { cfg, source, corpus: [], memory: new ProjectMemory(path.join(dir, "memory.jsonl")), logger, session: newSession() };
+    const ctx = { cfg, source, corpus: [], memory: new ProjectMemory(path.join(dir, "memory.jsonl")), logger, session: newSession(), activityStreamId: "scope-a" };
 
     const read = await tool("read").run({ path: "circuit.rs", start: 1, end: 2 }, ctx);
     assert.match(read.observation, /assign_advice/);
     assert.match(read.observation, /circuit\.rs lines 1-2 of 4/);
 
-    await tool("write").run({ path: "scratch.txt", content: "hello old value\n" }, ctx);
+    await tool("write").run({ path: "scratch.txt", content: "hello old value (\n" }, ctx);
     const edited = await tool("edit").run({ path: "scratch.txt", old: "old", new: "new" }, ctx);
     assert.match(edited.observation, /edited scratch\.txt/);
     const scratch = await tool("read").run({ path: "scratch.txt" }, ctx);
@@ -643,9 +1201,85 @@ test("read, write, edit, and bash operate on loaded material and the copied work
     assert.match(run.observation, /not confirmation-eligible/);
     assert.match(run.observation, /standalone file/);
     assert.equal(ctx.session.commandRuns.length, 1);
-    assert.equal(ctx.session.commandRuns[0].passed, false);
-    assert.equal(ctx.session.commandRuns[0].targetLinked, false);
+    assert.equal(ctx.session.commandRuns.at(-1).passed, false);
+    assert.equal(ctx.session.commandRuns.at(-1).targetLinked, false);
+    const events = (await readFile(path.join(logger.runDir, "events.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
+    assert.equal(events.filter((event) => event.kind === "audit_command_start").every((event) => event.streamId === "scope-a"), true);
+    assert.equal(events.filter((event) => event.kind === "audit_command_run").every((event) => event.streamId === "scope-a"), true);
   } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("bash blocks build when pinned toolchain does not match sandbox image", async () => {
+  const dir = await tempDir();
+  const oldPath = process.env.PATH;
+  try {
+    const target = path.join(dir, "target");
+    const binDir = path.join(dir, "bin");
+    await mkdir(target, { recursive: true });
+    await mkdir(binDir, { recursive: true });
+    await writeFile(path.join(target, "Scarb.toml"), "[package]\nname = \"audit_target\"\nversion = \"0.1.0\"\n");
+    await writeFile(path.join(target, ".tool-versions"), "scarb 2.12.0\n");
+    const fakeScarb = path.join(binDir, "scarb");
+    await writeFile(fakeScarb, "#!/usr/bin/env bash\nif [ \"$1\" = \"--version\" ]; then echo 'scarb 2.19.0'; exit 0; fi\necho 'unexpected scarb command' >&2\nexit 0\n");
+    await chmod(fakeScarb, 0o755);
+    process.env.PATH = `${binDir}${path.delimiter}${oldPath ?? ""}`;
+
+    const cfg = defaultConfig();
+    cfg.sourcePaths = [target];
+    cfg.sandboxBackend = "host";
+    cfg.sandboxAllowHostFallback = true;
+    cfg.auditPrepare = true;
+    cfg.auditPrepareTimeoutMs = 10_000;
+    const logger = await tempLogger(dir);
+    const ctx = { cfg, source: [], corpus: [], memory: new ProjectMemory(path.join(dir, "memory.jsonl")), logger, session: newSession() };
+
+    const run = await tool("bash").run({ cmd: "scarb build", purpose: "build" }, ctx);
+    assert.match(run.observation, /sandbox image\/toolchain preflight failed/);
+    assert.match(run.observation, /scarb expected 2\.12\.0, actual scarb 2\.19\.0/);
+    assert.match(run.observation, /resource_requests\.json/);
+    assert.equal(ctx.session.commandRuns.length, 0);
+  } finally {
+    process.env.PATH = oldPath;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("bash prepare ignores sibling pinned toolchains outside the focused build command", async () => {
+  const dir = await tempDir();
+  const oldPath = process.env.PATH;
+  try {
+    const target = path.join(dir, "target");
+    const binDir = path.join(dir, "bin");
+    const logPath = path.join(dir, "tool.log");
+    await mkdir(target, { recursive: true });
+    await mkdir(path.join(target, "cairo"), { recursive: true });
+    await mkdir(binDir, { recursive: true });
+    await writeFile(path.join(target, "package.json"), "{\"scripts\":{\"test\":\"echo ok\"}}\n");
+    await writeFile(path.join(target, "yarn.lock"), "");
+    await writeFile(path.join(target, "cairo", "Scarb.toml"), "[package]\nname = \"audit_target\"\nversion = \"0.1.0\"\n");
+    await writeFile(path.join(target, "cairo", ".tool-versions"), "scarb 2.12.0\nstarknet-foundry 0.49.0\n");
+    const fakeYarn = path.join(binDir, "yarn");
+    await writeFile(fakeYarn, `#!/usr/bin/env bash\necho "yarn $PWD $*" >> ${JSON.stringify(logPath)}\nexit 0\n`);
+    await chmod(fakeYarn, 0o755);
+    process.env.PATH = `${binDir}${path.delimiter}${oldPath ?? ""}`;
+
+    const cfg = defaultConfig();
+    cfg.sourcePaths = [target];
+    cfg.sandboxBackend = "host";
+    cfg.sandboxAllowHostFallback = true;
+    cfg.auditPrepare = true;
+    cfg.auditPrepareTimeoutMs = 10_000;
+    const logger = await tempLogger(dir);
+    const ctx = { cfg, source: [], corpus: [], memory: new ProjectMemory(path.join(dir, "memory.jsonl")), logger, session: newSession() };
+
+    const run = await tool("bash").run({ cmd: "yarn install --frozen-lockfile", purpose: "build" }, ctx);
+    assert.doesNotMatch(run.observation, /sandbox image\/toolchain preflight failed/);
+    assert.match(await readFile(logPath, "utf8"), /yarn .* install --frozen-lockfile/);
+    assert.equal(ctx.session.commandRuns.length, 1);
+  } finally {
+    process.env.PATH = oldPath;
     await rm(dir, { recursive: true, force: true });
   }
 });
@@ -675,6 +1309,142 @@ test("confirmed executable commands must link model-written tests to pristine ta
   }
 });
 
+test("confirm target-link parsing ignores Foundry project root flags but keeps explicit files", () => {
+  const session = {
+    scratchFiles: new Map([["poc/standalone.t.sol", "contract Standalone {}"]]),
+    baselineFiles: new Set(["sources/silo-contracts-v3-3.5.0/silo-core/contracts/Silo.sol"]),
+  };
+
+  const projectRunnerArgs = commandFileArgsForTest({
+    program: "forge",
+    args: [
+      "test",
+      "--root",
+      "sources/silo-contracts-v3-3.5.0",
+      "--contracts",
+      "silo-core/contracts",
+      "--match-contract",
+      "SiloConfirmCoreRel",
+      "--via-ir",
+      "-vv",
+    ],
+  }, session);
+  assert.deepEqual(projectRunnerArgs, []);
+
+  const explicitFileArgs = commandFileArgsForTest({
+    program: "forge",
+    args: ["test", "poc/standalone.t.sol", "--match-contract", "Standalone"],
+  }, session);
+  assert.deepEqual(explicitFileArgs, ["poc/standalone.t.sol"]);
+});
+
+test("confirm target-link parsing resolves Foundry rooted match paths without treating runner flags as files", () => {
+  const testPath = "sources/deployed-v2/20220609-stable-pool-v2/test/StablePoolV2LiveForkNonconvergent.t.sol";
+  const session = {
+    scratchFiles: new Map([[testPath, "import '../sources/contracts/StableMath.sol';\ncontract Repro {}\n"]]),
+    baselineFiles: new Set(["sources/deployed-v2/20220609-stable-pool-v2/sources/contracts/StableMath.sol"]),
+  };
+  const command = {
+    program: "forge",
+    args: [
+      "test",
+      "--root",
+      "sources/deployed-v2/20220609-stable-pool-v2",
+      "--match-path",
+      "test/StablePoolV2LiveForkNonconvergent.t.sol",
+      "--fork-url",
+      "https://ethereum.publicnode.com",
+      "--use",
+      "0.7.6",
+      "--remappings",
+      "@balancer-labs/=sources/@balancer-labs/",
+      "-vv",
+    ],
+  };
+
+  assert.deepEqual(commandFileArgsForTest(command, session), [testPath]);
+  const targetLink = confirmCommandTargetLinkForTest(command, session);
+  assert.equal(targetLink.linked, true);
+});
+
+test("confirm target-link parsing resolves cwd-relative Hardhat test files to pristine imports", () => {
+  const testPath = "sources/evm-smart-contracts/test/BridgeAdapterSourceBinding.poc.ts";
+  const session = {
+    scratchFiles: new Map([[
+      testPath,
+      "import PRISTINE_BRIDGE_SOURCE from '../contracts/bridge/Bridge.sol';\n"
+        + "it('reproduces through target source', () => console.log(PRISTINE_BRIDGE_SOURCE));\n",
+    ]]),
+    baselineFiles: new Set([
+      "sources/evm-smart-contracts/contracts/bridge/Bridge.sol",
+      "sources/evm-smart-contracts/test/Bridge.ts",
+    ]),
+  };
+  const command = {
+    program: "npx",
+    args: ["hardhat", "test", "--no-compile", "test/BridgeAdapterSourceBinding.poc.ts"],
+    cwd: "sources/evm-smart-contracts",
+  };
+
+  assert.deepEqual(commandFileArgsForTest(command, session), [testPath]);
+  const targetLink = confirmCommandTargetLinkForTest(command, session);
+  assert.equal(targetLink.linked, true);
+});
+
+test("confirm target-link parsing follows command-line remappings from scratch tests to pristine source", () => {
+  const session = {
+    scratchFiles: new Map([[
+      "poc/test/StablePoolV2LiveForkNonconvergent.t.sol",
+      "import 'stablev2/contracts/StableMath.sol';\ncontract Repro {}\n",
+    ]]),
+    baselineFiles: new Set(["sources/deployed-v2/20220609-stable-pool-v2/sources/contracts/StableMath.sol"]),
+  };
+  const command = {
+    program: "forge",
+    args: [
+      "test",
+      "poc/test/StablePoolV2LiveForkNonconvergent.t.sol",
+      "--remappings",
+      "stablev2/=sources/deployed-v2/20220609-stable-pool-v2/sources/",
+      "-vv",
+    ],
+  };
+
+  assert.deepEqual(commandFileArgsForTest(command, session), ["poc/test/StablePoolV2LiveForkNonconvergent.t.sol"]);
+  const targetLink = confirmCommandTargetLinkForTest(command, session);
+  assert.equal(targetLink.linked, true);
+});
+
+test("confirm target-link parsing ignores Foundry config-path when matching scratch tests", () => {
+  const session = {
+    scratchFiles: new Map([[
+      "poc/test/OracleValueStopLossMidBasisPoC.t.sol",
+      "import 'metric-periphery/contracts/extensions/OracleValueStopLossExtension.sol';\ncontract Repro {}\n",
+    ]]),
+    baselineFiles: new Set([
+      "metric-periphery/contracts/extensions/OracleValueStopLossExtension.sol",
+      "poc/foundry.toml",
+    ]),
+  };
+  const command = {
+    program: "forge",
+    args: [
+      "test",
+      "--config-path",
+      "poc/foundry.toml",
+      "--match-path",
+      "poc/test/OracleValueStopLossMidBasisPoC.t.sol",
+      "--match-contract",
+      "OracleValueStopLossMidBasisPoCTest",
+      "-vv",
+    ],
+  };
+
+  assert.deepEqual(commandFileArgsForTest(command, session), ["poc/test/OracleValueStopLossMidBasisPoC.t.sol"]);
+  const targetLink = confirmCommandTargetLinkForTest(command, session);
+  assert.equal(targetLink.linked, true);
+});
+
 test("failed bash command events include an output preview for the UI", async () => {
   const dir = await tempDir();
   try {
@@ -698,6 +1468,41 @@ test("failed bash command events include an output preview for the UI", async ()
     const commandEvent = events.find((event) => event.kind === "audit_command_run");
     assert.equal(commandEvent.exitCode, 1);
     assert.match(commandEvent.output, /VISIBLE_FAILURE_REASON/);
+    assert.ok(commandEvent.output.length <= 2600, "event output preview should stay bounded");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("failed bash command previews preserve early diagnostics and late context", async () => {
+  const dir = await tempDir();
+  try {
+    const cfg = defaultConfig();
+    cfg.sourcePaths = [fixtures];
+    const logger = await tempLogger(dir);
+    const ctx = { cfg, source: [], corpus: [], memory: new ProjectMemory(path.join(dir, "memory.jsonl")), logger, session: newSession() };
+
+    await tool("write").run({
+      path: "noisy_compiler_failure.test.mjs",
+      content: [
+        "import test from 'node:test';",
+        "test('noisy compiler output', () => {",
+        "  console.log('EARLY_COMPILE_ERROR: unresolved Cairo symbol');",
+        "  for (let i = 0; i < 220; i += 1) console.log('warning ' + i + ': workspace manifest profile output');",
+        "  console.log('LATE_COMPILER_CONTEXT: Scarb exited with error');",
+        "  throw new Error('NOISY_COMPILER_FAIL');",
+        "});",
+      ].join("\n"),
+    }, ctx);
+    const run = await tool("bash").run({ cmd: "node --test noisy_compiler_failure.test.mjs", purpose: "confirm", success_patterns: ["NEVER_SEEN"] }, ctx);
+    assert.match(run.observation, /EARLY_COMPILE_ERROR/);
+    assert.match(run.observation, /LATE_COMPILER_CONTEXT/);
+
+    const events = (await readFile(logger.eventsPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const commandEvent = events.find((event) => event.kind === "audit_command_run");
+    assert.equal(commandEvent.exitCode, 1);
+    assert.match(commandEvent.output, /EARLY_COMPILE_ERROR/);
+    assert.match(commandEvent.output, /LATE_COMPILER_CONTEXT/);
     assert.ok(commandEvent.output.length <= 2600, "event output preview should stay bounded");
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -748,6 +1553,12 @@ test("prepare/confirm report files may cite public URLs while generated PoC file
     }, ctx);
     assert.match(confirm.observation, /wrote confirm_decision\.json/);
 
+    const impact = await tool("write").run({
+      path: "impact_inventory.json",
+      content: JSON.stringify({ items: [{ bug: "x", status: "unknown", blockers: ["needs live balance sizing"] }] }),
+    }, ctx);
+    assert.match(impact.observation, /wrote impact_inventory\.json/);
+
     const poc = await tool("write").run({
       path: "exploit.test.mjs",
       content: "fetch('https://mainnet.example/rpc');\n",
@@ -784,7 +1595,7 @@ test("sandbox workspace copy and read skip symlinks that point outside the sourc
     const safe = await tool("read").run({ path: "safe.txt" }, ctx);
     assert.match(safe.observation, /safe/);
     const leaked = await tool("read").run({ path: "leak.txt" }, ctx);
-    assert.match(leaked.observation, /no loaded or sandbox file matches/i);
+    assert.match(leaked.observation, /no authorized source/i);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -839,6 +1650,16 @@ test("baseline integrity: the model cannot modify the target source under audit"
     // A new test file is fine.
     const newFile = await tool("write").run({ path: "exploit_test.rs", content: "// poc\n" }, ctx);
     assert.match(newFile.observation, /wrote exploit_test\.rs/);
+
+    const harnessManifest = await tool("write").run({ path: "verify_poc/Scarb.toml", content: "[package]\nname = \"verify_poc\"\nversion = \"0.1.0\"\n" }, ctx);
+    assert.match(harnessManifest.observation, /wrote verify_poc\/Scarb\.toml/);
+
+    const scratchHarnessManifest = await tool("write").run({ path: ".tmp/verify_poc/Scarb.toml", content: "[package]\nname = \"verify_poc\"\nversion = \"0.1.0\"\n" }, ctx);
+    assert.match(scratchHarnessManifest.observation, /wrote \.tmp\/verify_poc\/Scarb\.toml/);
+
+    const topLevelManifest = await tool("write").run({ path: "Scarb.toml", content: "[package]\nname = \"production_shim\"\nversion = \"0.1.0\"\n" }, ctx);
+    assert.match(topLevelManifest.observation, /blocked/i);
+    assert.match(topLevelManifest.observation, /production source files must stay pristine/i);
 
     session.baselineFiles.add("contracts/contracts/Proxy.sol");
     const newNativeTest = await tool("write").run({ path: "contracts/test/hidden_upgrade_target_hash.spec.ts", content: "// poc\n" }, ctx);
@@ -932,14 +1753,89 @@ test("independent refutation: a skeptic verdict is attached to each confirmed fi
         return JSON.stringify({ refuted: false, reason: "could not refute" });
       },
     };
-    const verdicts = await runRefutation({ findings, source, cfg, llm, logger, max: 8 });
+    const result = await runRefutation({ findings, source, cfg, llm, logger, max: 8 });
+    const verdicts = result.verdicts;
     assert.equal(verdicts.length, 2);
+    assert.equal(result.errors.length, 0);
     assert.equal(findings[0].refutation.refuted, false);
     assert.equal(findings[1].refutation.refuted, true);
     assert.match(findings[1].refutation.reason, /enforced/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("discharge challenge preserves a mechanism-specific identity inside a broad obligation", async () => {
+  const dir = await tempDir();
+  try {
+    const cfg = defaultConfig();
+    const logger = await tempLogger(dir);
+    const source = [{ path: "x.rs", kind: "source", content: "fn ratio() {}\n" }];
+    const findings = [{ id: "discharge:S1:O1", title: "DISCHARGED: every ratio input is bounded", severity: "high", location: "x.rs:1", description: "broad obligation", evidence: "", exploitSketch: "", fix: "", confidence: 0.8, confirmationStatus: "discharged" }];
+    const llm = {
+      async complete() {
+        return JSON.stringify({
+          unsound: true,
+          title: "Denominator uncertainty is understated by additive spread aggregation",
+          gap: "x.rs:1 divides by an uncertain denominator but only adds input spreads.",
+          reason: "The broad bound does not conservatively contain division error.",
+        });
+      },
+    };
+
+    const [verdict] = await runDischargeChallenge({ findings, source, cfg, llm, logger, max: 1 });
+    assert.equal(verdict.title, "Denominator uncertainty is understated by additive spread aggregation");
+    assert.equal(dischargeChallengeFindingTitle(verdict, findings[0].title), verdict.title);
+    assert.notEqual(
+      dischargeChallengeFindingTitle(verdict, findings[0].title),
+      dischargeChallengeFindingTitle({ title: "Quote-feed staleness class is ignored" }, findings[0].title),
+      "different mechanisms under one broad obligation must not share a canonical title",
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("discharge challenge reviews only outcomes produced by the current run", () => {
+  const prior = { scopeId: "S1", sample: 1, obligations: [] };
+  const currentOldSample = { scopeId: "S2", sample: 1, obligations: [] };
+  const currentLatestSample = { scopeId: "S2", sample: 2, obligations: [] };
+  const selected = dischargeChallengeScopeOutcomes([prior, currentOldSample], [currentOldSample, currentLatestSample]);
+  assert.deepEqual(selected, [currentLatestSample]);
+  assert.equal(selected.includes(prior), false, "persisted outcomes from prior runs must not be replayed");
+});
+
+test("refutation reports model-call errors without manufacturing a verdict", async () => {
+  const dir = await tempDir();
+  try {
+    const cfg = defaultConfig();
+    const logger = await tempLogger(dir);
+    const source = [{ path: "x.rs", kind: "source", content: "fn check() {}\n" }];
+    const findings = [
+      { id: "f1", title: "candidate", severity: "high", location: "x.rs:1", description: "", evidence: "", exploitSketch: "", fix: "", confidence: 0.9, confirmationStatus: "confirmed-executable" },
+    ];
+    const llm = { async complete() { throw new Error("session completion returned no text"); } };
+    const result = await runRefutation({ findings, source, cfg, llm, logger, max: 8 });
+    assert.equal(result.attempted, 1);
+    assert.equal(result.verdicts.length, 0);
+    assert.equal(result.errors.length, 1);
+    assert.equal(findings[0].refutation, undefined);
+    assert.match(result.errors[0].error, /no text/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("pi session provider failures preserve their upstream error message", () => {
+  assert.equal(
+    assistantMessageError({ role: "assistant", content: [], stopReason: "error", errorMessage: "usage limit reached; retry later" }),
+    "usage limit reached; retry later",
+  );
+  assert.equal(
+    assistantMessageError({ role: "assistant", content: [], stopReason: "aborted" }),
+    "provider returned stopReason=aborted",
+  );
+  assert.equal(assistantMessageError({ role: "assistant", content: [], stopReason: "stop" }), undefined);
 });
 
 test("forced finalize: a run that never writes findings.json still captures hypotheses", async () => {
@@ -1080,6 +1976,15 @@ test("differential confirmation: a real fix blocks the exploit; a no-op fix does
   }
 });
 
+test("differential confirmation never grants a rerun more network than the cited exploit run", () => {
+  const cfg = { ...defaultConfig(), confirmMode: true, sandboxConfirmNetwork: "enabled" };
+  assert.equal(differentialNetworkForExploitRun(cfg, { network: "enabled" }), "enabled");
+  assert.equal(differentialNetworkForExploitRun(cfg, { network: "none" }), "none");
+  assert.equal(differentialNetworkForExploitRun(cfg, {}), "none");
+  assert.equal(differentialNetworkForExploitRun({ ...cfg, sandboxConfirmNetwork: "none" }, { network: "enabled" }), "none");
+  assert.equal(differentialNetworkForExploitRun({ ...cfg, confirmMode: false }, { network: "enabled" }), "none");
+});
+
 test("disclosure report only labels patch-blocking patterns after differential confirmation", () => {
   const baseFinding = {
     id: "f1",
@@ -1113,7 +2018,7 @@ test("audit produces an execution-confirmed finding and banks cross-run memory",
     await writeFile(corpusFile, "# Protocol spec\nThe nullifier must be unique per note.\n");
     const cfg = defaultConfig();
     cfg.targetName = "agent-e2e";
-    cfg.sourcePaths = [fixtures];
+    cfg.sourcePaths = [path.join(fixtures, "mock_target.mjs")];
     cfg.corpusPaths = [corpusFile];
     cfg.outputDir = path.join(dir, "runs");
     cfg.auditMaxSteps = 10;
@@ -1206,6 +2111,174 @@ test("map → dig: --deep enumerates scopes then deep-audits each, tagging findi
     assert.equal(summary.findings[0].confirmationStatus, "confirmed-executable");
     const findingsArtifact = JSON.parse(await readFile(path.join(runDir, "audit_findings.json"), "utf8"));
     assert.equal(findingsArtifact[0].scopeId, "S1", "dig findings are tagged with the scope they came from");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("zero-finding dig outcomes still trigger complete cross-scope synthesis", async () => {
+  const dir = await tempDir();
+  try {
+    const cfg = defaultConfig();
+    cfg.targetName = "outcome-synthesis-e2e";
+    cfg.sourcePaths = [fixtures];
+    cfg.outputDir = path.join(dir, "runs");
+    cfg.auditDeep = true;
+    cfg.auditMaxScopes = 2;
+    cfg.auditChallengeDischarges = false;
+    cfg.auditRefute = false;
+    const llm = new OutcomeOnlySynthesisLlmClient();
+
+    const { runDir, summary } = await runAudit(cfg, { llm });
+    assert.equal(summary.findings.length, 0);
+    assert.ok(llm.synthesisCalls > 0, "new coverage outcomes must trigger synthesis even with zero findings");
+    assert.equal(llm.sawOutcomeArtifact, true, "synthesis receives the complete outcome ledger by file, not a truncated prompt list");
+    const outcomes = JSON.parse(await readFile(path.join(runDir, "scope_outcomes.json"), "utf8"));
+    assert.equal(outcomes.length, 2);
+    assert.equal(outcomes[0].coverageComplete, true, JSON.stringify(outcomes));
+    const runHealth = JSON.parse(await readFile(path.join(runDir, "run_health.json"), "utf8"));
+    assert.equal(runHealth.signals.scopeOutcomesIncomplete, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("incomplete dig coverage remains pending after serial and concurrent attempts", async () => {
+  const dir = await tempDir();
+  try {
+    for (const concurrency of [1, 2]) {
+      const cfg = defaultConfig();
+      cfg.targetName = `incomplete-coverage-${concurrency}`;
+      cfg.sourcePaths = [fixtures];
+      cfg.outputDir = path.join(dir, `runs-${concurrency}`);
+      cfg.auditDeep = true;
+      cfg.auditMaxScopes = 1;
+      cfg.auditDigSamples = 1;
+      cfg.auditDigMaxSamples = 1;
+      cfg.auditDigConcurrency = concurrency;
+      cfg.auditSynthesize = false;
+      cfg.auditChallengeDischarges = false;
+      cfg.auditRefute = false;
+
+      const { runDir, scopeCoverage } = await runAudit(cfg, { llm: new IncompleteOutcomeLlmClient() });
+      const scopes = JSON.parse(await readFile(path.join(runDir, "audit_scopes.json"), "utf8"));
+      assert.equal(scopes.find((scope) => scope.id === "S1").status, "pending", `concurrency ${concurrency}`);
+      assert.deepEqual(scopeCoverage, { total: 2, audited: 0, pending: 2, deferred: 0 }, `concurrency ${concurrency}`);
+      const events = (await readFile(path.join(runDir, "events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+      const done = events.find((event) => event.kind === "audit_dig_done");
+      assert.equal(done.coverageComplete, false, `concurrency ${concurrency}`);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("standard dig target counts coverage-complete scopes instead of attempts", async () => {
+  const dir = await tempDir();
+  try {
+    for (const concurrency of [1, 2]) {
+      const cfg = defaultConfig();
+      cfg.targetName = `complete-scope-target-${concurrency}`;
+      cfg.sourcePaths = [fixtures];
+      cfg.outputDir = path.join(dir, `runs-${concurrency}`);
+      cfg.auditDeep = true;
+      cfg.auditMaxScopes = 1;
+      cfg.auditDigSamples = 1;
+      cfg.auditDigMaxSamples = 1;
+      cfg.auditDigConcurrency = concurrency;
+      cfg.auditSynthesize = false;
+      cfg.auditChallengeDischarges = false;
+      cfg.auditRefute = false;
+
+      const { runDir, scopeCoverage } = await runAudit(cfg, { llm: new FirstIncompleteThenCompleteOutcomeLlmClient() });
+      const scopes = JSON.parse(await readFile(path.join(runDir, "audit_scopes.json"), "utf8"));
+      assert.equal(scopes.find((scope) => scope.id === "S1").status, "pending", `concurrency ${concurrency}`);
+      assert.equal(scopes.find((scope) => scope.id === "S2").status, "audited", `concurrency ${concurrency}`);
+      assert.deepEqual(scopeCoverage, { total: 2, audited: 1, pending: 1, deferred: 0 }, `concurrency ${concurrency}`);
+      const events = (await readFile(path.join(runDir, "events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+      assert.equal(events.filter((event) => event.kind === "audit_dig_done").length, 2, `concurrency ${concurrency}`);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("resuming requeues legacy audited scopes whose durable outcome is incomplete", async () => {
+  const dir = await tempDir();
+  try {
+    const cfg = defaultConfig();
+    cfg.targetName = "legacy-incomplete-coverage";
+    cfg.sourcePaths = [fixtures];
+    cfg.outputDir = path.join(dir, "runs");
+    cfg.auditDeep = true;
+    cfg.auditMaxScopes = 1;
+    cfg.auditDigSamples = 1;
+    cfg.auditDigMaxSamples = 1;
+    cfg.auditSynthesize = false;
+    cfg.auditChallengeDischarges = false;
+    cfg.auditRefute = false;
+
+    await runAudit(cfg, { llm: new IncompleteOutcomeLlmClient() });
+    const historyDir = path.join(cfg.outputDir, "history", cfg.targetName);
+    const scopesPath = path.join(historyDir, "scopes.json");
+    const legacyScopes = JSON.parse(await readFile(scopesPath, "utf8"));
+    legacyScopes.find((scope) => scope.id === "S1").status = "audited";
+    await writeFile(scopesPath, JSON.stringify(legacyScopes), "utf8");
+
+    cfg.auditMaxScopes = 0;
+    const { runDir, scopeCoverage } = await runAudit(cfg, { llm: new IncompleteOutcomeLlmClient() });
+    assert.deepEqual(scopeCoverage, { total: 2, audited: 0, pending: 2, deferred: 0 });
+    const repairedScopes = JSON.parse(await readFile(scopesPath, "utf8"));
+    assert.equal(repairedScopes.find((scope) => scope.id === "S1").status, "pending");
+    const events = (await readFile(path.join(runDir, "events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(events.find((event) => event.kind === "audit_scope_coverage_requeued")?.scopes, ["S1"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("pinned region audits persist the same scope outcome contract", async () => {
+  const dir = await tempDir();
+  try {
+    const cfg = defaultConfig();
+    cfg.targetName = "pinned-outcome-e2e";
+    cfg.sourcePaths = [fixtures];
+    cfg.outputDir = path.join(dir, "runs");
+    cfg.auditDeep = true;
+    cfg.auditDeepFocus = "producer-region-marker";
+    cfg.auditRefute = false;
+    cfg.auditChallengeDischarges = false;
+
+    const { runDir } = await runAudit(cfg, { llm: new OutcomeOnlySynthesisLlmClient() });
+    const outcomes = JSON.parse(await readFile(path.join(runDir, "scope_outcomes.json"), "utf8"));
+    assert.equal(outcomes.length, 1);
+    assert.match(outcomes[0].scopeId, /^region-[a-f0-9]{12}$/);
+    assert.equal(outcomes[0].coverageComplete, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("post-dig refutation covers every confirmed candidate beyond one eight-item batch", async () => {
+  const dir = await tempDir();
+  try {
+    const cfg = defaultConfig();
+    cfg.targetName = "refutation-full-coverage";
+    cfg.sourcePaths = [fixtures];
+    cfg.corpusPaths = [fixtures];
+    cfg.outputDir = path.join(dir, "runs");
+    cfg.auditDeep = true;
+    cfg.auditMaxScopes = 9;
+    cfg.auditSynthesize = false;
+    cfg.auditAppeal = false;
+    cfg.auditChallengeDischarges = false;
+    const llm = new ManyScopeRefutationLlmClient();
+
+    const { runDir } = await runAudit(cfg, { llm });
+    assert.equal(llm.refutedTags.length, 9, "every confirmed candidate receives a skeptic verdict");
+    const events = (await readFile(path.join(runDir, "events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const stage = events.findLast((event) => event.kind === "audit_refutation");
+    assert.ok(stage, "refutation verdicts are persisted as evidence");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -1405,9 +2478,785 @@ test("verify mode isolates generated PoC files between candidates", async () => 
     const transcript = JSON.parse(await readFile(path.join(runDir, "audit_transcript.json"), "utf8"));
     const markerReads = transcript.steps.filter((step) => step.tool === "read" && step.args?.path === "tests/verify-marker.poc.test.js");
     assert.equal(markerReads.length, 1);
-    assert.match(markerReads[0].observation, /no loaded or sandbox file matches "tests\/verify-marker\.poc\.test\.js"/);
+    assert.match(markerReads[0].observation, /no authorized source.*"tests\/verify-marker\.poc\.test\.js"/);
     assert.ok((await stat(path.join(runDir, "audit", "verify-1", "tests", "verify-marker.poc.test.js"))).isFile());
     await assert.rejects(stat(path.join(runDir, "audit", "verify-2", "tests", "verify-marker.poc.test.js")), /ENOENT/);
+    const events = (await readFile(path.join(runDir, "events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const verifyStreams = new Set(events.filter((event) => event.streamId?.startsWith("verify-")).map((event) => event.streamId));
+    assert.deepEqual([...verifyStreams].sort(), ["verify-1", "verify-2"], "concurrent verify activity remains independently selectable in the UI");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("verify progress counts settled verdicts instead of candidate indexes", async () => {
+  const dir = await tempDir();
+  try {
+    const verifyFile = path.join(dir, "to-verify.json");
+    await writeFile(verifyFile, JSON.stringify([
+      { title: "first missing verdict", location: "halo2_missing_constraint.rs:5", severity: "high", description: "no local setup" },
+      {
+        title: "second settled verdict",
+        location: "halo2_missing_constraint.rs:5",
+        severity: "high",
+        description: "trace the binding",
+        originId: 42,
+        phaseAttempt: { subjectType: "finding", subjectId: 42, inputFingerprint: "sha256:verify-refuted" },
+      },
+    ]), "utf8");
+    const cfg = defaultConfig();
+    cfg.targetName = "verify-progress-e2e";
+    cfg.sourcePaths = [fixtures];
+    cfg.corpusPaths = [fixtures];
+    cfg.outputDir = path.join(dir, "runs");
+    cfg.auditVerify = verifyFile;
+    cfg.auditVerifyConcurrency = 1;
+    cfg.auditRefute = false;
+    const progress = [];
+    const phaseAttempts = [];
+    const tracker = {
+      runDbId: undefined,
+      scopes() {},
+      runScopes(done, target) { progress.push({ done, target }); },
+      findings() {},
+      phaseAttempt(input) { phaseAttempts.push(input); },
+      stage() {},
+      confirmDecisions() {},
+      findingReports() {},
+      finish() {},
+    };
+
+    const { runDir, summary } = await runAudit(cfg, { llm: new VerifyProgressLlmClient(), makeTracker: () => tracker });
+    assert.deepEqual(progress.at(-1), { done: 1, target: 2 });
+    assert.equal(progress.some((entry) => entry.done === 2), false, "a later verdict must not make an earlier missing verdict look complete");
+    assert.equal(phaseAttempts.findLast((attempt) => attempt.subjectId === 42 && attempt.state === "settled")?.outcome, "refuted");
+    assert.equal(summary.findings.length, 0, "a passed mitigation command must not count a REFUTED verdict as a vulnerability");
+    const findings = JSON.parse(await readFile(path.join(runDir, "audit_findings.json"), "utf8"));
+    const hypotheses = JSON.parse(await readFile(path.join(runDir, "audit_hypotheses.json"), "utf8"));
+    assert.equal(findings.length, 0);
+    assert.equal(hypotheses.length, 1);
+    assert.match(hypotheses[0].title, /^REFUTED:/);
+    assert.equal(hypotheses[0].confirmationStatus, "suspected");
+    assert.equal(summary.coverage.hypotheses, 0, "terminal refutations are not unresolved hypotheses");
+    assert.equal(summary.coverage.refuted, 1);
+    const persistedSummary = JSON.parse(await readFile(path.join(runDir, "summary.json"), "utf8"));
+    assert.equal(persistedSummary.coverage.hypotheses, 0);
+    assert.equal(persistedSummary.coverage.refuted, 1);
+    const report = await readFile(path.join(runDir, "audit_report.md"), "utf8");
+    assert.match(report, /Refuted claims — terminal, no further verification required \(1\)/);
+    assert.doesNotMatch(report, /Hypotheses — suspected, need a human or a test/);
+    await assert.rejects(stat(path.join(runDir, "report_f1.md")), /ENOENT/, "refuted verdicts must not get disclosure artifacts");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("startup reconciliation repairs dropped remote refutations and their phase outcomes", async () => {
+  const dir = await tempDir();
+  const sourceRunDir = path.join(dir, "source-run");
+  const verifyRunDir = path.join(dir, "verify-run");
+  try {
+    let store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "verify-reconciliation" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: sourceRunDir });
+    const verifyRunId = store.startRun({ projectId, kind: "audit", runDir: verifyRunDir, budgets: { verify: true } });
+    store.upsertFindings(projectId, sourceRunId, [{
+      findingKey: "dropped-refutation",
+      title: "Explicit design intent makes the seeded claim false",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "suspected",
+      reportPath: path.join(sourceRunDir, "report_f1.md"),
+    }]);
+    const finding = store.queryFindings(projectId, { search: "Explicit design intent" })[0];
+    store.recordFindingPhaseAttempt(projectId, verifyRunId, {
+      subjectType: "finding",
+      subjectId: Number(finding.id),
+      phase: "verify",
+      inputFingerprint: "sha256:dropped-refutation",
+      state: "settled",
+      outcome: "confirmed-executable",
+      metrics: { findings: 1 },
+    });
+    store.finishRun(sourceRunId, "done");
+    store.finishRun(verifyRunId, "error");
+    store.close();
+
+    await mkdir(verifyRunDir, { recursive: true });
+    await writeFile(path.join(verifyRunDir, "audit_findings.json"), JSON.stringify([{
+      id: "f1",
+      originId: Number(finding.id),
+      title: "REFUTED: Explicit design intent makes the seeded claim false",
+      location: "src/Foo.sol:1",
+      severity: "info",
+      description: "The seeded property is explicitly not required.",
+      evidence: "The design material states the prospective behavior.",
+      exploitSketch: "No attacker path exists.",
+      fix: "No change required.",
+      confidence: 0.99,
+      confirmationStatus: "confirmed-executable",
+    }]));
+
+    store = MetadataStore.openForOutput(dir);
+    const repaired = store.getFinding(Number(finding.id));
+    assert.equal(repaired.status, "refuted");
+    assert.equal(repaired.report_path, null);
+    assert.equal(repaired.report_markdown, null);
+    const attempt = store.latestFindingPhaseAttempt("finding", Number(finding.id), "verify");
+    assert.equal(attempt.state, "settled");
+    assert.equal(attempt.outcome, "refuted");
+    assert.equal(attempt.metrics_json, JSON.stringify({ findings: 1 }), "reconciliation preserves attempt metrics");
+    const repairedAt = attempt.updated_at;
+    store.close();
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    store = MetadataStore.openForOutput(dir);
+    assert.equal(
+      store.latestFindingPhaseAttempt("finding", Number(finding.id), "verify").updated_at,
+      repairedAt,
+      "reopening an already-reconciled store must not rewrite attempt timestamps",
+    );
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("startup reconciliation preserves skeptic refutation after an unsuccessful appeal", async () => {
+  const dir = await tempDir();
+  const sourceRunDir = path.join(dir, "source-run");
+  const verifyRunDir = path.join(dir, "verify-run");
+  try {
+    let store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "appeal-refutation-reconciliation" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: sourceRunDir });
+    store.upsertFindings(projectId, sourceRunId, [{
+      findingKey: "appeal-refutation",
+      title: "Reviewer-rejected candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "suspected",
+    }]);
+    const finding = store.queryFindings(projectId, { search: "Reviewer-rejected candidate" })[0];
+    const verifyRunId = store.startRun({ projectId, kind: "verify", runDir: verifyRunDir });
+    store.recordFindingPhaseAttempt(projectId, verifyRunId, {
+      subjectType: "finding",
+      subjectId: Number(finding.id),
+      phase: "verify",
+      inputFingerprint: "sha256:appeal-refutation",
+      state: "blocked",
+      blocker: "terminal artifact not yet reconciled",
+    });
+    store.finishRun(sourceRunId, "done");
+    store.finishRun(verifyRunId, "done");
+    store.close();
+
+    await mkdir(verifyRunDir, { recursive: true });
+    await writeFile(path.join(verifyRunDir, "audit_hypotheses.json"), JSON.stringify([{
+      id: "f1",
+      originId: Number(finding.id),
+      title: "Reviewer-rejected candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      confirmationStatus: "suspected",
+      disputed: true,
+      refutationStatus: "refuted",
+      refutationReason: "The PoC relies on an attacker capability excluded by the trust model.",
+      refutation: { refuted: true, unrealistic: true, reason: "The PoC relies on an attacker capability excluded by the trust model." },
+      appeal: { attempted: true, upheld: false, reason: "no faithful PoC produced on appeal" },
+    }]));
+
+    store = MetadataStore.openForOutput(dir);
+    const repaired = store.getFinding(Number(finding.id));
+    assert.equal(repaired.status, "refuted");
+    assert.equal(repaired.refutation_status, "refuted");
+    assert.equal(repaired.refutation_reason, "The PoC relies on an attacker capability excluded by the trust model.");
+    const attempt = store.latestFindingPhaseAttempt("finding", Number(finding.id), "verify");
+    assert.equal(attempt.state, "settled");
+    assert.equal(attempt.outcome, "refuted");
+    assert.equal(attempt.blocker, null);
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("startup reconciliation never lets an old refutation overwrite a newer confirmed retry", async () => {
+  const dir = await tempDir();
+  const sourceRunDir = path.join(dir, "source-run");
+  const oldVerifyDir = path.join(dir, "old-verify");
+  const newVerifyDir = path.join(dir, "new-verify");
+  try {
+    let store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "verify-authority" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: sourceRunDir });
+    store.upsertFindings(projectId, sourceRunId, [{
+      findingKey: "verify-authority",
+      title: "Retry authority candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "suspected",
+    }]);
+    const finding = store.queryFindings(projectId, { search: "Retry authority candidate" })[0];
+    const oldVerifyId = store.startRun({ projectId, kind: "audit", runDir: oldVerifyDir, budgets: { verify: true } });
+    store.recordFindingPhaseAttempt(projectId, oldVerifyId, {
+      subjectType: "finding",
+      subjectId: Number(finding.id),
+      phase: "verify",
+      inputFingerprint: "sha256:old-refutation",
+      state: "blocked",
+      blocker: "remote verdict was dropped",
+    });
+    const newVerifyId = store.startRun({ projectId, kind: "audit", runDir: newVerifyDir, budgets: { verify: true } });
+    store.recordFindingPhaseAttempt(projectId, newVerifyId, {
+      subjectType: "finding",
+      subjectId: Number(finding.id),
+      phase: "verify",
+      inputFingerprint: "sha256:new-confirmation",
+      state: "settled",
+      outcome: "confirmed-differential",
+    });
+    store.upsertFindings(projectId, newVerifyId, [{
+      findingKey: "verify-authority-confirmed",
+      originId: Number(finding.id),
+      title: "Retry authority candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-differential",
+      reportPath: path.join(newVerifyDir, "report_f1.md"),
+      reportMarkdown: "# New confirmed report\n",
+    }]);
+    store.finishRun(sourceRunId, "done");
+    store.finishRun(oldVerifyId, "error");
+    store.finishRun(newVerifyId, "done");
+    store.close();
+
+    await mkdir(oldVerifyDir, { recursive: true });
+    await mkdir(newVerifyDir, { recursive: true });
+    await writeFile(path.join(oldVerifyDir, "audit_findings.json"), JSON.stringify([{
+      id: "f1",
+      originId: Number(finding.id),
+      title: "REFUTED: Retry authority candidate",
+      location: "src/Foo.sol:1",
+      severity: "info",
+      confirmationStatus: "confirmed-executable",
+    }]));
+    await writeFile(path.join(newVerifyDir, "audit_findings.json"), JSON.stringify([{
+      id: "f1",
+      originId: Number(finding.id),
+      title: "Retry authority candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      confirmationStatus: "confirmed-differential",
+    }]));
+
+    store = MetadataStore.openForOutput(dir);
+    const canonical = store.getFinding(Number(finding.id));
+    assert.equal(canonical.status, "confirmed-differential");
+    assert.equal(canonical.run_id, newVerifyId);
+    assert.equal(canonical.report_path, path.join(newVerifyDir, "report_f1.md"));
+    assert.equal(canonical.report_markdown, "# New confirmed report\n");
+    const attempts = store.listFindingPhaseAttempts("finding", Number(finding.id));
+    assert.equal(attempts.find((attempt) => attempt.run_id === oldVerifyId).outcome, "refuted", "the old attempt itself is repaired");
+    assert.equal(attempts.find((attempt) => attempt.run_id === oldVerifyId).blocker, null);
+    assert.equal(attempts.find((attempt) => attempt.run_id === newVerifyId).outcome, "confirmed-differential");
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a late verdict from an older verify attempt cannot overwrite the newer retry", async () => {
+  const dir = await tempDir();
+  try {
+    const store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "late-verify-verdict" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: path.join(dir, "source-run") });
+    store.upsertFindings(projectId, sourceRunId, [{ findingKey: "late-verdict", title: "Late verdict candidate", location: "src/Foo.sol:1", severity: "high", status: "suspected" }]);
+    const finding = store.queryFindings(projectId, { search: "Late verdict candidate" })[0];
+    const oldVerifyId = store.startRun({ projectId, kind: "audit", runDir: path.join(dir, "old-verify"), budgets: { verify: true } });
+    store.recordFindingPhaseAttempt(projectId, oldVerifyId, {
+      subjectType: "finding", subjectId: Number(finding.id), phase: "verify", inputFingerprint: "sha256:old", state: "running",
+    });
+    const newVerifyId = store.startRun({ projectId, kind: "audit", runDir: path.join(dir, "new-verify"), budgets: { verify: true } });
+    store.recordFindingPhaseAttempt(projectId, newVerifyId, {
+      subjectType: "finding", subjectId: Number(finding.id), phase: "verify", inputFingerprint: "sha256:new", state: "settled", outcome: "confirmed-differential",
+    });
+    store.upsertFindings(projectId, newVerifyId, [{
+      findingKey: "late-verdict-new",
+      originId: Number(finding.id),
+      title: "Late verdict candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-differential",
+      reportPath: path.join(dir, "new-verify", "report_f1.md"),
+      reportMarkdown: "# New retry report\n",
+    }]);
+    store.upsertFindings(projectId, oldVerifyId, [{
+      findingKey: "late-verdict-old",
+      originId: Number(finding.id),
+      title: "Late verdict candidate",
+      location: "src/Foo.sol:1",
+      severity: "info",
+      status: "refuted",
+      phaseAttempt: { subjectType: "finding", subjectId: Number(finding.id), inputFingerprint: "sha256:old" },
+    }]);
+
+    const canonical = store.getFinding(Number(finding.id));
+    assert.equal(canonical.status, "confirmed-differential");
+    assert.equal(canonical.run_id, newVerifyId);
+    assert.equal(canonical.report_path, path.join(dir, "new-verify", "report_f1.md"));
+    const attempts = store.listFindingPhaseAttempts("finding", Number(finding.id));
+    assert.equal(attempts.find((attempt) => attempt.run_id === oldVerifyId).outcome, "refuted");
+    assert.equal(attempts.find((attempt) => attempt.run_id === newVerifyId).outcome, "confirmed-differential");
+    assert.equal(store.findingOccurrences(Number(finding.id)).some((occurrence) => occurrence.run_id === oldVerifyId && occurrence.status === "refuted"), true, "the stale verdict remains in occurrence history");
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("startup reconciliation treats a newer canonical audit run as an ordering barrier", async () => {
+  const dir = await tempDir();
+  const oldVerifyDir = path.join(dir, "old-verify");
+  const rediscoveryDir = path.join(dir, "rediscovery");
+  try {
+    let store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "canonical-run-barrier" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: path.join(dir, "source-run") });
+    store.upsertFindings(projectId, sourceRunId, [{ findingKey: "canonical-barrier", title: "Rediscovered candidate", location: "src/Foo.sol:1", severity: "high", status: "suspected" }]);
+    const finding = store.queryFindings(projectId, { search: "Rediscovered candidate" })[0];
+    const oldVerifyId = store.startRun({ projectId, kind: "audit", runDir: oldVerifyDir, budgets: { verify: true } });
+    store.recordFindingPhaseAttempt(projectId, oldVerifyId, {
+      subjectType: "finding",
+      subjectId: Number(finding.id),
+      phase: "verify",
+      inputFingerprint: "sha256:old-attempt",
+      state: "blocked",
+      blocker: "remote verdict was dropped",
+    });
+    const rediscoveryId = store.startRun({ projectId, kind: "run", runDir: rediscoveryDir });
+    store.upsertFindings(projectId, rediscoveryId, [{
+      findingKey: "canonical-barrier-confirmed",
+      originId: Number(finding.id),
+      title: "Rediscovered candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-differential",
+      reportPath: path.join(rediscoveryDir, "report_f1.md"),
+      reportMarkdown: "# Rediscovered report\n",
+    }]);
+    store.finishRun(sourceRunId, "done");
+    store.finishRun(oldVerifyId, "error");
+    store.finishRun(rediscoveryId, "done");
+    store.close();
+
+    await mkdir(oldVerifyDir, { recursive: true });
+    await writeFile(path.join(oldVerifyDir, "audit_findings.json"), JSON.stringify([{
+      id: "f1", originId: Number(finding.id), title: "REFUTED: Rediscovered candidate", location: "src/Foo.sol:1", severity: "info", confirmationStatus: "confirmed-executable",
+    }]));
+
+    store = MetadataStore.openForOutput(dir);
+    const canonical = store.getFinding(Number(finding.id));
+    assert.equal(canonical.status, "confirmed-differential");
+    assert.equal(canonical.run_id, rediscoveryId);
+    assert.equal(canonical.report_path, path.join(rediscoveryDir, "report_f1.md"));
+    const oldAttempt = store.latestFindingPhaseAttempt("finding", Number(finding.id), "verify");
+    assert.equal(oldAttempt.outcome, "refuted", "historical attempt repair remains independent of canonical ordering");
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("startup reconciliation applies an older refutation to a same-material suspected rediscovery", async () => {
+  const dir = await tempDir();
+  const oldVerifyDir = path.join(dir, "old-verify");
+  const rediscoveryDir = path.join(dir, "rediscovery");
+  try {
+    let store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "same-material-suspected-rediscovery" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: path.join(dir, "source-run"), materialFingerprint: "sha256:m1" });
+    store.upsertFindings(projectId, sourceRunId, [{ findingKey: "same-material-candidate", title: "Same-material candidate", location: "src/Foo.sol:1", severity: "high", status: "suspected" }]);
+    const finding = store.queryFindings(projectId, { search: "Same-material candidate" })[0];
+    const oldVerifyId = store.startRun({ projectId, kind: "audit", runDir: oldVerifyDir, budgets: { verify: true }, materialFingerprint: "sha256:m1" });
+    store.recordFindingPhaseAttempt(projectId, oldVerifyId, {
+      subjectType: "finding", subjectId: Number(finding.id), phase: "verify", inputFingerprint: "sha256:same-material-old", state: "blocked", blocker: "remote verdict was dropped",
+    });
+    const rediscoveryId = store.startRun({ projectId, kind: "run", runDir: rediscoveryDir, materialFingerprint: "sha256:m1" });
+    store.upsertFindings(projectId, rediscoveryId, [{
+      findingKey: "same-material-candidate-rediscovered",
+      originId: Number(finding.id),
+      title: "Same-material candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "suspected",
+    }]);
+    store.finishRun(sourceRunId, "done");
+    store.finishRun(oldVerifyId, "error");
+    store.finishRun(rediscoveryId, "done");
+    store.close();
+
+    await mkdir(oldVerifyDir, { recursive: true });
+    await writeFile(path.join(oldVerifyDir, "audit_hypotheses.json"), JSON.stringify([{
+      id: "h1", originId: Number(finding.id), title: "REFUTED: Same-material candidate", location: "src/Foo.sol:1", severity: "info", confirmationStatus: "confirmed-executable",
+    }]));
+
+    store = MetadataStore.openForOutput(dir);
+    const canonical = store.getFinding(Number(finding.id));
+    assert.equal(canonical.status, "refuted");
+    assert.equal(canonical.run_id, oldVerifyId);
+    assert.equal(store.latestFindingPhaseAttempt("finding", Number(finding.id), "verify").outcome, "refuted");
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("startup reconciliation never applies an old-material refutation to a new-material rediscovery", async () => {
+  const dir = await tempDir();
+  const oldVerifyDir = path.join(dir, "old-verify");
+  const rediscoveryDir = path.join(dir, "rediscovery");
+  try {
+    let store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "changed-material-suspected-rediscovery" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: path.join(dir, "source-run"), materialFingerprint: "sha256:m1" });
+    store.upsertFindings(projectId, sourceRunId, [{ findingKey: "changed-material-candidate", title: "Changed-material candidate", location: "src/Foo.sol:1", severity: "high", status: "suspected" }]);
+    const finding = store.queryFindings(projectId, { search: "Changed-material candidate" })[0];
+    const oldVerifyId = store.startRun({ projectId, kind: "audit", runDir: oldVerifyDir, budgets: { verify: true }, materialFingerprint: "sha256:m1" });
+    store.recordFindingPhaseAttempt(projectId, oldVerifyId, {
+      subjectType: "finding", subjectId: Number(finding.id), phase: "verify", inputFingerprint: "sha256:changed-material-old", state: "blocked", blocker: "remote verdict was dropped",
+    });
+    const rediscoveryId = store.startRun({ projectId, kind: "run", runDir: rediscoveryDir, materialFingerprint: "sha256:m2" });
+    store.upsertFindings(projectId, rediscoveryId, [{
+      findingKey: "changed-material-candidate-rediscovered",
+      originId: Number(finding.id),
+      title: "Changed-material candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "suspected",
+    }]);
+    store.finishRun(sourceRunId, "done");
+    store.finishRun(oldVerifyId, "error");
+    store.finishRun(rediscoveryId, "done");
+    store.close();
+
+    await mkdir(oldVerifyDir, { recursive: true });
+    await writeFile(path.join(oldVerifyDir, "audit_hypotheses.json"), JSON.stringify([{
+      id: "h1", originId: Number(finding.id), title: "REFUTED: Changed-material candidate", location: "src/Foo.sol:1", severity: "info", confirmationStatus: "confirmed-executable",
+    }]));
+
+    store = MetadataStore.openForOutput(dir);
+    const canonical = store.getFinding(Number(finding.id));
+    assert.equal(canonical.status, "suspected");
+    assert.equal(canonical.run_id, rediscoveryId);
+    assert.equal(store.latestFindingPhaseAttempt("finding", Number(finding.id), "verify").outcome, "refuted", "the historical attempt is still repaired without mutating the newer material");
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("startup reconciliation does not guess between conflicting same-run verdict artifacts", async () => {
+  const dir = await tempDir();
+  const verifyRunDir = path.join(dir, "verify-run");
+  try {
+    let store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "same-run-verdict-conflict" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: path.join(dir, "source-run") });
+    store.upsertFindings(projectId, sourceRunId, [{ findingKey: "same-run-conflict", title: "Conflicting verdict candidate", location: "src/Foo.sol:1", severity: "high", status: "suspected" }]);
+    const finding = store.queryFindings(projectId, { search: "Conflicting verdict candidate" })[0];
+    const verifyRunId = store.startRun({ projectId, kind: "audit", runDir: verifyRunDir, budgets: { verify: true } });
+    store.recordFindingPhaseAttempt(projectId, verifyRunId, {
+      subjectType: "finding",
+      subjectId: Number(finding.id),
+      phase: "verify",
+      inputFingerprint: "sha256:conflicting-verdicts",
+      state: "settled",
+      outcome: "confirmed-differential",
+    });
+    store.upsertFindings(projectId, verifyRunId, [{
+      findingKey: "same-run-conflict-confirmed",
+      originId: Number(finding.id),
+      title: "Conflicting verdict candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-differential",
+      reportPath: path.join(verifyRunDir, "report_f1.md"),
+      reportMarkdown: "# Confirmed report\n",
+    }]);
+    store.finishRun(sourceRunId, "done");
+    store.finishRun(verifyRunId, "error");
+    store.close();
+
+    await mkdir(verifyRunDir, { recursive: true });
+    await writeFile(path.join(verifyRunDir, "audit_hypotheses.json"), JSON.stringify([{
+      id: "h1", originId: Number(finding.id), title: "REFUTED: Conflicting verdict candidate", location: "src/Foo.sol:1", severity: "info", confirmationStatus: "suspected",
+    }]));
+    await writeFile(path.join(verifyRunDir, "audit_findings.json"), JSON.stringify([{
+      id: "f1", originId: Number(finding.id), title: "Conflicting verdict candidate", location: "src/Foo.sol:1", severity: "high", confirmationStatus: "confirmed-differential",
+    }]));
+
+    store = MetadataStore.openForOutput(dir);
+    const canonical = store.getFinding(Number(finding.id));
+    assert.equal(canonical.status, "confirmed-differential");
+    assert.equal(canonical.report_path, path.join(verifyRunDir, "report_f1.md"));
+    assert.equal(store.latestFindingPhaseAttempt("finding", Number(finding.id), "verify").outcome, "confirmed-differential");
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("real-target reproduction is preserved when a later local verify refutes the claim", async () => {
+  const dir = await tempDir();
+  const sourceRunDir = path.join(dir, "source-run");
+  const verifyRunDir = path.join(dir, "verify-run");
+  try {
+    let store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "real-target-evidence-precedence" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: sourceRunDir });
+    store.upsertFindings(projectId, sourceRunId, [{
+      findingKey: "real-target-evidence",
+      title: "Real-target reproduced candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-differential",
+      reportPath: path.join(sourceRunDir, "report_f1.md"),
+      reportMarkdown: "# Real-target-backed report\n",
+    }]);
+    const finding = store.queryFindings(projectId, { search: "Real-target reproduced candidate" })[0];
+    assert.equal(store.setFindingConfirmStatus(projectId, "real-target-evidence", "reproduced"), true);
+    const verifyRunId = store.startRun({ projectId, kind: "audit", runDir: verifyRunDir, budgets: { verify: true } });
+    store.upsertFindings(projectId, verifyRunId, [{
+      findingKey: "real-target-evidence-checkpoint",
+      originId: Number(finding.id),
+      title: "Real-target reproduced candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-executable",
+    }]);
+    store.upsertFindings(projectId, verifyRunId, [{
+      findingKey: "real-target-evidence-refuted",
+      originId: Number(finding.id),
+      title: "Real-target reproduced candidate",
+      location: "src/Foo.sol:1",
+      severity: "info",
+      status: "refuted",
+    }]);
+    store.finishRun(sourceRunId, "done");
+    store.finishRun(verifyRunId, "error");
+    let protectedFinding = store.getFinding(Number(finding.id));
+    assert.equal(protectedFinding.status, "confirmed-differential");
+    assert.equal(protectedFinding.confirm_status, "reproduced");
+    assert.equal(protectedFinding.report_path, path.join(sourceRunDir, "report_f1.md"));
+    assert.equal(protectedFinding.refutation_status, "conflict");
+    store.close();
+
+    await mkdir(verifyRunDir, { recursive: true });
+    await writeFile(path.join(verifyRunDir, "audit_hypotheses.json"), JSON.stringify([{
+      id: "h1", originId: Number(finding.id), title: "REFUTED: Real-target reproduced candidate", location: "src/Foo.sol:1", severity: "info", confirmationStatus: "suspected",
+    }]));
+    store = MetadataStore.openForOutput(dir);
+    protectedFinding = store.getFinding(Number(finding.id));
+    assert.equal(protectedFinding.status, "confirmed-differential");
+    assert.equal(protectedFinding.confirm_status, "reproduced");
+    assert.equal(protectedFinding.report_path, path.join(sourceRunDir, "report_f1.md"));
+    assert.equal(protectedFinding.refutation_status, "conflict");
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a later real-target reproduction restores a locally refuted finding and its report", async () => {
+  const dir = await tempDir();
+  const sourceRunDir = path.join(dir, "source-run");
+  const verifyRunDir = path.join(dir, "verify-run");
+  try {
+    let store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "reverse-real-target-evidence-precedence" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: sourceRunDir });
+    store.upsertFindings(projectId, sourceRunId, [{
+      findingKey: "reverse-real-target-evidence",
+      title: "Reverse-order reproduced candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-differential",
+      reportPath: path.join(sourceRunDir, "report_f1.md"),
+      reportMarkdown: "# Reverse-order report\n",
+    }]);
+    const finding = store.queryFindings(projectId, { search: "Reverse-order reproduced candidate" })[0];
+    const verifyRunId = store.startRun({ projectId, kind: "audit", runDir: verifyRunDir, budgets: { verify: true } });
+    store.upsertFindings(projectId, verifyRunId, [{
+      findingKey: "reverse-real-target-evidence-refuted",
+      originId: Number(finding.id),
+      title: "Reverse-order reproduced candidate",
+      location: "src/Foo.sol:1",
+      severity: "info",
+      status: "refuted",
+    }]);
+
+    let canonical = store.getFinding(Number(finding.id));
+    assert.equal(canonical.status, "refuted");
+    assert.equal(canonical.report_path, null);
+    assert.equal(canonical.report_markdown, null);
+    assert.equal(store.setFindingConfirmStatus(projectId, "reverse-real-target-evidence", "reproduced"), true);
+    canonical = store.getFinding(Number(finding.id));
+    assert.equal(canonical.status, "confirmed-executable");
+    assert.equal(canonical.confirm_status, "reproduced");
+    assert.equal(canonical.report_path, path.join(sourceRunDir, "report_f1.md"));
+    assert.equal(canonical.report_markdown, "# Reverse-order report\n");
+    assert.equal(canonical.refutation_status, "conflict");
+    store.close();
+
+    store = MetadataStore.openForOutput(dir);
+    canonical = store.getFinding(Number(finding.id));
+    assert.equal(canonical.status, "confirmed-executable");
+    assert.equal(canonical.confirm_status, "reproduced");
+    assert.equal(canonical.report_path, path.join(sourceRunDir, "report_f1.md"));
+    assert.equal(canonical.report_markdown, "# Reverse-order report\n");
+    assert.equal(canonical.refutation_status, "conflict");
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a real-target retry that no longer reproduces resolves an evidence conflict as refuted", async () => {
+  const dir = await tempDir();
+  try {
+    const store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "real-target-conflict-resolution" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: path.join(dir, "source-run") });
+    store.upsertFindings(projectId, sourceRunId, [{
+      findingKey: "krealconflictresolution",
+      title: "Conflicted candidate",
+      location: "src/Foo.sol:1",
+      severity: "high",
+      status: "confirmed-differential",
+      reportPath: path.join(dir, "source-run", "report_f1.md"),
+      reportMarkdown: "# Conflicted report\n",
+    }]);
+    const finding = store.queryFindings(projectId, { search: "Conflicted candidate" })[0];
+    assert.equal(store.setFindingConfirmStatus(projectId, "krealconflictresolution", "reproduced"), true);
+    const verifyRunId = store.startRun({ projectId, kind: "audit", runDir: path.join(dir, "verify-run"), budgets: { verify: true } });
+    store.upsertFindings(projectId, verifyRunId, [{
+      findingKey: "real-target-conflict-resolution-refuted",
+      originId: Number(finding.id),
+      title: "Conflicted candidate",
+      location: "src/Foo.sol:1",
+      severity: "info",
+      status: "refuted",
+    }]);
+    assert.equal(store.getFinding(Number(finding.id)).refutation_status, "conflict");
+
+    const confirmRetryRunId = store.startRun({ projectId, kind: "confirm", runDir: path.join(dir, "confirm-retry") });
+    store.upsertConfirmDecisions(projectId, confirmRetryRunId, [{
+      bug: "Conflicted candidate",
+      reproduced: "no",
+      recommendation: "drop",
+      members: ["krealconflictresolution"],
+      reproEvidence: "The fresh real-target replay did not reproduce the claimed effect.",
+    }]);
+
+    const resolved = store.getFinding(Number(finding.id));
+    assert.equal(resolved.status, "refuted");
+    assert.equal(resolved.confirm_status, "not-reproduced");
+    assert.equal(resolved.refutation_status, "refuted");
+    assert.equal(resolved.report_path, null);
+    assert.equal(resolved.report_markdown, null);
+    assert.match(resolved.refutation_reason, /no longer reproduced/);
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("startup reconciliation ignores running verify artifacts", async () => {
+  const dir = await tempDir();
+  const sourceRunDir = path.join(dir, "source-run");
+  const runningVerifyDir = path.join(dir, "running-verify");
+  try {
+    let store = MetadataStore.openForOutput(dir);
+    const projectId = store.upsertProject({ name: "running-verify-artifact" });
+    const sourceRunId = store.startRun({ projectId, kind: "run", runDir: sourceRunDir });
+    store.upsertFindings(projectId, sourceRunId, [{ findingKey: "running-artifact", title: "Running candidate", location: "src/Foo.sol:1", severity: "high", status: "suspected" }]);
+    const finding = store.queryFindings(projectId, { search: "Running candidate" })[0];
+    const verifyRunId = store.startRun({ projectId, kind: "audit", runDir: runningVerifyDir, budgets: { verify: true } });
+    store.recordFindingPhaseAttempt(projectId, verifyRunId, {
+      subjectType: "finding",
+      subjectId: Number(finding.id),
+      phase: "verify",
+      inputFingerprint: "sha256:running",
+      state: "running",
+    });
+    store.finishRun(sourceRunId, "done");
+    store.close();
+
+    await mkdir(runningVerifyDir, { recursive: true });
+    await writeFile(path.join(runningVerifyDir, "audit_findings.json"), JSON.stringify([{
+      id: "f1",
+      originId: Number(finding.id),
+      title: "REFUTED: Running candidate",
+      location: "src/Foo.sol:1",
+      severity: "info",
+      confirmationStatus: "confirmed-executable",
+    }]));
+
+    store = MetadataStore.openForOutput(dir);
+    assert.equal(store.getFinding(Number(finding.id)).status, "suspected");
+    const attempt = store.latestFindingPhaseAttempt("finding", Number(finding.id), "verify");
+    assert.equal(attempt.state, "running");
+    assert.equal(attempt.outcome, null);
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("legacy reconciliation uses the newest terminal verify artifact as an ordering barrier", async () => {
+  const dir = await tempDir();
+  const oldVerifyDir = path.join(dir, "legacy-old-verify");
+  const newVerifyDir = path.join(dir, "legacy-new-verify");
+  const refuteOnlyDir = path.join(dir, "legacy-refute-only");
+  try {
+    let store = MetadataStore.openForOutput(dir);
+    const barrierProjectId = store.upsertProject({ name: "legacy-confirmed-barrier" });
+    const barrierSourceId = store.startRun({ projectId: barrierProjectId, kind: "run", runDir: path.join(dir, "legacy-source") });
+    store.upsertFindings(barrierProjectId, barrierSourceId, [{ findingKey: "legacy-barrier", title: "Legacy barrier candidate", location: "src/Foo.sol:1", severity: "high", status: "suspected" }]);
+    const barrierFinding = store.queryFindings(barrierProjectId, { search: "Legacy barrier candidate" })[0];
+    const oldVerifyId = store.startRun({ projectId: barrierProjectId, kind: "audit", runDir: oldVerifyDir, budgets: { verify: true } });
+    const newVerifyId = store.startRun({ projectId: barrierProjectId, kind: "audit", runDir: newVerifyDir, budgets: { verify: true } });
+    store.finishRun(barrierSourceId, "done");
+    store.finishRun(oldVerifyId, "error");
+    store.finishRun(newVerifyId, "done");
+
+    const refuteProjectId = store.upsertProject({ name: "legacy-refute-latest" });
+    const refuteSourceId = store.startRun({ projectId: refuteProjectId, kind: "run", runDir: path.join(dir, "legacy-refute-source") });
+    store.upsertFindings(refuteProjectId, refuteSourceId, [{ findingKey: "legacy-refute", title: "Legacy refute candidate", location: "src/Bar.sol:1", severity: "high", status: "suspected" }]);
+    const refuteFinding = store.queryFindings(refuteProjectId, { search: "Legacy refute candidate" })[0];
+    const refuteVerifyId = store.startRun({ projectId: refuteProjectId, kind: "audit", runDir: refuteOnlyDir, budgets: { verify: true } });
+    store.finishRun(refuteSourceId, "done");
+    store.finishRun(refuteVerifyId, "error");
+    store.close();
+
+    await mkdir(oldVerifyDir, { recursive: true });
+    await mkdir(newVerifyDir, { recursive: true });
+    await mkdir(refuteOnlyDir, { recursive: true });
+    const refutedArtifact = (originId, title, location) => JSON.stringify([{
+      id: "f1", originId, title: `REFUTED: ${title}`, location, severity: "info", confirmationStatus: "confirmed-executable",
+    }]);
+    await writeFile(path.join(oldVerifyDir, "audit_findings.json"), refutedArtifact(Number(barrierFinding.id), "Legacy barrier candidate", "src/Foo.sol:1"));
+    await writeFile(path.join(newVerifyDir, "audit_findings.json"), JSON.stringify([{
+      id: "f1", originId: Number(barrierFinding.id), title: "Legacy barrier candidate", location: "src/Foo.sol:1", severity: "high", confirmationStatus: "confirmed-executable",
+    }]));
+    await writeFile(path.join(refuteOnlyDir, "audit_findings.json"), refutedArtifact(Number(refuteFinding.id), "Legacy refute candidate", "src/Bar.sol:1"));
+
+    store = MetadataStore.openForOutput(dir);
+    assert.equal(store.getFinding(Number(barrierFinding.id)).status, "suspected", "the newer confirmed artifact prevents replaying an older refutation");
+    assert.equal(store.getFinding(Number(refuteFinding.id)).status, "refuted", "the latest legacy refutation still repairs canonical state");
+    store.close();
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -1486,14 +3335,49 @@ test("map → dig is resumable: a second run skips map and audits the next pendi
   }
 });
 
+test("map append expands inventory without replacing audited scope state", async () => {
+  const dir = await tempDir();
+  try {
+    const base = {
+      targetName: "append-map-e2e",
+      sourcePaths: [fixtures],
+      corpusPaths: [fixtures],
+      outputDir: path.join(dir, "runs"),
+      auditDeep: true,
+      auditSynthesize: false,
+      auditRefute: false,
+      auditMapSteps: 6,
+      auditDigSteps: 8,
+      auditMaxScopes: 1,
+    };
+
+    const run1 = await runAudit({ ...defaultConfig(), ...base }, { llm: new AppendMapLlmClient() });
+    assert.deepEqual(run1.scopeCoverage, { total: 2, audited: 1, pending: 1, deferred: 0 });
+
+    const append = await runAudit({ ...defaultConfig(), ...base, auditMapOnly: true, auditAppendMap: true }, { llm: new AppendMapLlmClient() });
+    assert.deepEqual(append.scopeCoverage, { total: 3, audited: 1, pending: 2, deferred: 0 });
+    const scopes = JSON.parse(await readFile(path.join(append.runDir, "audit_scopes.json"), "utf8"));
+    assert.equal(scopes.length, 3);
+    assert.equal(scopes.find((s) => s.id === "S1")?.status, "audited");
+    assert.equal(scopes.find((s) => s.id === "S2")?.status, "pending");
+    assert.ok(scopes.some((s) => s.obligation === "tertiary advice region must bind to its source" && s.status === "pending"));
+    const events = (await readFile(path.join(append.runDir, "events.jsonl"), "utf8")).trim().split("\n").map((l) => JSON.parse(l));
+    assert.ok(events.some((e) => e.kind === "audit_map_append_done" && e.added === 1 && e.skippedDuplicate === 1));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("buildRoot: the sandbox copies the buildable root, while the model reads only the narrow source", async () => {
   const dir = await tempDir();
   try {
     // A buildable project: manifest at the root, audited source in a subdir.
     const buildRoot = path.join(dir, "project");
     await mkdir(path.join(buildRoot, "crate", "src"), { recursive: true });
+    await mkdir(path.join(buildRoot, "crate", "docs"), { recursive: true });
     await writeFile(path.join(buildRoot, "Cargo.toml"), "[workspace]\nmembers=[\"crate\"]\n");
     await writeFile(path.join(buildRoot, "crate", "src", "lib.rs"), "// audited unit\npub fn f() {}\n");
+    await writeFile(path.join(buildRoot, "crate", "docs", "AuditFindings.md"), "KNOWN ANSWER MUST STAY HIDDEN\n");
 
     const cfg = defaultConfig();
     cfg.targetName = "buildroot-e2e";
@@ -1508,6 +3392,31 @@ test("buildRoot: the sandbox copies the buildable root, while the model reads on
     // which is NOT under the narrow sourcePaths subdir — proving buildRoot drove the copy.
     const manifest = path.join(runDir, "audit", "workspace", "Cargo.toml");
     assert.ok((await stat(manifest)).isFile(), "the buildable root's manifest must be copied into the sandbox");
+
+    const logger = await tempLogger(path.join(dir, "tool-run"));
+    const session = newSession();
+    session.workspace = { absolute: path.join(runDir, "audit", "workspace"), relative: "audit/workspace" };
+    session.baselineFiles = new Set(["Cargo.toml", "crate/src/lib.rs", "crate/docs/AuditFindings.md"]);
+    const toolCtx = {
+      cfg,
+      source: [{ path: "crate/src/lib.rs", kind: "source", content: "// audited unit\npub fn f() {}\n" }],
+      corpus: [],
+      memory: new ProjectMemory(path.join(dir, "tool-memory.jsonl")),
+      logger,
+      session,
+    };
+    const hiddenRead = await tool("read").run({ path: "crate/docs/AuditFindings.md" }, toolCtx);
+    assert.match(hiddenRead.observation, /no authorized source/i);
+    const emptyIngestionRead = await tool("read").run(
+      { path: "crate/docs/AuditFindings.md" },
+      { ...toolCtx, source: [] },
+    );
+    assert.match(emptyIngestionRead.observation, /no authorized source/i, "an empty ingestion must fail closed instead of exposing buildRoot");
+    const sourceRead = await tool("read").run({ path: "crate/src/lib.rs" }, toolCtx);
+    assert.match(sourceRead.observation, /audited unit/);
+    const inspect = await tool("bash").run({ cmd: "find crate -type f -print", purpose: "inspect" }, toolCtx);
+    assert.match(inspect.observation, /crate\/src\/lib\.rs/);
+    assert.doesNotMatch(inspect.observation, /AuditFindings|KNOWN ANSWER/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

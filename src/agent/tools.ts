@@ -1,8 +1,8 @@
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { sandboxExecutionOptions, sandboxNetworkForPurpose, type AuditorConfig } from "../config.js";
-import { analyzeAgentBashCommandSafety, analyzeConfirmBashCommandSafety, isAgentBuildCommand, isAgentConfirmCommand } from "../security/policy.js";
-import { prepareWorkspaceToolchain } from "./prepare.js";
+import { analyzeAgentBashCommandSafety, analyzeConfirmBashCommandSafety, isAgentBuildCommand, isAgentConfirmCommand, isAgentInspectionCommand, isAgentWorkspaceSetupCommand, openWorldCommandNeedsNetwork } from "../security/policy.js";
+import { prepareResourceRequests, prepareToolVersionBlockingIssue, prepareWorkspaceToolchain } from "./prepare.js";
 import {
   firstBlockedSandboxFile,
   matchSuccessPatterns,
@@ -16,6 +16,7 @@ import {
 } from "../security/sandbox.js";
 import type { RunLogger } from "../trace/logger.js";
 import type { ConfirmationStatus, Doc, ReproductionCommand, ReproductionCommandResult, ReproductionFile, Severity } from "../types.js";
+import type { ResourceRequest } from "./discovery-artifacts.js";
 import type { ProjectMemory } from "./memory.js";
 import { stagePackageSource } from "./package-source.js";
 
@@ -62,10 +63,29 @@ export interface AgentFinding {
    * (flips its status + attaches the PoC) instead of being recorded as a new finding. The link is
    * known by construction (claim N is seeded from input finding N), never re-matched by content. */
   originId?: number;
+  /** Durable lifecycle attempt context supplied by the project worklist. */
+  phaseAttempt?: {
+    subjectType: "finding" | "decision";
+    subjectId: number;
+    inputFingerprint: string;
+  };
+  /** Explicit coverage state for the independent refutation pass. */
+  refutationStatus?: "pending" | "running" | "passed" | "refuted" | "blocked";
+  refutationReason?: string;
+}
+
+/** Verify-mode false-positive verdicts use a title prefix because the in-memory
+ * confirmation enum intentionally has no `refuted` member. Keep this predicate
+ * shared by ingestion, artifact classification, and persistence so a passing
+ * mitigation test can never turn a REFUTED verdict into a vulnerability. */
+export function isRefutedFindingTitle(title: string): boolean {
+  return /^\s*REFUTED\s*:/i.test(title);
 }
 
 export interface CommandRunRecord {
   id: string;
+  purpose?: "inspect" | "build" | "confirm";
+  network?: "none" | "enabled";
   passed: boolean;
   targetLinked?: boolean;
   targetLinkReason?: string;
@@ -91,6 +111,10 @@ export interface AgentSession {
   scratchFiles: Map<string, string>;
   /** Whether the toolchain warm-up has run for this session's workspace. */
   prepared?: boolean;
+  /** Blocking sandbox/toolchain preflight issue detected during warm-up. */
+  prepareBlock?: string;
+  /** Product-owned resource requests detected by framework preflight, independent of model-authored resource_requests.json. */
+  resourceRequests?: ResourceRequest[];
   /** Persistent, host-isolated package cache (CARGO_HOME etc.) reused across runs. */
   buildCacheDir?: string;
   /**
@@ -118,6 +142,13 @@ export interface ToolContext {
   memory: ProjectMemory;
   logger: RunLogger;
   session: AgentSession;
+  onCommandRun?: (record: CommandRunRecord) => void;
+  /** Identity of the concurrent map/dig/verify stream that owns this context. */
+  activityStreamId?: string;
+}
+
+function activityStreamMeta(ctx: ToolContext): { streamId?: string } {
+  return ctx.activityStreamId ? { streamId: ctx.activityStreamId } : {};
 }
 
 export interface ToolResult {
@@ -203,7 +234,9 @@ export function ingestFindingsFromScratch(session: AgentSession): { parsed: numb
 
     const commandRunId = asString(record.command_id) ?? asString(record.commandRunId) ?? asString(record.test_run_id);
     const citedRun = commandRunId ? session.commandRuns.find((run) => run.id === commandRunId) : undefined;
-    const confirmed = Boolean(citedRun?.passed);
+    // A successful local command may prove either side of a verify claim. For a
+    // REFUTED verdict it is mitigation evidence, not vulnerability confirmation.
+    const confirmed = Boolean(citedRun?.passed) && !isRefutedFindingTitle(title);
     const id = asString(record.id) ?? `f${findings.length + 1}`;
     const fixPatch = normalizeFixPatch(record.fix_patch ?? record.fixPatch);
     findings.push({
@@ -221,7 +254,7 @@ export function ingestFindingsFromScratch(session: AgentSession): { parsed: numb
       // "DISCHARGED:" title prefix. Only a passed command_id can promote a
       // claim to confirmed-executable.
       confirmationStatus: confirmed ? "confirmed-executable" : declaredUnconfirmedStatus(record, title),
-      ...(confirmed && citedRun ? { commandRunId: citedRun.id } : {}),
+      ...(citedRun?.passed ? { commandRunId: citedRun.id } : {}),
       ...(fixPatch ? { fixPatch } : {}),
       ...(asStringList(record.patched_success_patterns ?? record.patchedSuccessPatterns).length > 0
         ? { patchedSuccessPatterns: asStringList(record.patched_success_patterns ?? record.patchedSuccessPatterns) }
@@ -246,7 +279,7 @@ const readTool: AgentTool = {
     if (!target) return { observation: 'error: "path" is required' };
     if (!normalizeToolPath(target)) return { observation: 'error: "path" must be a safe relative path.' };
     const readable = await findReadable(ctx, target);
-    if (!readable) return { observation: `error: no loaded or sandbox file matches "${target}". Use bash with ls/find/rg to inspect the copied workspace.` };
+    if (!readable) return { observation: `error: no authorized source, corpus, build metadata, or scratch file matches "${target}".` };
     const allLines = readable.content.split(/\r?\n/);
     const total = allLines.length;
     const start = clampInt(args.start, 1, Math.max(1, total), 1);
@@ -283,7 +316,7 @@ const writeTool: AgentTool = {
     if (!workspace) return { observation: "error: write needs on-disk source roots (sourcePaths); none are configured for this run." };
     await writeSandboxFiles(workspace.absolute, [{ path: normalized, content }]);
     ctx.session.scratchFiles.set(normalized, content);
-    await ctx.logger.event("audit_write", { path: normalized, bytes: Buffer.byteLength(content, "utf8") });
+    await ctx.logger.event("audit_write", { path: normalized, bytes: Buffer.byteLength(content, "utf8"), ...activityStreamMeta(ctx) });
     return { observation: `wrote ${normalized} (${Buffer.byteLength(content, "utf8")} bytes) in sandbox workspace ${workspace.relative}.`, meta: { path: normalized } };
   },
 };
@@ -317,7 +350,7 @@ const editTool: AgentTool = {
 
     await writeSandboxFiles(workspace.absolute, [{ path: existing.path, content: next }]);
     ctx.session.scratchFiles.set(existing.path, next);
-    await ctx.logger.event("audit_edit", { path: existing.path, bytes: Buffer.byteLength(next, "utf8") });
+    await ctx.logger.event("audit_edit", { path: existing.path, bytes: Buffer.byteLength(next, "utf8"), ...activityStreamMeta(ctx) });
     return { observation: `edited ${existing.path} in sandbox workspace ${workspace.relative}.`, meta: { path: existing.path } };
   },
 };
@@ -325,37 +358,53 @@ const editTool: AgentTool = {
 const bashTool: AgentTool = {
   name: "bash",
   description:
-    'Run one local command in the copied sandbox workspace. args: {"cmd": string, "purpose"?: "inspect"|"build"|"confirm" (default inspect), "cwd"?: relative, "expected_exit_code"?: int, "success_patterns"?: [string], "timeout_ms"?: int}. Shell control operators, remote networks, destructive commands, and paths outside the workspace are blocked. purpose=inspect is for exploration (ls/find/rg/cat/sed/jq), tool availability checks (which nargo), and local JSON reads (jq . file or jq length file); it never confirms anything. purpose=build is for dependency resolution and compilation (cargo build/fetch, cmake -S/-B/--build, ninja, make, npm install, go mod download, forge build, pip install, …) to make the workspace buildable; it has side effects but is NOT confirmation-eligible. For CMake, prefer generator-neutral `cmake -S <src> -B <build>` then `cmake --build <build> --parallel 2` on large targets; pass `-G Ninja` only after `ninja --version` succeeds, and keep parallelism bounded. purpose=confirm must be a real local test runner (cargo test, ctest, forge test, go test, node --test, pytest, …) with success_patterns; only a confirm command that exits as expected, observes every success_pattern, and executes a test linked to pristine target source becomes confirmation-eligible and citable as command_id for confirmed-executable.',
+    'Run one local command in the copied sandbox workspace. args: {"cmd": string, "purpose"?: "inspect"|"build"|"confirm" (default inspect), "cwd"?: relative, "expected_exit_code"?: int, "success_patterns"?: [string], "timeout_ms"?: int}. Shell control operators, remote networks, destructive commands, and paths outside the workspace are blocked. purpose=inspect is for exploration (ls/find/rg/cat/sed/jq), tool availability checks (which nargo/scarb/blueprint/tact), and local JSON reads (jq . file or jq length file); it never confirms anything. purpose=build is for dependency resolution and compilation (cargo build/fetch, cmake -S/-B/--build, ninja, make, npm install, go mod download, forge build, scarb fetch/build/check/metadata, blueprint build --all, func-js/tolk-js/tact, pip install, …) to make the workspace buildable; it has side effects but is NOT confirmation-eligible. For CMake, prefer generator-neutral `cmake -S <src> -B <build>` then `cmake --build <build> --parallel 2` on large targets; pass `-G Ninja` only after `ninja --version` succeeds, and keep parallelism bounded. purpose=confirm must be a real local test runner (cargo test, ctest, forge test, scarb test, snforge test, blueprint test, go test, node --test, pytest, …) with success_patterns; only a confirm command that exits as expected, observes every success_pattern, and executes a test linked to pristine target source becomes confirmation-eligible and citable as command_id for confirmed-executable.',
   async run(args, ctx) {
     const normalized = normalizeBashCommand(args, ctx.cfg);
     if ("error" in normalized) return { observation: normalized.error };
-    // CONFIRM mode swaps to the network-enabled policy (fork/read live networks, fetch,
-    // search — never broadcast); `flounder run` keeps the network-sealed local-only policy.
+    // Open-world phases accept a broader local command set, but network egress is
+    // granted below only to explicit read/fork/fetch capabilities. Arbitrary model
+    // programs remain network-sealed; every phase still enforces the no-broadcast line.
     const blocked = (ctx.cfg.confirmMode || ctx.cfg.prepareMode)
       ? analyzeConfirmBashCommandSafety(normalized.command)
       : analyzeAgentBashCommandSafety(normalized.command);
     if (blocked.blocked) return { observation: `blocked: ${blocked.reason ?? "command blocked by policy"}` };
+
+    if (sourceReadBoundaryActive(ctx) && isAgentWorkspaceSetupCommand(normalized.command)) {
+      return { observation: "blocked: sealed audits must create or modify files with write/edit; bash workspace setup cannot cross the authorized source boundary." };
+    }
 
     const workspace = await ensureWorkspace(ctx);
     if (!workspace) return { observation: "error: bash needs on-disk source roots (sourcePaths); none are configured for this run." };
     // Lazy warm-up: only a real test/build command needs dependencies, so prepare
     // the toolchain on first use rather than eagerly for every (possibly
     // read-only or unauthenticated) run.
-    if (isAgentConfirmCommand(normalized.command) || isAgentBuildCommand(normalized.command)) await ensurePrepared(ctx, workspace);
+    if (isAgentConfirmCommand(normalized.command) || isAgentBuildCommand(normalized.command)) {
+      const prepareBlock = await ensurePrepared(ctx, workspace, normalized.command);
+      if (prepareBlock) return { observation: `blocked: ${prepareBlock} Write resource_requests.json with kind "sandbox-image" or rebuild/select the correct target-specific image before retrying.` };
+    }
     ctx.session.counters.command += 1;
     const runId = `cmd${ctx.session.counters.command}`;
     await ctx.logger.event("audit_command_start", {
       runId,
       purpose: normalized.purpose,
       command: normalized.raw,
+      ...activityStreamMeta(ctx),
     });
+    const phaseNetwork = sandboxNetworkForPurpose(ctx.cfg, normalized.purpose);
+    const commandNetwork = (ctx.cfg.confirmMode || ctx.cfg.prepareMode) && phaseNetwork === "enabled"
+      ? (openWorldCommandNeedsNetwork(normalized.command, normalized.purpose) ? "enabled" : "none")
+      : phaseNetwork;
+    const commandWorkspace = sourceReadBoundaryActive(ctx) && isAgentInspectionCommand(normalized.command)
+      ? await prepareInspectionWorkspace(ctx, workspace, runId)
+      : workspace;
     const result = await runSandboxCommand(
       normalized.command,
-      workspace.absolute,
+      commandWorkspace.absolute,
       ctx.cfg.reproductionMaxLogBytes,
       ctx.cfg.sourcePaths,
       ctx.session.buildCacheDir,
-      sandboxExecutionOptions(ctx.cfg, sandboxNetworkForPurpose(ctx.cfg, normalized.purpose)),
+      sandboxExecutionOptions(ctx.cfg, commandNetwork),
     );
     const exitMatched = result.exitCode === result.expectedExitCode && !result.timedOut;
     const isConfirm = normalized.purpose === "confirm";
@@ -375,10 +424,12 @@ const bashTool: AgentTool = {
       && patternCheck.matched.length > 0;
     const record: CommandRunRecord = {
       id: runId,
+      purpose: normalized.purpose,
       passed,
       targetLinked: targetLink.linked,
       targetLinkReason: targetLink.reason,
       command: normalized.raw,
+      network: commandNetwork,
       commandSpec: normalized.command,
       successPatterns: normalized.successPatterns,
       matched: patternCheck.matched,
@@ -394,6 +445,7 @@ const bashTool: AgentTool = {
     await ctx.logger.event("audit_command_run", {
       runId,
       purpose: normalized.purpose,
+      network: commandNetwork,
       ok: exitMatched,
       passed,
       exitCode: result.exitCode,
@@ -402,16 +454,21 @@ const bashTool: AgentTool = {
       matched: patternCheck.matched.length,
       missing: patternCheck.missing.length,
       ...(includeOutput && output ? { output } : {}),
+      ...activityStreamMeta(ctx),
     });
+    try {
+      ctx.onCommandRun?.(record);
+    } catch {
+      // live progress projection is best-effort
+    }
 
-    const tail = (text: string): string => (text.length > 1600 ? `...${text.slice(-1600)}` : text);
     const verdict = !isConfirm
       ? `command ${runId} (${normalized.purpose}): exit=${result.exitCode}${result.timedOut ? " timedOut" : ""}.`
       : passed
         ? `command ${runId}: CONFIRMATION-ELIGIBLE PASS; cite command_id="${runId}" in findings.json for confirmed-executable.`
         : `command ${runId}: not confirmation-eligible (${confirmFailureReason(eligibleByType, targetLink, normalized, exitMatched, result, patternCheck)}).`;
     return {
-      observation: `${verdict}\n--- stdout ---\n${tail(result.stdout) || "(empty)"}\n--- stderr ---\n${tail(result.stderr) || "(empty)"}`,
+      observation: `${verdict}\n--- stdout ---\n${diagnosticOutputPreview(result.stdout, 2000) || "(empty)"}\n--- stderr ---\n${diagnosticOutputPreview(result.stderr, 2000) || "(empty)"}`,
       meta: { runId, passed, purpose: normalized.purpose },
     };
   },
@@ -445,6 +502,7 @@ const stagePackageSourceTool: AgentTool = {
         version: result.version,
         stagedPath: result.stagedPath,
         files: result.fileCount,
+        ...activityStreamMeta(ctx),
       });
       const manifestHint = {
         component: result.componentTemplate,
@@ -488,7 +546,7 @@ function confirmCommandTargetLink(command: ReproductionCommand, session: AgentSe
   for (const fileArg of fileArgs) {
     if (baselineHasPathLike(baseline, fileArg)) return { linked: true, reason: `test target ${fileArg} is part of the pristine target source` };
     const scratch = session.scratchFiles.get(fileArg);
-    if (scratch && scratchLinksToBaseline(fileArg, scratch, baseline)) {
+    if (scratch && scratchLinksToBaseline(fileArg, scratch, baseline, command)) {
       return { linked: true, reason: `test target ${fileArg} imports pristine target source` };
     }
   }
@@ -501,34 +559,203 @@ function confirmCommandTargetLink(command: ReproductionCommand, session: AgentSe
 
 function commandFileArgs(command: ReproductionCommand, session: AgentSession): string[] {
   const out: string[] = [];
-  const skipValueAfter = new Set(["--test-dir", "-C", "--config", "--manifest-path", "--package", "-p", "--match-test", "--match-path", "-R"]);
+  const roots = commandRootCandidates(command);
+  const skipValueAfter = new Set([
+    "--test-dir",
+    "-C",
+    "--config",
+    "--config-path",
+    "--manifest-path",
+    "--package",
+    "-p",
+    "--match-test",
+    "--match-contract",
+    "--match",
+    "-R",
+    "--root",
+    "--contracts",
+    "--lib-paths",
+    "--cache-path",
+    "--out",
+    "--build-info-path",
+    "--evm-version",
+    "--fork-url",
+    "--fork-block-number",
+    "--fork-retries",
+    "--fork-retry-backoff",
+    "--rpc-url",
+    "--etherscan-api-key",
+    "--use",
+    "--sender",
+    "--initial-balance",
+    "--gas-limit",
+    "--chain-id",
+    "--gas-price",
+    "--block-base-fee-per-gas",
+    "--block-coinbase",
+    "--block-difficulty",
+    "--block-gas-limit",
+    "--block-number",
+    "--block-timestamp",
+    "--memory-limit",
+  ]);
+  const fileValueAfter = new Set(["--match-path"]);
   for (let idx = 0; idx < command.args.length; idx += 1) {
     const arg = command.args[idx] ?? "";
+    const option = splitLongOptionValue(arg);
+    if (option) {
+      if (fileValueAfter.has(option.name)) addCommandFileArg(out, option.value, roots, session);
+      continue;
+    }
+    if (arg === "--remappings" || arg === "--remapping") {
+      while (idx + 1 < command.args.length && looksLikeRemappingValue(command.args[idx + 1] ?? "")) idx += 1;
+      continue;
+    }
+    if (fileValueAfter.has(arg)) {
+      addCommandFileArg(out, command.args[idx + 1] ?? "", roots, session);
+      idx += 1;
+      continue;
+    }
     if (skipValueAfter.has(arg)) {
       idx += 1;
       continue;
     }
     if (arg.startsWith("-")) continue;
-    const normalized = normalizeRelativePath(arg);
-    if (!normalized) continue;
-    if (session.scratchFiles.has(normalized) || session.baselineFiles?.has(normalized) || /\.[A-Za-z0-9]+$/.test(path.posix.basename(normalized))) {
-      out.push(normalized);
-    }
+    addCommandFileArg(out, arg, roots, session);
   }
-  return out;
+  return [...new Set(out)];
 }
 
-function scratchLinksToBaseline(filePath: string, content: string, baseline: Set<string>): boolean {
+export function commandFileArgsForTest(command: ReproductionCommand, session: Pick<AgentSession, "scratchFiles" | "baselineFiles">): string[] {
+  return commandFileArgs(command, session as AgentSession);
+}
+
+export function confirmCommandTargetLinkForTest(command: ReproductionCommand, session: Pick<AgentSession, "scratchFiles" | "baselineFiles">): { linked: boolean; reason: string } {
+  return confirmCommandTargetLink(command, session as AgentSession);
+}
+
+export function splitCommandLineForTest(input: string): { argv: string[] } | { error: string } {
+  return splitCommandLine(input);
+}
+
+function addCommandFileArg(out: string[], value: string, roots: string[], session: Pick<AgentSession, "scratchFiles" | "baselineFiles">): void {
+  if (looksLikeNonFileValue(value)) return;
+  const normalized = normalizeRelativePath(value);
+  if (!normalized || hasGlobSyntax(normalized)) return;
+  const rooted = roots
+    .map((root) => normalizeRelativePath(path.posix.join(root, normalized)))
+    .filter((candidate): candidate is string => Boolean(candidate));
+  const knownRooted = rooted.filter((candidate) => commandFileArgKnown(candidate, session));
+  if (knownRooted.length > 0) {
+    out.push(...knownRooted);
+    return;
+  }
+  if (commandFileArgKnown(normalized, session) || hasFileExtension(normalized)) out.push(normalized);
+}
+
+function commandFileArgKnown(candidate: string, session: Pick<AgentSession, "scratchFiles" | "baselineFiles">): boolean {
+  return session.scratchFiles.has(candidate) || Boolean(session.baselineFiles && baselineHasPathLike(session.baselineFiles, candidate));
+}
+
+function commandRootCandidates(command: ReproductionCommand): string[] {
+  const out: string[] = [];
+  for (let idx = 0; idx < command.args.length; idx += 1) {
+    const arg = command.args[idx] ?? "";
+    const option = splitLongOptionValue(arg);
+    if (option?.name === "--root") {
+      const normalized = normalizeRelativePath(option.value);
+      if (normalized) out.push(normalized);
+      continue;
+    }
+    if (arg === "--root" || arg === "-C") {
+      const normalized = normalizeRelativePath(command.args[idx + 1] ?? "");
+      if (normalized) out.push(normalized);
+      idx += 1;
+    }
+  }
+  const cwd = normalizeRelativePath(command.cwd ?? "");
+  if (cwd) out.push(cwd);
+  return [...new Set(out)];
+}
+
+function splitLongOptionValue(arg: string): { name: string; value: string } | undefined {
+  if (!arg.startsWith("--")) return undefined;
+  const eq = arg.indexOf("=");
+  if (eq <= 2) return undefined;
+  return { name: arg.slice(0, eq), value: arg.slice(eq + 1) };
+}
+
+function looksLikeNonFileValue(value: string): boolean {
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(value) || /^\d+(?:\.\d+)+$/.test(value);
+}
+
+function hasGlobSyntax(value: string): boolean {
+  return /[*?\[\]{}]/.test(value);
+}
+
+function hasFileExtension(value: string): boolean {
+  return /\.[A-Za-z0-9]+$/.test(path.posix.basename(value));
+}
+
+function scratchLinksToBaseline(filePath: string, content: string, baseline: Set<string>, command?: ReproductionCommand): boolean {
   const dir = path.posix.dirname(filePath);
   const specifiers = sourceSpecifiers(content);
+  const remappings = command ? commandRemappings(command) : [];
   for (const specifier of specifiers) {
+    if (baselineHasPathLike(baseline, specifier)) return true;
     if (specifier.startsWith("source/") && baselineHasPathLike(baseline, specifier)) return true;
     if (specifier.startsWith("./") || specifier.startsWith("../")) {
       const resolved = normalizeRelativePath(path.posix.join(dir, specifier));
       if (resolved && baselineHasPathLike(baseline, resolved)) return true;
     }
+    for (const remapped of remappedSpecifierCandidates(specifier, remappings)) {
+      if (baselineHasPathLike(baseline, remapped)) return true;
+    }
   }
   return false;
+}
+
+function commandRemappings(command: ReproductionCommand): Array<{ prefix: string; target: string }> {
+  const out: Array<{ prefix: string; target: string }> = [];
+  for (let idx = 0; idx < command.args.length; idx += 1) {
+    const arg = command.args[idx] ?? "";
+    const option = splitLongOptionValue(arg);
+    if (option && (option.name === "--remappings" || option.name === "--remapping")) {
+      addRemapping(out, option.value);
+      continue;
+    }
+    if (arg === "--remappings" || arg === "--remapping") {
+      while (idx + 1 < command.args.length && looksLikeRemappingValue(command.args[idx + 1] ?? "")) {
+        idx += 1;
+        addRemapping(out, command.args[idx] ?? "");
+      }
+    }
+  }
+  return out;
+}
+
+function addRemapping(out: Array<{ prefix: string; target: string }>, value: string): void {
+  const eq = value.indexOf("=");
+  if (eq <= 0) return;
+  const prefix = value.slice(0, eq);
+  const target = normalizeRelativePath(value.slice(eq + 1));
+  if (!target) return;
+  out.push({ prefix, target });
+}
+
+function looksLikeRemappingValue(value: string): boolean {
+  return !value.startsWith("-") && value.includes("=");
+}
+
+function remappedSpecifierCandidates(specifier: string, remappings: Array<{ prefix: string; target: string }>): string[] {
+  const out: string[] = [];
+  for (const remapping of remappings) {
+    if (!specifier.startsWith(remapping.prefix)) continue;
+    const suffix = specifier.slice(remapping.prefix.length);
+    const resolved = normalizeRelativePath(path.posix.join(remapping.target, suffix));
+    if (resolved) out.push(resolved);
+  }
+  return out;
 }
 
 function sourceSpecifiers(content: string): string[] {
@@ -559,20 +786,62 @@ function baselineHasPathLike(baseline: Set<string>, candidate: string): boolean 
 }
 
 function commandOutputPreview(result: ReproductionCommandResult): string {
-  const tail = (text: string): string => (text.length > 1200 ? `...${text.slice(-1200)}` : text);
-  const sections = [
-    result.stderr.trim() ? `stderr:\n${tail(result.stderr.trim())}` : "",
-    result.stdout.trim() ? `stdout:\n${tail(result.stdout.trim())}` : "",
-  ].filter(Boolean);
+  const rawEntries: Array<[string, string]> = [
+    ["stderr", result.stderr.trim()],
+    ["stdout", result.stdout.trim()],
+  ];
+  const entries = rawEntries.filter(([, text]) => text.length > 0);
+  const sectionCap = entries.length > 1 ? 1200 : 2500;
+  const sections = entries.map(([label, text]) => `${label}:\n${diagnosticOutputPreview(text, sectionCap)}`);
   return sections.join("\n---\n").slice(0, 2600);
+}
+
+const DIAGNOSTIC_LINE_RE = /\b(error|failed|failure|panic|exception|traceback|undefined reference|cannot find|not found|caused by|assertion|timed out|timeout|revert)\b/i;
+
+function diagnosticOutputPreview(text: string, cap: number): string {
+  const trimmed = text.trim();
+  if (trimmed.length <= cap) return trimmed;
+  const markerBudget = 160;
+  const diagnostics = diagnosticExcerpt(trimmed, Math.max(0, Math.floor(cap * 0.3)));
+  const headCap = Math.max(200, Math.floor(cap * (diagnostics ? 0.32 : 0.5)));
+  const tailCap = Math.max(200, cap - headCap - markerBudget - diagnostics.length);
+  const head = trimmed.slice(0, headCap);
+  const tail = trimmed.slice(Math.max(headCap, trimmed.length - tailCap));
+  if (diagnostics) {
+    return `${head}\n[... output elided; diagnostic lines follow ...]\n${diagnostics}\n[... output tail ...]\n${tail}`;
+  }
+  return `${head}\n[... output elided; tail follows ...]\n${tail}`;
+}
+
+function diagnosticExcerpt(text: string, cap: number): string {
+  if (cap <= 0) return "";
+  const lines = text.split(/\r?\n/);
+  const selected = new Set<number>();
+  for (let idx = 0; idx < lines.length; idx += 1) {
+    if (!DIAGNOSTIC_LINE_RE.test(lines[idx] ?? "")) continue;
+    if (idx > 0) selected.add(idx - 1);
+    selected.add(idx);
+    if (idx + 1 < lines.length) selected.add(idx + 1);
+  }
+  if (selected.size === 0) return "";
+  const out = [...selected].sort((a, b) => a - b).map((idx) => lines[idx]).join("\n");
+  if (out.length <= cap) return out;
+  const head = Math.floor(cap * 0.5);
+  const tail = cap - head;
+  return `${out.slice(0, head)}\n[... diagnostics elided ...]\n${out.slice(-tail)}`;
 }
 
 /** Report files the framework reads back from the workspace. */
 export function isReportFile(normalizedPath: string): boolean {
   return normalizedPath === "findings.json"
     || normalizedPath === "scopes.json"
+    || normalizedPath === "scope_outcome.json"
+    || normalizedPath === "coverage_gaps.json"
+    || normalizedPath === "resource_requests.json"
+    || normalizedPath === "followup_scopes.json"
     || normalizedPath === "prepare_manifest.json"
     || normalizedPath === "confirm_decision.json"
+    || normalizedPath === "impact_inventory.json"
     || /^report_[a-z0-9_.-]+\.md$/.test(normalizedPath);
 }
 
@@ -609,9 +878,10 @@ function insidePristineSourceTree(ctx: ToolContext, normalizedPath: string): boo
 
 function isModelOwnedPocPath(normalizedPath: string): boolean {
   const segments = normalizedPath.toLowerCase().split("/");
-  if (segments.some((segment) => /^(test|tests|spec|specs|__tests__|poc|pocs|repro|repros|harness|harnesses|scratch)$/.test(segment))) return true;
+  const modelOwnedSegment = /(^|[._-])(test|tests|spec|specs|__tests__|poc|pocs|repro|repros|harness|harnesses|scratch|flounder)([._-]|$)/;
+  if (segments.some((segment) => /^(test|tests|spec|specs|__tests__|poc|pocs|repro|repros|harness|harnesses|scratch)$/.test(segment) || modelOwnedSegment.test(segment))) return true;
   const base = segments.at(-1) ?? "";
-  return /(^|[._-])(test|spec|poc|repro|harness|scratch|flounder)([._-]|$)/.test(base)
+  return modelOwnedSegment.test(base)
     || /(^test_|_test\.|\.test\.|\.spec\.)/.test(base);
 }
 
@@ -620,10 +890,40 @@ function dirname(normalizedPath: string): string {
   return idx === -1 ? "" : normalizedPath.slice(0, idx);
 }
 
-async function ensurePrepared(ctx: ToolContext, workspace: SandboxWorkspace): Promise<void> {
-  if (!ctx.cfg.auditPrepare || ctx.session.prepared) return;
+async function ensurePrepared(ctx: ToolContext, workspace: SandboxWorkspace, focusCommand?: ReproductionCommand): Promise<string | undefined> {
+  if (!ctx.cfg.auditPrepare) return undefined;
+  if (ctx.session.prepareBlock) return ctx.session.prepareBlock;
+  if (ctx.session.prepared) return undefined;
   ctx.session.prepared = true; // set before awaiting so a second test command does not re-trigger
-  await prepareWorkspaceToolchain({ workspace, cfg: ctx.cfg, logger: ctx.logger, ...(ctx.session.buildCacheDir ? { cacheDir: ctx.session.buildCacheDir } : {}) });
+  const report = await prepareWorkspaceToolchain({
+    workspace,
+    cfg: ctx.cfg,
+    logger: ctx.logger,
+    ...(ctx.session.buildCacheDir ? { cacheDir: ctx.session.buildCacheDir } : {}),
+    ...(focusCommand ? { focusCommand } : {}),
+    ...(ctx.activityStreamId ? { streamId: ctx.activityStreamId } : {}),
+  });
+  const resourceRequests = prepareResourceRequests(report, focusCommand);
+  if (resourceRequests.length > 0) ctx.session.resourceRequests = mergeResourceRequests(ctx.session.resourceRequests ?? [], resourceRequests);
+  const issue = prepareToolVersionBlockingIssue(report);
+  if (issue) ctx.session.prepareBlock = issue;
+  return issue;
+}
+
+function mergeResourceRequests(existing: ResourceRequest[], next: ResourceRequest[]): ResourceRequest[] {
+  const out = [...existing];
+  const seen = new Set(out.map((request) => resourceRequestKey(request)));
+  for (const request of next) {
+    const key = resourceRequestKey(request);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(request);
+  }
+  return out;
+}
+
+function resourceRequestKey(request: ResourceRequest): string {
+  return `${request.kind}::${request.findingId ?? ""}::${request.scopeId ?? ""}::${request.needed}::${request.reason}`.toLowerCase();
 }
 
 async function ensureWorkspace(ctx: ToolContext): Promise<SandboxWorkspace | undefined> {
@@ -632,7 +932,7 @@ async function ensureWorkspace(ctx: ToolContext): Promise<SandboxWorkspace | und
   const workspace = await prepareSandboxWorkspace(ctx.cfg.sourcePaths, ctx.logger.runDir, "audit/workspace");
   ctx.session.workspace = workspace;
   ctx.session.baselineFiles = await listWorkspaceFiles(workspace.absolute);
-  await ctx.logger.event("audit_workspace", { workspace: workspace.relative });
+  await ctx.logger.event("audit_workspace", { workspace: workspace.relative, ...activityStreamMeta(ctx) });
   return workspace;
 }
 
@@ -642,11 +942,54 @@ async function findReadable(ctx: ToolContext, target: string): Promise<{ path: s
   if (ctx.session.scratchFiles.has(normalized)) {
     return { path: normalized, content: ctx.session.scratchFiles.get(normalized) as string, kind: "scratch" };
   }
-  const workspaceContent = await readWorkspaceCandidate(ctx, normalized);
-  if (workspaceContent) return { ...workspaceContent, kind: "sandbox" };
   const doc = findDoc(ctx, normalized);
   if (doc) return { path: doc.path, content: doc.content, kind: doc.kind };
+  if (!sourceReadBoundaryActive(ctx) || isBuildMetadataPath(normalized)) {
+    const workspaceContent = await readWorkspaceCandidate(ctx, normalized);
+    if (workspaceContent) return { ...workspaceContent, kind: "sandbox" };
+  }
   return undefined;
+}
+
+function sourceReadBoundaryActive(ctx: ToolContext): boolean {
+  const buildRoot = ctx.cfg.buildRoot ? path.resolve(ctx.cfg.buildRoot) : undefined;
+  if (!buildRoot || ctx.cfg.prepareMode) return false;
+  return ctx.cfg.sourcePaths.length !== 1 || path.resolve(ctx.cfg.sourcePaths[0] ?? "") !== buildRoot;
+}
+
+async function prepareInspectionWorkspace(ctx: ToolContext, workspace: SandboxWorkspace, runId: string): Promise<SandboxWorkspace> {
+  const relative = `${workspace.relative}-source-view-${runId}`;
+  const absolute = path.join(ctx.logger.runDir, ...relative.split("/"));
+  await mkdir(absolute, { recursive: true });
+  const visible = new Map<string, string>();
+  for (const doc of ctx.source) {
+    const safe = normalizeRelativePath(doc.path);
+    if (safe) visible.set(safe, doc.content);
+  }
+  const corpusSeen = new Set<string>();
+  for (const [index, doc] of ctx.corpus.entries()) {
+    const safe = normalizeRelativePath(doc.path) ?? `doc-${index}`;
+    let relativeCorpus = `corpus/${safe}`;
+    while (corpusSeen.has(relativeCorpus)) relativeCorpus = `corpus/${index}-${safe}`;
+    corpusSeen.add(relativeCorpus);
+    visible.set(relativeCorpus, doc.content);
+  }
+  for (const [scratchPath, content] of ctx.session.scratchFiles) visible.set(scratchPath, content);
+  for (const filePath of ctx.session.baselineFiles ?? []) {
+    if (!isBuildMetadataPath(filePath) || visible.has(filePath)) continue;
+    try {
+      visible.set(filePath, await readFile(await resolveWorkspacePathForRead(workspace.absolute, filePath), "utf8"));
+    } catch {
+      // Binary or unreadable metadata is not needed for source inspection.
+    }
+  }
+  await writeSandboxFiles(absolute, [...visible].map(([filePath, content]) => ({ path: filePath, content })));
+  return { absolute, relative };
+}
+
+function isBuildMetadataPath(filePath: string): boolean {
+  const name = path.posix.basename(filePath.replaceAll("\\", "/"));
+  return /^(?:Cargo\.(?:toml|lock)|go\.(?:mod|sum)|package(?:-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lock|foundry\.toml|remappings\.txt|rust-toolchain(?:\.toml)?|pyproject\.toml|uv\.lock|requirements[^/]*\.txt|Makefile|CMakeLists\.txt|\.gitmodules|tsconfig[^/]*\.json|hardhat\.config\.[cm]?[jt]s)$/.test(name);
 }
 
 async function readWorkspaceCandidate(ctx: ToolContext, target: string): Promise<{ path: string; content: string } | undefined> {
@@ -680,10 +1023,11 @@ function findDoc(ctx: ToolContext, target: string): Doc | undefined {
   const normalized = normalizeToolPath(target);
   if (!normalized) return undefined;
   const all = [...ctx.source, ...ctx.corpus];
+  const withoutCorpusPrefix = normalized.startsWith("corpus/") ? normalized.slice("corpus/".length) : normalized;
   return (
-    all.find((doc) => doc.path === normalized) ??
-    all.find((doc) => doc.path.endsWith(`/${normalized}`) || doc.path.endsWith(normalized)) ??
-    all.find((doc) => doc.path.includes(normalized))
+    all.find((doc) => doc.path === normalized || doc.path === withoutCorpusPrefix) ??
+    all.find((doc) => doc.path.endsWith(`/${withoutCorpusPrefix}`) || doc.path.endsWith(withoutCorpusPrefix)) ??
+    all.find((doc) => doc.path.includes(withoutCorpusPrefix))
   );
 }
 
@@ -714,6 +1058,14 @@ export interface AuditScope {
   status?: "pending" | "audited" | "deferred" | "auditing";
   digSeconds?: number; // how long this scope's deep-audit took (set when it completes)
   priority?: number; // manual dig-queue ordering (operator "↑ Top"); ordered above score, doesn't change score
+  parentScopeId?: string; // model-proposed follow-up provenance; not part of ranking semantics
+  source?: "map" | "followup" | "coverage-gap";
+  /** Exact source/build/corpus snapshot this scope was mapped against. */
+  materialFingerprint?: string;
+  /** Independent MAP samples that emitted this exact region + obligation. */
+  mapSamples?: number[];
+  /** Number of independent MAP samples that emitted this scope. */
+  mapAgreement?: number;
 }
 
 /** Non-mutating check: did the session write a non-empty findings.json to scratch?
@@ -902,7 +1254,19 @@ function splitCommandLine(input: string): { argv: string[] } | { error: string }
       continue;
     }
     if (ch === "\\" && quote !== "'") {
-      escaping = true;
+      if (quote === '"') {
+        const next = input[idx + 1];
+        // POSIX shells preserve a backslash inside double quotes unless it
+        // escapes $, `, ", \\, or a newline. Regexes such as "for \\(" must
+        // therefore reach rg with the backslash intact.
+        if (next !== undefined && ["$", "`", '"', "\\", "\n"].includes(next)) {
+          escaping = true;
+        } else {
+          current += ch;
+        }
+      } else {
+        escaping = true;
+      }
       continue;
     }
     if (!quote && (ch === ";" || ch === "&" || ch === "|" || ch === "<" || ch === ">" || ch === "`")) {

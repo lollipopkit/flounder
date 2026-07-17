@@ -10,7 +10,10 @@ description: >
   daemon, provider profiles, model auth, sandboxed execution, corpus paths,
   source paths, build roots, coverage, or budgets; to monitor live audit activity, continue
   pending scopes, verify suspected vulnerabilities, reproduce findings, or
-  collect execution-backed bug reports.
+  collect execution-backed bug reports; or when a Flounder maintainer asks an
+  agent to improve auditor recall, analyze Evaluation failures, run governed
+  Harness experiments, modify Flounder source in an isolated branch, or prepare
+  a candidate improvement PR.
 ---
 
 # Flounder
@@ -32,6 +35,7 @@ gates.
 | `reference/examples.md` | Concrete Solidity/EVM and ZK examples. |
 | `reference/product.md` | Dashboard, project lifecycle, run phases, tracking, and artifact model. |
 | `reference/safety.md` | White-hat policy, sandbox boundary, evidence ladder, and public-release hygiene. |
+| `reference/maintainer-harness.md` | Maintainer-only agent workflow for Evaluation-driven source improvement and candidate PRs. |
 
 Use progressive disclosure: open only the reference file needed for the current
 task. Do not duplicate long command references into the conversation when a
@@ -41,12 +45,15 @@ short command and status summary is enough.
 
 - Turn a security-audit request into a public-source or authorized Flounder project or run.
 - Keep the operator on the current workflow: `run <clue>` lets Flounder prepare
-  the target, then map/dig, confirm, and report; `run --source` is the
-  source-provided entry path for sealed map/dig.
+  the target, then map/dig/synthesize/verify, confirm, and report; `run --source`
+  is the source-provided entry path for sealed map/dig/synthesize/verify.
 - Prefer the dashboard/API control plane for project work so state, daemon
   ownership, live logs, findings, and reports stay durable.
 - Preserve the evidence ladder: suspected, locally confirmed, real-target
   reproduced, submission-ready. Do not collapse these into one "bug" bucket.
+- Use run health and discovery backlog rows when judging progress: a shallow
+  or resource-blocked zero-finding run is not a negative result, and follow-up
+  scopes should stay as pending coverage rather than becoming findings.
 - Separate machine noise from active work by marking dismissed findings
   `ignored`, never by deleting them.
 - Stop with a clear next action or blocker; do not call an audit complete just
@@ -61,6 +68,8 @@ Choose the mode from the user's intent before launching anything:
 | "Do a blind audit / test Flounder's capability / no hints" | Blind capability audit | Recommended: `flounder run <project-or-repo-or-package-link>` or a dashboard project with a factual target clue. If source is already staged or external preparation is explicitly unwanted, use `flounder run --source <paths...> --build-root <root>`. | Do not add incident docs, known bug names, exploit theories, or answer-bearing corpus. Official target docs are allowed only as target material, not as a hidden answer. |
 | "Here is a suspicious tx/address; find the hack/root cause" | Incident investigation | `flounder run <tx-or-address-or-incident-link>` | Treat the clue as evidence, not as proof. Prepare may fetch chain/source data; confirm by local fork/read-only reproduction only. |
 | "Audit this project/repo openly like a white-hat researcher" | Open-world public-source audit | Create a project with source paths when available plus a task/clue naming the project, bounty, repo, package, or deployment, then Run. | Let Prepare collect official docs, scope, deployments, and provenance. Do not use private or answer-bearing material. |
+| "Audit this normal bounty / should we submit to this bounty?" | Normal bug bounty | Project with `engagement.kind="bug-bounty"`, source/build/corpus paths when available, and a task/clue naming the public or private program scope. | Keep real-target Confirm when a live target exists. Submit only reproduced or locally confirmed source findings that pass scope, duplicate, known-issue, impact, and payout-readiness gates. |
+| "Start this contest / maximize contest bounty speed" | Bug bounty contest | Project with `engagement.kind="bug-bounty-contest"` and contest strategy such as `batchScopes`, `digConcurrency`, `skipRealTargetConfirm`, and `appendMapWhenExhausted`. | Run short settled batches: verify/refute and report before opening the next batch. Source-only local confirmation may be enough when venue rules allow it, but suspected-only findings are not submissions. Use append-map, not remap, when expanding coverage. |
 
 When in doubt: if the user asks to measure Flounder's unaided recall, use blind
 capability audit and keep the clue target-only. If the user gives live exploit
@@ -80,6 +89,8 @@ Use these when the user is not asking for a full end-to-end audit:
 | "Is this locally confirmed bug real on mainnet/deployment?" | `flounder confirm <run-dir>` or selected project Confirm. |
 | "Prepare submission package" | selected Report; include only execution-backed, non-ignored findings. |
 | "Triage noisy machine findings" | update tracking: `ignored` for dismissed, `open` to recover. |
+| "Run a benchmark / regression set / positive and safe controls" | Create a validated manifest and use `flounder group create --manifest <file>`, then `flounder group start <uuid|name>`. Keep blind material policy explicit, require execution evidence for positives, and require zero confirmed findings on safe/control items. Retry only blocked items with `flounder group retry <work-item-id>`; repeated samples are separate items. |
+| "Improve Flounder's harness / raise recall / learn from Evaluation failures" | This is maintainer work, not a normal target audit. Confirm the agent is operating in the Flounder source repository with authorization to change it, then read [reference/maintainer-harness.md](reference/maintainer-harness.md) and drive the isolated source-change workflow. |
 
 ## Core Operating Rules
 
@@ -93,6 +104,9 @@ Use these when the user is not asking for a full end-to-end audit:
   live there unless the user explicitly passes `--out` or `--workspace`.
 - Start with `flounder ui` unless the user already has a control plane running.
   CLI verbs are thin clients of that control plane.
+- Start with `flounder ui --maintainer` only when an authorized Flounder
+  maintainer is improving Flounder source. Ordinary Project and Evaluation work
+  must not enable or advertise Harness source-improvement operations.
 - Use `GET /api` before driving the REST API directly; the catalog is the source
   of truth for endpoint shape.
 - Use project-owned docs/specs/audits as corpus. Do not write answer-bearing
@@ -103,9 +117,10 @@ Use these when the user is not asking for a full end-to-end audit:
   produced `confirmed-executable`, `confirmed-differential`, or a reproduced
   confirm decision.
 - `flounder run <clue>` is the one-command workflow: open-world prepare,
-  sealed map/dig, open-world confirm, then report generation. `flounder run
-  --source`, `map`, and `audit` are sealed discovery phases. `prepare` and
-  `confirm` are open-world phases, still under white-hat no-broadcast rules.
+  sealed map/dig/synthesize/verify, open-world confirm, then report generation.
+  `flounder run --source`, `map`, and `audit` are sealed discovery phases.
+  `prepare` and `confirm` are open-world phases, still under white-hat
+  no-broadcast rules.
 - Never broadcast transactions, move funds, submit writes, persist access, or
   target systems outside the declared local audit boundary or explicit authorized
   scope.
@@ -117,7 +132,8 @@ When a user asks to audit, confirm, verify, report, or inspect Flounder state:
 1. Confirm the target source is public, operator-owned, client-authorized, or in
    public bounty scope. If the source boundary is unclear, ask before running.
 2. Classify the request into one core audit mode: blind capability audit,
-   incident investigation, or open-world public-source audit.
+   incident investigation, open-world public-source audit, normal bug bounty,
+   or bug bounty contest.
 3. Decide the surface:
    - Existing dashboard/API project: use `GET /api`, then project UUID routes.
    - New project or local operator workflow: start/reuse `flounder ui`.
@@ -180,23 +196,35 @@ For repository development or local builds, use Node 24 LTS from `.nvmrc` /
    pi already has `openai-codex` in `~/.pi/agent/auth.json`, Flounder imports
    that provider entry into `~/.flounder/agent/auth.json` on login/check.
 
-4. Ensure the execution sandbox is available on the daemon machine. For real
-   audits, install and start Docker or a Docker-compatible runtime, then build
-   the default sandbox image from the Flounder repo:
+4. Ensure the execution sandbox is available on the daemon machine. Default
+   `auto` mode prefers Apple's `container` runtime on Apple silicon macOS when
+   the selected image and sealed network are ready, then falls back to
+   Docker-backed OCI when the image is available. For the Docker-backed path,
+   install and start Docker or a Docker-compatible runtime, then build the
+   default sandbox image from the Flounder repo:
 
    ```bash
    npm run sandbox:build
    ```
 
-   Default `auto` mode uses the OCI image when it exists and otherwise fails
-   closed. If Docker/OCI is unavailable, only use
+   Curated target-specific images are available for common non-EVM audits:
+
+   ```bash
+   npm run sandbox:cairo:build  # flounder-sandbox:cairo, Scarb + Starknet Foundry
+   npm run sandbox:ton:build    # flounder-sandbox:ton, TON Blueprint + FunC/Tolk/Tact
+   ```
+
+   On Apple silicon macOS daemon hosts, install/start Apple's `container`
+   runtime and build or pull the selected image into that runtime to let `auto`
+   select it; `--sandbox-backend apple-container` requires that path explicitly.
+   If no sandbox engine is available, only use
    `--sandbox-backend host --allow-host-execution` for trusted local smoke tests
    after warning the user that host mode lacks kernel-level filesystem and
    network isolation.
 
 5. Create or reuse a provider profile in Settings. A provider profile selects
    provider, model, and thinking level. Fresh stores seed `openai-codex ·
-   gpt-5.5 · xhigh` and `claude-code · opus 4.8 max`; the selected daemon still
+   gpt-5.6-sol · xhigh` and `claude-code · opus 4.8 max`; the selected daemon still
    needs local auth for every provider the project can use. A project can
    override the profile per phase: prepare, map, dig, confirm.
 
@@ -227,7 +255,7 @@ For repository development or local builds, use Node 24 LTS from `.nvmrc` /
 
 8. Monitor progress from the dashboard, CLI stream, or REST API:
 
-   - current phase: prepare, map, dig, confirm, report
+   - current phase: prepare, map, dig, synthesis, verify, confirm, report
    - live activity: `GET /api/runs/:id/log`
    - project state: `GET /api/projects/:uuid`
    - prepare quality: `prepareSummary.quality` is `ready`, `limited`,
@@ -239,6 +267,14 @@ For repository development or local builds, use Node 24 LTS from `.nvmrc` /
    - findings: `GET /api/projects/:uuid/findings?tracking=active`
    - ignored findings recovery: `GET /api/projects/:uuid/findings?tracking=ignored`
    - confirm decisions: `GET /api/projects/:uuid/confirm-decisions`
+   - run health: `latestRunHealth.status` is `healthy`,
+     `needs-coverage`, `needs-resource`, `shallow`, or `infra-failed`
+   - discovery backlog: `GET /api/projects/:uuid/backlog?status=open`
+     lists coverage gaps, resource requests, and follow-up scopes with
+     `actionability`, `action_owner`, and `recommended_action`; treat open rows
+     as an agent-owned queue (`agent-runnable`, `agent-resource`, `agent-review`)
+     and use `PATCH /api/backlog/:id` to mark rows `resolved`, `ignored`,
+     `stale`, or back to `open`
 
    Project names are display labels. Resolve a project UUID from `POST /api/projects`
    or `GET /api/projects`; do not build a project URL from the name.
@@ -305,13 +341,50 @@ prerequisite for local sealed audit.
    - local source/build/corpus paths if available;
    - a task/clue naming the project, repo, bounty page, deployment, or package;
    - an online daemon;
-   - a provider profile such as `openai-codex · gpt-5.5 · xhigh`.
+   - a provider profile such as `openai-codex · gpt-5.6-sol · xhigh`.
 3. Leave **Run after create** checked when the user wants immediate execution.
 4. Monitor `GET /api/runs/:id/log` and `GET /api/projects/:uuid`.
 5. Treat `limited` prepare as audit-ready unless it has blocking issues; carry
    caveats forward to verify/confirm/report decisions.
 6. Use official/public materials only; do not add private notes or answer-bearing
    docs that name a suspected bug.
+
+### Normal Bug Bounty
+
+Use this when the target is a normal public or private bounty program and a live
+target may need real-world reproduction.
+
+1. Create a project with `config.engagement.kind="bug-bounty"`.
+2. Provide local source/build/corpus paths when available, plus a task/clue
+   naming the official program, scope, deployment, or package.
+3. Let Prepare collect public scope, deployments, provenance, and known-issue
+   leads.
+4. Run sealed map/dig/synthesize/verify for local proof.
+5. Run Confirm for locally confirmed findings when live-target reproduction is
+   required or useful.
+6. Submit only findings that pass scope, duplicate, known-issue, impact,
+   payout-readiness, and white-hat disclosure gates.
+
+### Bug Bounty Contest
+
+Use this when the venue is a time-limited audit contest with source, rules, and
+a report format.
+
+1. Create a project with `config.engagement.kind="bug-bounty-contest"`.
+2. Configure contest strategy to favor fast settled loops, for example
+   `batchScopes:10`, `digConcurrency:5`, `skipRealTargetConfirm:true`, and
+   `appendMapWhenExhausted:true` when the rules are source-only.
+3. Before opening more scopes, settle existing candidates through verify/refute
+   and report. Contest mode is speed-oriented, but suspected-only findings
+   still do not meet the submission bar.
+4. Use duplicate tracking against already submitted issues and local findings
+   before submitting a new report.
+5. When mapped scopes are exhausted, append-map to add novel scopes while
+   preserving audited status, submitted findings, duplicate links, and reports.
+   Do not remap unless the operator intentionally wants a fresh inventory.
+6. Watch contest stop-review signals: elapsed review window, exhausted
+   inventory, recent low-yield batches, duplicate rate, report backlog, and open
+   resource requests.
 
 ### Continue An Existing Project
 
@@ -332,7 +405,13 @@ prerequisite for local sealed audit.
      -d '{"verb":"run"}'
    ```
 
-4. If many mapped scopes are pending, prefer continuing coverage before drawing
+4. Inspect `latestRunHealth`, `backlogCounts`, and open backlog rows before
+   drawing conclusions. Treat open Next Actions as work for the agent to
+   resolve or route before opening unrelated fresh coverage; ask the operator
+   only for explicit credentials, authorization, or unavailable external
+   resources. Continue coverage or prioritize follow-up scopes for
+   `needs-coverage`; do not treat `shallow` as a meaningful negative result.
+5. If many mapped scopes are pending, prefer continuing coverage before drawing
    a negative conclusion.
 
 ### Project Setup And Housekeeping
@@ -343,6 +422,13 @@ project rail, or how to recover archived work.
 - Open the project setup disclosure first when the overview reports setup
   attention. Fix daemon selection, provider auth, source paths, or prepared
   material blockers before launching new work.
+- Treat the Project setup disclosure as the home for the stored project clue
+  and prepare caveats. Do not expect the clue to appear as a separate dashboard
+  card; inspect setup before assuming Prepare did not receive context.
+- If open `resource-request` backlog rows explain a setup limitation, first let
+  the agent inspect the blocker and retry safe setup work. Ask the operator only
+  for explicit credentials, authorization, or unavailable external resources,
+  then mark handled rows `resolved` or non-actionable rows `ignored`.
 - Pin active projects that need daily attention; archive dormant projects from
   the project card menu. Archiving hides the project from the rail, clears pin,
   and keeps runs, scopes, findings, and reports.
@@ -389,10 +475,12 @@ Open only the references needed for the current task:
   [reference/commands.md](reference/commands.md)
 - Solidity/EVM and ZK examples:
   [reference/examples.md](reference/examples.md)
-- dashboard, project lifecycle, run phases, and artifact model:
+- dashboard, project lifecycle, run phases, discovery backlog, and artifact model:
   [reference/product.md](reference/product.md)
 - white-hat policy, sandbox boundary, and evidence ladder:
   [reference/safety.md](reference/safety.md)
+- maintainer-only Evaluation-to-source-improvement loop:
+  [reference/maintainer-harness.md](reference/maintainer-harness.md)
 
 ## Task Routing
 
@@ -404,21 +492,23 @@ Open only the references needed for the current task:
 | "Map the attack surface first" | `flounder map`, then inspect scopes and run `flounder audit --scope ...` |
 | "Dig this file/function/region" | `flounder audit <region> --source ... --build-root ...` |
 | "Verify this suspected bug" | Write a claims JSON and run `flounder verify <file>` or `flounder audit --verify <file>` |
-| "Continue coverage" | Use project Continue or audit pending scopes from the inventory |
+| "Continue coverage" | Use project Continue or audit pending scopes from the inventory; inspect discovery backlog first for resource blockers or follow-up scopes |
 | "Confirm whether this is real" | `flounder confirm <run-dir>` or project/finding Confirm in the UI |
 | "Collect bugs for disclosure" | Read findings, selected reports, confirm decisions, and artifacts; return only execution-backed items |
 | "Ignore this false positive" | Set finding tracking to `ignored`; do not delete it |
 | "Bring back ignored findings" | Filter `tracking=ignored`, then set selected rows back to `open` |
 | "Regenerate reports" | Use `flounder report --project <uuid|name> --finding <id>` or the report action with selected `findingIds` |
+| "Improve Flounder itself from evaluation evidence" | Confirm maintainer context, enable `flounder ui --maintainer`, then follow `reference/maintainer-harness.md`; never run this loop from an ordinary target Project |
 
 ## Deciding The Next Action
 
 - No daemon online: create/connect a daemon before launching jobs.
 - Daemon online but provider check fails: run `flounder daemon provider login`
   or set daemon-local provider credentials, then check again.
-- Sandbox says no OCI image is available: install/start Docker on the daemon and
-  run `npm run sandbox:build`, or ask for explicit trusted-local approval before
-  using `--sandbox-backend host --allow-host-execution`.
+- Sandbox says no backend is available: on Apple silicon macOS, install/start
+  Apple's `container` runtime and build or pull the image into that runtime, or
+  install/start Docker on the daemon and run `npm run sandbox:build`. Host
+  fallback still needs explicit trusted-local approval.
 - Project has no provider profile or daemon: configure those before creating a
   run.
 - Run is queued and no daemon can claim it: check the project's selected daemon.
@@ -434,9 +524,32 @@ Open only the references needed for the current task:
   caveats instead of requiring manual review.
 - Map is done but many high-score scopes are pending: continue the audit or
   prioritize scopes.
+- Latest run health is `needs-resource`: inspect open `resource-request` rows,
+  have the agent retry safe toolchain, sandbox, dependency, source, or auth setup
+  where possible, and ask the operator only for explicit credentials,
+  authorization, or unavailable external resources. Mark handled rows
+  `resolved`, then rerun the blocked phase. Prepare and toolchain warm-up can
+  create these rows even when the model did not write `resource_requests.json`;
+  treat them as product-owned setup work, not as audit findings.
+- Latest run health is `needs-coverage`: continue pending scopes or prioritize
+  follow-up scopes from the backlog. Do not ask the model to "report more bugs"
+  as a substitute for coverage.
+- Latest run health is `shallow`: treat the run as inconclusive; inspect logs
+  and rerun or fix setup before summarizing.
+- Discovery backlog has open Next Actions: let the agent resolve or route them
+  first. Coverage rows continue coverage, append map coverage, or prioritize the
+  referenced scopes; setup rows retry safe local setup; routing rows are
+  inspected and turned into the right safe workflow action. They are not findings
+  and should not appear in a bug list unless a later execution-backed audit
+  confirms one.
 - Findings are only `suspected`: make the target buildable and run verify or
   dig again.
 - Findings are confirmed locally but not reproduced: run confirm.
+- Contest project with `skipRealTargetConfirm=true`: real-target Confirm may be
+  intentionally skipped, but verify/refute and report eligibility are still
+  required before submission.
+- Contest inventory exhausted: use append-map/Continue to expand novel scopes
+  without losing prior scope status or submitted/duplicate finding history.
 - Machine-reported finding is manually dismissed: set tracking to `ignored`;
   recover it later from the Ignored filter by changing tracking back to `open`.
 - Confirm decision is `not-reproduced`: treat it as not submission-ready unless
@@ -452,7 +565,8 @@ Open only the references needed for the current task:
 | --- | --- | --- |
 | No daemon can claim a queued job | Project is pinned to an offline daemon | Start that daemon or edit the project daemon. |
 | Provider auth missing | Credentials live on daemon, not server | Run `flounder daemon provider login <provider>` and then `check`. |
-| OCI sandbox unavailable | Default image missing or Docker stopped | Start Docker and run `npm run sandbox:build`; host fallback needs explicit trusted-local approval. |
+| Docker-backed OCI sandbox unavailable | Default image missing or Docker stopped | Start Docker and run `npm run sandbox:build`; host fallback needs explicit trusted-local approval. |
+| Apple container sandbox unavailable | Apple `container` is not installed/started, the selected image is missing from that runtime, or the internal sealed network cannot be created | Run `container system start` and build or pull the image into Apple's runtime; `auto` falls back to Docker when that path is not ready. |
 | `prepareSummary.quality=limited` | Source is usable but has caveats | Continue unless blocking issues exist; preserve caveats for confirm/report. |
 | `prepareSummary.quality=invalid/missing` | No usable staged source or contaminated material | Repair prepare inputs before audit. |
 | Verify rejects selected findings for material drift | New Prepare changed the current material boundary | Re-select current findings or pass the explicit expert override only after checking drift. |
@@ -492,6 +606,7 @@ The task is not complete until the agent can report:
 - Prepared materials are `ready` or `limited`; if limited, every caveat needed
   for verify, confirm, or report decisions is called out as a known limitation.
 - The audit run reached a terminal state or a meaningful blocker.
+- Latest run health and open discovery backlog rows are summarized when present.
 - Scope coverage is summarized: mapped, audited, pending, deferred.
 - Findings are grouped by status.
 - Confirmed findings have been sent through confirm when real-target

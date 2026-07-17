@@ -26,20 +26,31 @@ async function withServer(fn) {
 test("api: GET /api is a self-describing catalog of every resource + operation", async () => {
   await withServer(async (base) => {
     const cat = await (await fetch(base + "/api")).json();
-    assert.deepEqual(cat.resources, ["project", "provider", "daemon", "run", "scope", "finding", "confirm-decision"]);
+    assert.equal(cat.maintainerMode, false);
+    assert.deepEqual(cat.resources, ["project", "provider", "daemon", "run", "run-group", "work-item", "scope", "discovery-backlog", "finding", "confirm-decision"]);
     const sigs = cat.endpoints.map((e) => e.method + " " + e.path);
     for (const expected of [
       "GET /api/projects", "PATCH /api/projects/order", "POST /api/projects", "GET /api/projects/:uuid",
       "PATCH /api/projects/:uuid", "DELETE /api/projects/:uuid",
       "POST /api/projects/:uuid/runs", "GET /api/projects/:uuid/findings",
-      "GET /api/projects/:uuid/scopes", "GET /api/projects/:uuid/confirm-decisions",
+      "GET /api/findings/:id/lifecycle", "POST /api/findings/:id/retry",
+      "GET /api/projects/:uuid/scopes", "GET /api/projects/:uuid/backlog", "GET /api/projects/:uuid/confirm-decisions",
+      "PATCH /api/backlog/:id",
       "GET /api/providers", "POST /api/providers", "GET /api/providers/:id",
       "PATCH /api/providers/:id", "DELETE /api/providers/:id",
       "GET /api/daemons", "POST /api/daemons",
+      "GET /api/run-groups", "POST /api/run-groups", "GET /api/run-groups/:uuid",
+      "POST /api/run-groups/:uuid/items", "POST /api/run-groups/:uuid/start",
+      "POST /api/run-groups/:uuid/pause", "POST /api/run-groups/:uuid/cancel",
+      "GET /api/run-groups/:uuid/report", "GET /api/work-items/:id", "POST /api/work-items/:id/retry",
       "GET /api/jobs/:id", "POST /api/jobs/:id/cancel",
       "GET /api/runs/:id", "PATCH /api/runs/:id", "POST /api/runs/:id/stop",
       "GET /api/runs/:id/log",
     ]) assert.ok(sigs.includes(expected), `catalog missing ${expected}`);
+    assert.equal(sigs.some((signature) => signature.includes("harness-experiments")), false, "ordinary catalog must not advertise maintainer-only source-improvement endpoints");
+    const disabledHarness = await fetch(base + "/api/harness-experiments");
+    assert.equal(disabledHarness.status, 403);
+    assert.match((await disabledHarness.json()).error, /maintainer mode required/);
     // every endpoint documents a summary so an agent can learn it
     assert.ok(cat.endpoints.every((e) => typeof e.summary === "string" && e.summary.length > 0));
     const projectCreate = cat.endpoints.find((e) => e.method === "POST" && e.path === "/api/projects");
@@ -47,17 +58,20 @@ test("api: GET /api is a self-describing catalog of every resource + operation",
     assert.equal(projectCreate.body.providerId.startsWith("number"), true);
     assert.match(projectCreate.body.config, /phaseProviders/);
     assert.match(projectCreate.body.config, /prepareClue/);
+    assert.match(projectCreate.body.config, /bug-bounty-contest/);
     const projectList = cat.endpoints.find((e) => e.method === "GET" && e.path === "/api/projects");
     assert.match(projectList.query.archived, /archived projects/);
     assert.match(projectList.query.limit, /default 100/);
     assert.match(projectList.query.offset, /default 0/);
     assert.match(projectList.query.q, /project-name search/);
     assert.match(projectList.query.status, /running/);
+    assert.match(projectList.query.origin, /evaluation/);
     const projectOrder = cat.endpoints.find((e) => e.method === "PATCH" && e.path === "/api/projects/order");
     assert.match(projectOrder.summary, /drag-and-drop/);
     const projectRun = cat.endpoints.find((e) => e.method === "POST" && e.path === "/api/projects/:uuid/runs");
     assert.match(projectRun.body.verb, /report/);
     assert.match(projectRun.body.verifyFromStart, /re-run Verify from the beginning/);
+    assert.match(projectRun.body.continueCoverage, /explicit opt-in/);
     assert.match(projectRun.body.scopeCoverageMode, /one-off coverage mode/);
     assert.match(projectRun.body.maxScopes, /one-off scope cap/);
     assert.match(projectRun.body.mapSteps, /one-off map turn cap/);
@@ -72,21 +86,57 @@ test("api: GET /api is a self-describing catalog of every resource + operation",
     const projectScopes = cat.endpoints.find((e) => e.method === "GET" && e.path === "/api/projects/:uuid/scopes");
     assert.match(projectScopes.query.limit, /default 50/);
     assert.match(projectScopes.query.offset, /default 0/);
+    const projectBacklog = cat.endpoints.find((e) => e.method === "GET" && e.path === "/api/projects/:uuid/backlog");
+    assert.match(projectBacklog.summary, /coverage gaps/);
+    assert.match(projectBacklog.query.kind, /resource-request/);
+    const backlogPatch = cat.endpoints.find((e) => e.method === "PATCH" && e.path === "/api/backlog/:id");
+    assert.match(backlogPatch.body.status, /ignored/);
     const projectFindings = cat.endpoints.find((e) => e.method === "GET" && e.path === "/api/projects/:uuid/findings");
     assert.match(projectFindings.query.status, /execution-confirmed/);
     assert.match(projectFindings.query.q, /#finding-id/);
     const globalFindings = cat.endpoints.find((e) => e.method === "GET" && e.path === "/api/bugs");
+    assert.match(globalFindings.query.source, /evaluation/);
     assert.match(globalFindings.summary, /execution-confirmed/);
     assert.match(globalFindings.query.project, /project uuid/);
     assert.match(globalFindings.query.tracking, /active/);
     assert.match(globalFindings.query.limit, /default 200/);
     const findingTracking = cat.endpoints.find((e) => e.method === "PATCH" && e.path === "/api/findings/:id/tracking");
     assert.match(findingTracking.body.status, /ignored/);
+    assert.match(findingTracking.body.duplicateOfFindingId, /canonical finding id/);
+    assert.match(findingTracking.body.duplicateOfFindingId, /required/);
     const runLog = cat.endpoints.find((e) => e.method === "GET" && e.path === "/api/runs/:id/log");
     assert.match(runLog.query.tail, /JSON/);
     const runPatch = cat.endpoints.find((e) => e.method === "PATCH" && e.path === "/api/runs/:id");
     assert.match(runPatch.body.scopeCoverageMode, /project-cumulative/);
     assert.match(runPatch.body.coverageTarget, /until 30/);
+    const runArtifact = cat.endpoints.find((e) => e.method === "GET" && e.path === "/api/runs/:id/artifact");
+    assert.match(runArtifact.query.name, /impact_inventory\.json/);
+  });
+});
+
+test("api: run artifacts expose confirm impact inventory", async () => {
+  await withServer(async (base, out) => {
+    const created = await (await fetch(base + "/api/projects", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "impact-inventory-artifact", sourcePaths: ["./src"] }),
+    })).json();
+
+    const runDir = path.join(out, "impact-inventory-run");
+    await mkdir(runDir, { recursive: true });
+    await writeFile(path.join(runDir, "impact_inventory.json"), JSON.stringify({
+      items: [{ bug: "Pool drain", members: ["kpool"], status: "funded" }],
+    }));
+
+    const store = MetadataStore.openForOutput(out);
+    const runId = store.startRun({ projectId: created.id, kind: "confirm", runDir, provider: "openai-codex", model: "gpt-5.5" });
+    store.finishRun(runId, "done");
+    store.close();
+
+    const artifact = await fetch(base + `/api/runs/${runId}/artifact?name=impact_inventory.json`);
+    assert.equal(artifact.status, 200);
+    const inventory = JSON.parse(await artifact.text());
+    assert.equal(inventory.items[0].bug, "Pool drain");
   });
 });
 
@@ -166,6 +216,85 @@ test("api: project list supports archive, unarchive, pin, and manual order", asy
   });
 });
 
+test("api: project detail exposes discovery health and operator backlog actions", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const patch = (p, body) => fetch(base + p, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+    const created = await json(await post("/api/projects", { name: "discovery-health-api", sourcePaths: ["./src"] }));
+    const runDir = path.join(out, "discovery-health-api-run");
+    await mkdir(runDir, { recursive: true });
+    await writeFile(path.join(runDir, "run_health.json"), JSON.stringify({ status: "needs-resource" }));
+
+    const store = MetadataStore.openForOutput(out);
+    const runId = store.startRun({ projectId: created.id, kind: "audit", runDir, provider: "openai-codex", model: "gpt-5.5" });
+    store.recordRunHealth(runId, {
+      status: "needs-resource",
+      reasons: ["1 resource request blocks deeper exploration"],
+      signals: { toolSteps: 7, resourceRequests: 1 },
+    });
+    store.replaceScopes(created.id, [
+      { scopeId: "FU1", title: "Permit replay domain", location: "src/Permit.sol:40", status: "pending", source: "followup" },
+    ]);
+    store.replaceDiscoveryBacklog(created.id, runId, [
+      { kind: "resource-request", status: "open", title: "Foundry dependencies", location: "dependency", reason: "forge build needs package install", nextAction: "Run npm install at the package root", priority: "high", payload: { id: "R1" } },
+      { kind: "followup-scope", status: "open", scopeId: "FU1", title: "Permit replay domain", location: "src/Permit.sol:40", reason: "Follow-up from S1", nextAction: "Dig this pending scope", priority: 8, payload: { id: "FU1" } },
+      { kind: "followup-scope", status: "open", scopeId: "FU2", title: "Unmapped settlement follow-up", location: "src/Settle.sol:20", reason: "Follow-up was recorded before it reached the current map", nextAction: "Expand the map", priority: 7, payload: { id: "FU2" } },
+      { kind: "coverage-gap", status: "open", title: "Router settlement path", location: "src/Router.sol", reason: "Map did not cover settlement obligations", nextAction: "Expand map around settlement", priority: "medium", payload: { gapId: "G1" } },
+    ]);
+    store.finishRun(runId, "done");
+    store.close();
+
+    let detail = await json(await fetch(base + `/api/projects/${created.uuid}`));
+    assert.equal(detail.latestRunHealth.status, "needs-resource");
+    assert.equal(detail.latestRunHealth.signals.resourceRequests, 1);
+    assert.equal(detail.backlogCounts.open, 4);
+    assert.equal(detail.backlogCounts["resource-request"], 1);
+    assert.equal(detail.backlogCounts["coverage-gap"], 1);
+    assert.equal(detail.discoveryBacklog.length, 4);
+    assert.equal(detail.openResourceRequests[0].title, "Foundry dependencies");
+    const resource = detail.discoveryBacklog.find((row) => row.kind === "resource-request");
+    const followup = detail.discoveryBacklog.find((row) => row.scope_id === "FU1");
+    const unmappedFollowup = detail.discoveryBacklog.find((row) => row.scope_id === "FU2");
+    const gap = detail.discoveryBacklog.find((row) => row.kind === "coverage-gap");
+    assert.equal(resource.actionability, "agent-resource");
+    assert.equal(resource.action_owner, "agent");
+    assert.equal(resource.recommended_action, "resolve-resource");
+    assert.equal(resource.autonomous, true);
+    assert.equal(followup.actionability, "agent-runnable");
+    assert.equal(followup.recommended_action, "prioritize-scope");
+    assert.equal(unmappedFollowup.recommended_action, "expand-map");
+    assert.equal(gap.actionability, "agent-runnable");
+    assert.equal(gap.recommended_action, "expand-map");
+
+    const backlog = await json(await fetch(base + `/api/projects/${created.uuid}/backlog?kind=resource-request`));
+    assert.equal(backlog.total, 1);
+    assert.equal(backlog.backlog[0].payload.id, "R1");
+    assert.equal(backlog.backlog[0].action_owner, "agent");
+
+    const launched = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run" }));
+    assert.equal(launched.queued, true);
+    const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
+    const spec = JSON.parse(job.spec_json);
+    assert.equal(spec.nextActions.length, 4);
+    const resourceAction = spec.nextActions.find((row) => row.kind === "resource-request");
+    assert.equal(resourceAction.actionability, "agent-resource");
+    assert.equal(resourceAction.recommendedAction, "resolve-resource");
+    assert.equal(resourceAction.title, "Foundry dependencies");
+
+    const patched = await json(await patch(`/api/backlog/${backlog.backlog[0].id}`, { status: "resolved" }));
+    assert.equal(patched.ok, true);
+    detail = await json(await fetch(base + `/api/projects/${created.uuid}`));
+    assert.equal(detail.backlogCounts.open, 3);
+    assert.equal(detail.openResourceRequests.length, 0);
+
+    const artifact = await fetch(base + `/api/runs/${runId}/artifact?name=run_health.json`);
+    assert.equal(artifact.status, 200);
+    assert.equal(JSON.parse(await artifact.text()).status, "needs-resource");
+  });
+});
+
 test("api: project run defaults leave map/dig turns unbounded and use standard scope coverage", async () => {
   await withServer(async (base) => {
     const json = (r) => r.json();
@@ -180,8 +309,8 @@ test("api: project run defaults leave map/dig turns unbounded and use standard s
     const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
     const spec = JSON.parse(job.spec_json);
 
-    assert.equal(spec.pipeline, true);
-    assert.equal(spec.clue, "default-run-budget");
+    assert.equal(spec.pipeline, false);
+    assert.equal(spec.clue, undefined);
     assert.equal(spec.coverageMode, "standard");
     assert.equal(spec.coverageTarget, 30);
     assert.equal(spec.maxScopes, 30);
@@ -206,8 +335,8 @@ test("api: explicit standard coverage leaves map/dig turns unbounded while cappi
     const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
     const spec = JSON.parse(job.spec_json);
 
-    assert.equal(spec.pipeline, true);
-    assert.equal(spec.clue, "standard-run-budget");
+    assert.equal(spec.pipeline, false);
+    assert.equal(spec.clue, undefined);
     assert.equal(spec.coverageMode, "standard");
     assert.equal(spec.maxScopes, 30);
     assert.equal(spec.mapSteps, undefined);
@@ -241,10 +370,45 @@ test("api: standard coverage fills the project up to 30 audited scopes instead o
     const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
     const spec = JSON.parse(job.spec_json);
 
-    assert.equal(spec.pipeline, true);
+    assert.equal(spec.pipeline, false);
     assert.equal(spec.coverageMode, "standard");
     assert.equal(spec.coverageTarget, 30);
     assert.equal(spec.maxScopes, 10);
+  });
+});
+
+test("api: standard coverage resumes an interrupted batch before requiring explicit coverage", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const created = await json(await post("/api/projects", {
+      name: "standard-interrupted-batch",
+      sourcePaths: ["./src"],
+      config: { scopeCoverageMode: "standard" },
+    }));
+
+    const store = MetadataStore.openForOutput(out);
+    try {
+      store.upsertScopes(created.id, [
+        ...Array.from({ length: 58 }, (_, i) => ({ scopeId: `audited-${i}`, title: `Audited ${i}`, status: "audited", score: 100 - i })),
+        ...Array.from({ length: 34 }, (_, i) => ({ scopeId: `pending-${i}`, title: `Pending ${i}`, status: "pending", score: 34 - i })),
+      ]);
+      const runId = store.startRun({ projectId: created.id, kind: "run", runDir: path.join(out, "standard-interrupted-batch-run") });
+      store.updateRunScopes(runId, 28, 30);
+      store.finishRun(runId, "killed");
+    } finally {
+      store.close();
+    }
+
+    const launched = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run" }));
+    assert.equal(launched.queued, true);
+    const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
+    const spec = JSON.parse(job.spec_json);
+
+    assert.equal(spec.pipeline, false);
+    assert.equal(spec.coverageMode, "standard");
+    assert.equal(spec.coverageTarget, 30);
+    assert.equal(spec.maxScopes, 2);
   });
 });
 
@@ -299,7 +463,7 @@ test("api: full coverage continues prepared pending inventory without a scope ca
   });
 });
 
-test("api: standard coverage lets pipeline continue after 30 audited scopes but still allows explicit scopes", async () => {
+test("api: standard pipeline continue stops after a settled round unless coverage continuation is explicit", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();
     const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -313,19 +477,34 @@ test("api: standard coverage lets pipeline continue after 30 audited scopes but 
     try {
       store.upsertScopes(created.id, [
         ...Array.from({ length: 30 }, (_, i) => ({ scopeId: `audited-${i}`, title: `Audited ${i}`, status: "audited", score: 30 - i })),
-        ...Array.from({ length: 5 }, (_, i) => ({ scopeId: `pending-${i}`, title: `Pending ${i}`, status: "pending", score: 5 - i })),
+        ...Array.from({ length: 35 }, (_, i) => ({ scopeId: `pending-${i}`, title: `Pending ${i}`, status: "pending", score: 35 - i })),
       ]);
     } finally {
       store.close();
     }
 
-    const continued = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run" }));
-    assert.equal(continued.queued, true);
-    const continuedJob = (await json(await fetch(base + "/api/jobs/" + continued.jobId))).job;
-    const continuedSpec = JSON.parse(continuedJob.spec_json);
-    assert.equal(continuedSpec.pipeline, true);
-    assert.equal(continuedSpec.coverageTarget, 30);
-    assert.equal(continuedSpec.maxScopes, 0);
+    const stopped = await post(`/api/projects/${created.uuid}/runs`, { verb: "run", pipeline: true });
+    assert.equal(stopped.status, 409);
+    const blocked = await json(stopped);
+    assert.equal(blocked.roundComplete, true);
+    assert.equal(blocked.continueCoverageRequired, true);
+    assert.equal(blocked.progress.pending, 35);
+
+    const pipeline = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run", pipeline: true, continueCoverage: true }));
+    assert.equal(pipeline.queued, true);
+    const pipelineJob = (await json(await fetch(base + "/api/jobs/" + pipeline.jobId))).job;
+    const pipelineSpec = JSON.parse(pipelineJob.spec_json);
+    assert.equal(pipelineSpec.pipeline, true);
+    assert.equal(pipelineSpec.continueCoverage, true);
+    assert.equal(pipelineSpec.coverageMode, "standard");
+    assert.equal(pipelineSpec.coverageTarget, 30);
+    assert.equal(pipelineSpec.maxScopes, 30);
+    assert.equal(pipelineSpec.sandboxConfirmNetwork, "enabled");
+
+    const continued = await post(`/api/projects/${created.uuid}/runs`, { verb: "run" });
+    assert.equal(continued.status, 409);
+    const nonPipelineBlocked = await json(continued);
+    assert.match(nonPipelineBlocked.error, /Standard coverage is already complete/);
 
     const launched = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "audit", scope: "pending-0" }));
     assert.equal(launched.queued, true);
@@ -333,6 +512,374 @@ test("api: standard coverage lets pipeline continue after 30 audited scopes but 
     const spec = JSON.parse(job.spec_json);
     assert.equal(spec.scope, "pending-0");
     assert.equal(spec.maxScopes, 30);
+  });
+});
+
+test("api: bug bounty contest projects skip real-target confirm and settle reports before the next scope batch", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const created = await json(await post("/api/projects", {
+      name: "contest-source-only-rounds",
+      sourcePaths: ["./src"],
+      config: {
+        engagement: {
+          kind: "bug-bounty-contest",
+          strategy: {
+            batchScopes: 10,
+            digConcurrency: 5,
+            skipRealTargetConfirm: true,
+            appendMapWhenExhausted: true,
+            stopAfterHours: 48,
+          },
+        },
+      },
+    }));
+
+    const store = MetadataStore.openForOutput(out);
+    let findingId;
+    try {
+      store.upsertScopes(created.id, [
+        ...Array.from({ length: 10 }, (_, i) => ({ scopeId: `audited-${i}`, title: `Audited ${i}`, status: "audited", score: 20 - i })),
+        ...Array.from({ length: 12 }, (_, i) => ({ scopeId: `pending-${i}`, title: `Pending ${i}`, status: "pending", score: 12 - i })),
+      ]);
+      const runId = store.startRun({ projectId: created.id, kind: "run", runDir: path.join(out, "contest-source-only-rounds-run") });
+      store.upsertFindings(created.id, runId, [
+        {
+          findingKey: "kcontest",
+          title: "Contest source-only bug",
+          location: "src/A.sol:1",
+          severity: "high",
+          status: "confirmed-executable",
+          evidence: "local proof",
+        },
+      ]);
+      store.finishRun(runId, "done");
+      findingId = store.listFindings(created.id)[0].id;
+    } finally {
+      store.close();
+    }
+
+    const list = await json(await fetch(base + "/api/projects"));
+    const row = list.projects.find((project) => project.uuid === created.uuid);
+    assert.equal(row.confirmPendingFindings, 0, "contest source-only findings do not wait for real-target confirm");
+
+    const pipeline = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run", pipeline: true }));
+    const pipelineJob = (await json(await fetch(base + "/api/jobs/" + pipeline.jobId))).job;
+    const pipelineSpec = JSON.parse(pipelineJob.spec_json);
+    assert.equal(pipelineSpec.coverageMode, "custom");
+    assert.equal(pipelineSpec.maxScopes, 0, "missing report work is settled before opening the next contest batch");
+    assert.equal(pipelineSpec.digConcurrency, 5);
+
+    const report = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "report" }));
+    const reportJob = (await json(await fetch(base + "/api/jobs/" + report.jobId))).job;
+    const reportSpec = JSON.parse(reportJob.spec_json);
+    assert.equal(reportSpec.reportFindings[0].findingId, findingId);
+    assert.equal(reportSpec.reportFindings[0].evidenceMode, "source-only-local-confirmed");
+  });
+});
+
+test("api: normal bug bounty projects keep real-target confirm before reports", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const created = await json(await post("/api/projects", {
+      name: "normal-bounty-confirm-required",
+      sourcePaths: ["./src"],
+      config: {
+        engagement: { kind: "bug-bounty" },
+      },
+    }));
+
+    const store = MetadataStore.openForOutput(out);
+    try {
+      store.upsertScopes(created.id, [
+        { scopeId: "audited-0", title: "Audited 0", status: "audited", score: 10 },
+      ]);
+      const runId = store.startRun({ projectId: created.id, kind: "run", runDir: path.join(out, "normal-bounty-run") });
+      store.upsertFindings(created.id, runId, [
+        {
+          findingKey: "kbounty",
+          title: "Normal bounty bug",
+          location: "src/A.sol:1",
+          severity: "high",
+          status: "confirmed-executable",
+          evidence: "local proof",
+        },
+      ]);
+      store.finishRun(runId, "done");
+    } finally {
+      store.close();
+    }
+
+    const list = await json(await fetch(base + "/api/projects"));
+    const row = list.projects.find((project) => project.uuid === created.uuid);
+    assert.equal(row.confirmPendingFindings, 1, "normal bounty findings wait for real-target confirm");
+    assert.equal(row.confirmedBugs, 0, "normal bounty local confirmations are not counted as final bugs");
+
+    const report = await post(`/api/projects/${created.uuid}/runs`, { verb: "report" });
+    assert.equal(report.status, 400);
+    assert.match((await report.json()).error, /no submission-ready decisions/i);
+  });
+});
+
+test("api: bug bounty contest pipeline opens short batches and expands the map when pending scopes are exhausted", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const created = await json(await post("/api/projects", {
+      name: "contest-next-batch",
+      sourcePaths: ["./src"],
+      config: {
+        engagement: {
+          kind: "bug-bounty-contest",
+          strategy: { batchScopes: 10, digConcurrency: 5, skipRealTargetConfirm: true, appendMapWhenExhausted: true },
+        },
+      },
+    }));
+
+    const store = MetadataStore.openForOutput(out);
+    try {
+      store.upsertScopes(created.id, [
+        ...Array.from({ length: 10 }, (_, i) => ({ scopeId: `audited-${i}`, title: `Audited ${i}`, status: "audited", score: 20 - i })),
+        ...Array.from({ length: 12 }, (_, i) => ({ scopeId: `pending-${i}`, title: `Pending ${i}`, status: "pending", score: 12 - i })),
+      ]);
+      const runId = store.startRun({ projectId: created.id, kind: "run", runDir: path.join(out, "contest-next-batch-run") });
+      store.upsertFindings(created.id, runId, [
+        {
+          findingKey: "kreportsready",
+          title: "Reported contest bug",
+          location: "src/A.sol:1",
+          severity: "high",
+          status: "confirmed-executable",
+          evidence: "local proof",
+        },
+      ]);
+      const findingId = store.listFindings(created.id)[0].id;
+      store.setFindingReport(created.id, findingId, "# Reported contest bug\n\nFormal report.");
+      store.finishRun(runId, "done");
+    } finally {
+      store.close();
+    }
+
+    const next = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run", pipeline: true }));
+    const nextJob = (await json(await fetch(base + "/api/jobs/" + next.jobId))).job;
+    const nextSpec = JSON.parse(nextJob.spec_json);
+    assert.equal(nextSpec.coverageMode, "custom");
+    assert.equal(nextSpec.maxScopes, 10);
+    assert.equal(nextSpec.continueCoverage, true);
+
+    const exhaustedStore = MetadataStore.openForOutput(out);
+    try {
+      exhaustedStore.replaceScopes(created.id, [
+        ...Array.from({ length: 22 }, (_, i) => ({ scopeId: `audited-${i}`, title: `Audited ${i}`, status: "audited", score: 30 - i })),
+      ]);
+    } finally {
+      exhaustedStore.close();
+    }
+    const expanded = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run", pipeline: true }));
+    const expandedJob = (await json(await fetch(base + "/api/jobs/" + expanded.jobId))).job;
+    const expandedSpec = JSON.parse(expandedJob.spec_json);
+    assert.equal(expandedSpec.appendMap, true);
+    assert.equal(expandedSpec.maxScopes, 10);
+  });
+});
+
+test("api: standard pipeline continue finishes pending verify work before opening the next scope batch", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const created = await json(await post("/api/projects", {
+      name: "standard-cumulative-pending-verify",
+      sourcePaths: ["./src"],
+      config: { scopeCoverageMode: "standard" },
+    }));
+
+    const store = MetadataStore.openForOutput(out);
+    try {
+      store.upsertScopes(created.id, [
+        ...Array.from({ length: 30 }, (_, i) => ({ scopeId: `audited-${i}`, title: `Audited ${i}`, status: "audited", score: 30 - i })),
+        ...Array.from({ length: 5 }, (_, i) => ({ scopeId: `pending-${i}`, title: `Pending ${i}`, status: "pending", score: 5 - i })),
+      ]);
+      const runId = store.startRun({ projectId: created.id, kind: "run", runDir: path.join(out, "standard-cumulative-pending-verify-run") });
+      store.upsertFindings(created.id, runId, [
+        {
+          findingKey: "ksuspected",
+          title: "Needs execution verification",
+          location: "src/A.sol:1",
+          severity: "high",
+          status: "suspected",
+          evidence: "candidate",
+        },
+      ]);
+      store.finishRun(runId, "done");
+    } finally {
+      store.close();
+    }
+
+    const pipeline = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run", pipeline: true }));
+    assert.equal(pipeline.queued, true);
+    const pipelineJob = (await json(await fetch(base + "/api/jobs/" + pipeline.jobId))).job;
+    const pipelineSpec = JSON.parse(pipelineJob.spec_json);
+    assert.equal(pipelineSpec.pipeline, true);
+    assert.equal(pipelineSpec.coverageMode, "standard");
+    assert.equal(pipelineSpec.coverageTarget, 30);
+    assert.equal(pipelineSpec.maxScopes, 0);
+    assert.equal(pipelineSpec.pipelineStart, "settle");
+    assert.equal(pipelineSpec.sandboxConfirmNetwork, "enabled");
+  });
+});
+
+test("api: blocked confirm decisions stay idempotent until focused retry or explicit coverage continuation", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const created = await json(await post("/api/projects", {
+      name: "standard-cumulative-needs-human",
+      sourcePaths: ["./src"],
+      config: { scopeCoverageMode: "standard" },
+    }));
+
+    const store = MetadataStore.openForOutput(out);
+    try {
+      store.upsertScopes(created.id, [
+        ...Array.from({ length: 30 }, (_, i) => ({ scopeId: `audited-${i}`, title: `Audited ${i}`, status: "audited", score: 30 - i })),
+        ...Array.from({ length: 12 }, (_, i) => ({ scopeId: `pending-${i}`, title: `Pending ${i}`, status: "pending", score: 12 - i })),
+      ]);
+      const auditRun = store.startRun({ projectId: created.id, kind: "audit", runDir: path.join(out, "standard-cumulative-needs-human-audit") });
+      store.upsertFindings(created.id, auditRun, [
+        {
+          findingKey: "kgated",
+          title: "Locally reproduced but human-gated",
+          location: "src/A.sol:1",
+          severity: "medium",
+          status: "confirmed-executable",
+          evidence: "local proof",
+        },
+      ]);
+      store.finishRun(auditRun, "done");
+      const confirmRun = store.startRun({ projectId: created.id, kind: "confirm", runDir: path.join(out, "standard-cumulative-needs-human-confirm") });
+      store.upsertConfirmDecisions(created.id, confirmRun, [
+        {
+          bug: "Locally reproduced but human-gated",
+          reproduced: "yes",
+          recommendation: "needs-human",
+          members: ["kgated"],
+          reproEvidence: "Forge harness used published source; live deployment and funds-at-risk were not established.",
+          humanGates: "Live deployment and payout eligibility need human review.",
+        },
+      ]);
+      store.finishRun(confirmRun, "done");
+    } finally {
+      store.close();
+    }
+
+    const response = await post(`/api/projects/${created.uuid}/runs`, { verb: "run", pipeline: true });
+    assert.equal(response.status, 409);
+    const pipeline = await json(response);
+    assert.equal(pipeline.roundComplete, true);
+    assert.equal(pipeline.continueCoverageRequired, true);
+  });
+});
+
+test("api: standard pipeline continue resumes an interrupted batch before pending verify work", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const created = await json(await post("/api/projects", {
+      name: "standard-pipeline-interrupted-batch",
+      sourcePaths: ["./src"],
+      config: { scopeCoverageMode: "standard" },
+    }));
+
+    const store = MetadataStore.openForOutput(out);
+    try {
+      store.upsertScopes(created.id, [
+        ...Array.from({ length: 58 }, (_, i) => ({ scopeId: `audited-${i}`, title: `Audited ${i}`, status: "audited", score: 100 - i })),
+        ...Array.from({ length: 34 }, (_, i) => ({ scopeId: `pending-${i}`, title: `Pending ${i}`, status: "pending", score: 34 - i })),
+      ]);
+      const runId = store.startRun({ projectId: created.id, kind: "run", runDir: path.join(out, "standard-pipeline-interrupted-batch-run") });
+      store.updateRunScopes(runId, 28, 30);
+      store.upsertFindings(created.id, runId, [
+        {
+          findingKey: "ksuspected",
+          title: "Needs execution verification",
+          location: "src/A.sol:1",
+          severity: "high",
+          status: "suspected",
+          evidence: "candidate",
+        },
+      ]);
+      store.finishRun(runId, "killed");
+    } finally {
+      store.close();
+    }
+
+    const pipeline = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "run", pipeline: true }));
+    assert.equal(pipeline.queued, true);
+    const pipelineJob = (await json(await fetch(base + "/api/jobs/" + pipeline.jobId))).job;
+    const pipelineSpec = JSON.parse(pipelineJob.spec_json);
+    assert.equal(pipelineSpec.pipeline, true);
+    assert.equal(pipelineSpec.coverageMode, "standard");
+    assert.equal(pipelineSpec.coverageTarget, 30);
+    assert.equal(pipelineSpec.maxScopes, 2);
+    assert.equal(pipelineSpec.sandboxConfirmNetwork, "enabled");
+  });
+});
+
+test("api: successful later coverage clears stale interrupted remainder without rerunning an unchanged blocked confirm", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const created = await json(await post("/api/projects", {
+      name: "standard-pipeline-stale-interrupt-cleared",
+      sourcePaths: ["./src"],
+      config: { scopeCoverageMode: "standard" },
+    }));
+
+    const store = MetadataStore.openForOutput(out);
+    try {
+      store.upsertScopes(created.id, [
+        ...Array.from({ length: 60 }, (_, i) => ({ scopeId: `audited-${i}`, title: `Audited ${i}`, status: "audited", score: 100 - i })),
+        ...Array.from({ length: 12 }, (_, i) => ({ scopeId: `pending-${i}`, title: `Pending ${i}`, status: "pending", score: 12 - i })),
+      ]);
+      const killedRun = store.startRun({ projectId: created.id, kind: "run", runDir: path.join(out, "standard-pipeline-stale-interrupt-killed") });
+      store.updateRunScopes(killedRun, 28, 30);
+      store.finishRun(killedRun, "killed");
+      const laterRun = store.startRun({ projectId: created.id, kind: "audit", runDir: path.join(out, "standard-pipeline-stale-interrupt-later") });
+      store.updateRunScopes(laterRun, 16, 16);
+      store.upsertFindings(created.id, laterRun, [
+        {
+          findingKey: "kgated",
+          title: "Reproduced but still needs submission gating",
+          location: "src/A.sol:1",
+          severity: "high",
+          status: "confirmed-executable",
+          evidence: "local proof",
+        },
+      ], "differential");
+      store.finishRun(laterRun, "done");
+      const confirmRun = store.startRun({ projectId: created.id, kind: "confirm", runDir: path.join(out, "standard-pipeline-stale-interrupt-confirm") });
+      store.upsertConfirmDecisions(created.id, confirmRun, [
+        {
+          bug: "Reproduced but still needs submission gating",
+          reproduced: "yes",
+          recommendation: "needs-human",
+          members: ["kgated"],
+          reproEvidence: "purpose=confirm command reproduced the target effect",
+          humanGates: "Live deployment and payout eligibility need human review.",
+        },
+      ]);
+      store.finishRun(confirmRun, "done");
+    } finally {
+      store.close();
+    }
+
+    const response = await post(`/api/projects/${created.uuid}/runs`, { verb: "run", pipeline: true });
+    assert.equal(response.status, 409);
+    const pipeline = await json(response);
+    assert.equal(pipeline.roundComplete, true);
+    assert.equal(pipeline.continueCoverageRequired, true);
   });
 });
 
@@ -433,6 +980,7 @@ test("api: daemon pipeline worklist exposes verify candidates before confirm", a
     const store = MetadataStore.openForOutput(out);
     let token;
     let suspectedId;
+    let jobId;
     try {
       const daemon = store.createDaemonToken("pipeline-verify-daemon");
       token = daemon.token;
@@ -447,6 +995,9 @@ test("api: daemon pipeline worklist exposes verify candidates before confirm", a
           confidence: 0.82,
         },
       ], "synthesis");
+      jobId = store.enqueueJob("pipeline-verify-worklist", { verb: "run", pipeline: true }, daemon.id);
+      assert.equal(store.claimJob(daemon.id)?.id, jobId);
+      store.setJobRun(jobId, runId);
       suspectedId = Number(store.listFindings(created.id)[0].id);
       store.upsertFindings(created.id, runId, [
         {
@@ -468,9 +1019,27 @@ test("api: daemon pipeline worklist exposes verify candidates before confirm", a
           confidence: 0.93,
         },
       ], "differential");
+      store.upsertFindings(created.id, runId, [
+        {
+          findingKey: "kgateblocked",
+          title: "Gate-blocked reproduced proof",
+          location: "src/Vault.sol:92",
+          severity: "critical",
+          status: "confirmed-executable",
+          confidence: 0.9,
+        },
+      ], "differential");
       const confirmRun = store.startRun({ projectId: created.id, kind: "confirm", runDir: path.join(out, "pipeline-confirm-run") });
       store.upsertConfirmDecisions(created.id, confirmRun, [
-        { bug: "prior reproduced withdrawal proof", reproduced: "yes", recommendation: "submit-candidate", members: ["kalreadyreproduced"] },
+        { bug: "prior reproduced withdrawal proof", reproduced: "yes", recommendation: "submit-candidate", evidenceLevel: "real-target-reproduced", members: ["kalreadyreproduced"] },
+        {
+          bug: "gate-blocked reproduced proof",
+          reproduced: "yes",
+          recommendation: "needs-human",
+          members: ["kgateblocked"],
+          reproEvidence: "purpose=confirm command cmd-gate reproduced the real target effect",
+          humanGates: "Live funded exposure and payout tier are pending review.",
+        },
       ]);
       store.finishRun(confirmRun, "done");
       store.upsertFindings(created.id, runId, [
@@ -491,37 +1060,48 @@ test("api: daemon pipeline worklist exposes verify candidates before confirm", a
     const verify = await json(await fetch(base + "/api/daemon/pipeline-worklist", {
       method: "POST",
       headers: authHeaders,
-      body: JSON.stringify({ project: "pipeline-verify-worklist", phase: "verify" }),
+      body: JSON.stringify({ jobId, project: "pipeline-verify-worklist", phase: "verify" }),
     }));
     assert.equal(verify.phase, "verify");
-    assert.equal(verify.verifyFindings.length, 1);
-    assert.equal(verify.verifyFindings[0].id, suspectedId);
-    assert.equal(verify.verifyFindings[0].originId, suspectedId);
-    assert.equal(verify.verifyFindings[0].finding_key, "suspected-bug");
+    assert.equal(verify.verifyFindings.length, 2, "distinct claims are not hidden by title-similarity heuristics");
+    const original = verify.verifyFindings.find((finding) => finding.id === suspectedId);
+    assert.equal(original.originId, suspectedId);
+    assert.equal(original.finding_key, "suspected-bug");
 
     const restartVerify = await json(await fetch(base + "/api/daemon/pipeline-worklist", {
       method: "POST",
       headers: authHeaders,
-      body: JSON.stringify({ project: "pipeline-verify-worklist", phase: "verify", verifyFromStart: true }),
+      body: JSON.stringify({ jobId, project: "pipeline-verify-worklist", phase: "verify", verifyFromStart: true }),
     }));
     assert.equal(restartVerify.phase, "verify");
     assert.equal(restartVerify.verifyFromStart, true);
-    assert.deepEqual(new Set(restartVerify.verifyFindings.map((finding) => finding.finding_key)), new Set(["suspected-bug", "confirmed-bug"]));
+    assert.deepEqual(new Set(restartVerify.verifyFindings.map((finding) => finding.finding_key)), new Set(["suspected-bug", "duplicate-suspected-bug", "confirmed-bug"]));
 
     const confirm = await json(await fetch(base + "/api/daemon/pipeline-worklist", {
       method: "POST",
       headers: authHeaders,
-      body: JSON.stringify({ project: "pipeline-verify-worklist", phase: "confirm" }),
+      body: JSON.stringify({ jobId, project: "pipeline-verify-worklist", phase: "confirm" }),
     }));
     assert.ok(confirm.confirmKeys.includes("confirmed-bug"));
-    assert.ok(confirm.confirmKeys.includes("kalreadyreproduced"), "confirm worklist carries prior decided findings as consolidation context");
+    assert.ok(!confirm.confirmKeys.includes("kgateblocked"), "the same blocked confirm input does not rerun without a focused retry request");
+    assert.ok(!confirm.confirmKeys.includes("kalreadyreproduced"), "confirm worklist skips prior decided findings");
+    assert.ok(confirm.confirmFindings.some((finding) => finding.id === "confirmed-bug" && finding.originId), "confirm worklist carries DB-backed finding seeds");
+    assert.ok(!confirm.confirmFindings.some((finding) => finding.id === "kgateblocked"), "blocked confirmation stays visible in lifecycle evidence instead of draining again");
     assert.deepEqual(confirm.confirmSettledRows.map((row) => row.bug), ["prior reproduced withdrawal proof"]);
     assert.ok(confirm.confirmKeys.some((key) => /^origin:\d+:confirmed-bug$/.test(key)), "worklist carries origin selector for verify-artifact recovery");
 
     const detail = await json(await fetch(base + `/api/projects/${created.uuid}`));
     const suspected = detail.allFindings.find((finding) => finding.finding_key === "suspected-bug");
     assert.equal(suspected.timeline[0].reason, "synthesis");
-    assert.equal(detail.allFindings.some((finding) => finding.finding_key === "duplicate-suspected-bug"), false);
+    assert.equal(detail.allFindings.some((finding) => finding.finding_key === "duplicate-suspected-bug"), true, "semantic similarity is visible until exact canonical identity or explicit duplicate tracking resolves it");
+    const blocked = detail.allFindings.find((finding) => finding.finding_key === "kgateblocked");
+    await json(await fetch(base + `/api/findings/${blocked.id}/retry`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ phase: "confirm" }) }));
+    const retriedConfirm = await json(await fetch(base + "/api/daemon/pipeline-worklist", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ jobId, project: "pipeline-verify-worklist", phase: "confirm" }),
+    }));
+    assert.ok(retriedConfirm.confirmKeys.includes("kgateblocked"), "focused retry reopens only the blocked confirm phase");
   });
 });
 
@@ -540,7 +1120,7 @@ test("api: current confirm decisions hide older rows superseded by newer member 
       store.finishRun(oldConfirm, "done");
       const newConfirm = store.startRun({ projectId: created.id, kind: "confirm", runDir: path.join(out, "new-confirm") });
       store.upsertConfirmDecisions(created.id, newConfirm, [
-        { bug: "new reproduced result", reproduced: "yes", recommendation: "submit-candidate", members: ["kabc123"] },
+        { bug: "new reproduced result", reproduced: "yes", recommendation: "submit-candidate", evidenceLevel: "real-target-reproduced", members: ["kabc123"] },
       ]);
       store.finishRun(newConfirm, "done");
       const setupFailedConfirm = store.startRun({ projectId: created.id, kind: "confirm", runDir: path.join(out, "setup-failed-confirm") });
@@ -682,6 +1262,24 @@ test("api: verify launch links project finding rows back to the original finding
     assert.equal(spec.verb, "audit");
     assert.equal(spec.verifyFindings[0].id, finding.id);
     assert.equal(spec.verifyFindings[0].originId, finding.id);
+
+    const launchedById = await json(await post(`/api/projects/${created.uuid}/runs`, {
+      verb: "audit",
+      verifyFindings: [{ id: finding.id }],
+    }));
+    const idJob = (await json(await fetch(base + "/api/jobs/" + launchedById.jobId))).job;
+    const idSpec = JSON.parse(idJob.spec_json);
+    assert.equal(idSpec.verifyFindings[0].id, finding.id);
+    assert.equal(idSpec.verifyFindings[0].originId, finding.id);
+    assert.equal(idSpec.verifyFindings[0].title, "Proof input is not bound");
+    assert.equal(idSpec.verifyFindings[0].location, "src/Rollup.sol:44");
+
+    const invalidOrigin = await post(`/api/projects/${created.uuid}/runs`, {
+      verb: "audit",
+      verifyFindings: [{ originId: String(finding.id), title: finding.title, location: finding.location }],
+    });
+    assert.equal(invalidOrigin.status, 400);
+    assert.match((await json(invalidOrigin)).error, /positive integer/);
   });
 });
 
@@ -728,6 +1326,8 @@ test("api: verify launch rejects findings produced before a newer prepare run", 
     const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
     const spec = JSON.parse(job.spec_json);
     assert.equal(spec.verifyFindings[0].originId, findingId);
+    assert.equal(spec.verifyFindings[0].finding_key, "stale-suspected-bug");
+    assert.equal(spec.verifyFindings[0].title, "Stale proof input is not bound");
   });
 });
 
@@ -1302,7 +1902,34 @@ test("api: report launch queues only reproduced real-target findings that were n
           severity: "medium",
           status: "confirmed-executable",
         },
+        {
+          findingKey: "kneeds",
+          title: "Gate-blocked bug",
+          location: "src/Target.sol:67",
+          severity: "high",
+          status: "confirmed-executable",
+        },
+        {
+          findingKey: "kconflict",
+          title: "Evidence-conflicted bug",
+          location: "src/Target.sol:78",
+          severity: "high",
+          status: "confirmed-executable",
+          refutationStatus: "conflict",
+          refutationReason: "Local verification conflicts with the real-target reproduction.",
+        },
       ]);
+      const conflictFinding = store.queryFindings(created.id, { search: "Evidence-conflicted bug" })[0];
+      store.upsertFindings(created.id, auditRun, [{
+        findingKey: "kconflictlegacy",
+        originId: Number(conflictFinding.id),
+        title: "Evidence-conflicted bug",
+        location: "src/Target.sol:78",
+        severity: "high",
+        status: "confirmed-executable",
+        refutationStatus: "conflict",
+        refutationReason: "Local verification conflicts with the real-target reproduction.",
+      }]);
       const confirmRun = store.startRun({ projectId: created.id, kind: "confirm", runDir: path.join(out, "report-launch-confirm") });
       store.upsertConfirmDecisions(created.id, confirmRun, [
         {
@@ -1312,6 +1939,15 @@ test("api: report launch queues only reproduced real-target findings that were n
           members: ["kready"],
           reproEvidence: "purpose=confirm command cmd1 reproduced the real target effect",
           reproCommandId: "cmd1",
+        },
+        {
+          bug: "Gate-blocked bug",
+          reproduced: "yes",
+          recommendation: "needs-human",
+          members: ["kneeds"],
+          reproEvidence: "purpose=confirm command cmd-needs reproduced the real target effect",
+          reproCommandId: "cmd-needs",
+          humanGates: "Live funded impact and payout tier are still pending review.",
         },
         {
           bug: "Dropped bug",
@@ -1334,6 +1970,14 @@ test("api: report launch queues only reproduced real-target findings that were n
           recommendation: "drop",
           members: ["knotreproduced"],
         },
+        {
+          bug: "Evidence-conflicted bug",
+          reproduced: "yes",
+          recommendation: "submit-candidate",
+          members: ["kconflictlegacy"],
+          reproEvidence: "purpose=confirm command cmd-conflict reproduced the real target effect",
+          reproCommandId: "cmd-conflict",
+        },
       ]);
     } finally {
       store.close();
@@ -1343,15 +1987,23 @@ test("api: report launch queues only reproduced real-target findings that were n
     const ready = detail.allFindings.find((finding) => finding.finding_key === "kready");
     const dropped = detail.allFindings.find((finding) => finding.finding_key === "kdrop");
     const existing = detail.allFindings.find((finding) => finding.finding_key === "kexisting");
+    const needs = detail.allFindings.find((finding) => finding.finding_key === "kneeds");
+    const conflicted = detail.allFindings.find((finding) => finding.finding_key === "kconflict");
     const readyDecision = detail.confirmDecisions.find((decision) => decision.bug === "Ready bug");
     const existingDecision = detail.confirmDecisions.find((decision) => decision.bug === "Existing report bug");
+    const conflictDecision = detail.confirmDecisions.find((decision) => decision.bug === "Evidence-conflicted bug");
     assert.ok(ready);
     assert.ok(dropped);
     assert.ok(existing);
+    assert.ok(needs);
+    assert.ok(conflicted);
     assert.ok(readyDecision);
     assert.ok(existingDecision);
+    assert.ok(conflictDecision);
+    assert.deepEqual(JSON.parse(conflictDecision.members_json), ["kconflict"], "decision members are canonicalized from historical aliases");
     assert.equal(existing.has_report, false);
     assert.equal(existingDecision.has_report, true);
+    assert.equal(conflicted.refutation_status, "conflict");
     const generatedDecisionReport = await json(await fetch(base + `/api/confirm-decisions/${readyDecision.id}/report`));
     assert.equal(generatedDecisionReport.source, "generated");
     assert.match(generatedDecisionReport.markdown, /^# Ready bug/);
@@ -1398,7 +2050,45 @@ test("api: report launch queues only reproduced real-target findings that were n
 
     const rejected = await post(`/api/projects/${created.uuid}/runs`, { verb: "report", findingIds: [dropped.id] });
     assert.equal(rejected.status, 400);
-    assert.match((await rejected.json()).error, /not reproduced on the real target|dropped/);
+    assert.match((await rejected.json()).error, /not reproduced on the real target|dropped|submission-ready/);
+    const gateBlocked = await post(`/api/projects/${created.uuid}/runs`, { verb: "report", findingIds: [needs.id] });
+    assert.equal(gateBlocked.status, 400);
+    assert.match((await gateBlocked.json()).error, /submission-ready/);
+    const conflictBlocked = await post(`/api/projects/${created.uuid}/runs`, { verb: "report", findingIds: [conflicted.id] });
+    assert.equal(conflictBlocked.status, 400);
+    assert.match((await conflictBlocked.json()).error, /unresolved local\/real-target evidence conflict/);
+
+    const resolutionStore = MetadataStore.openForOutput(out);
+    try {
+      const verifyRetry = resolutionStore.startRun({ projectId: created.id, kind: "audit", runDir: path.join(out, "report-launch-conflict-retry"), budgets: { verify: true } });
+      resolutionStore.recordFindingPhaseAttempt(created.id, verifyRetry, {
+        subjectType: "finding",
+        subjectId: Number(conflicted.id),
+        phase: "verify",
+        inputFingerprint: "sha256:conflict-retry",
+        state: "running",
+      });
+      resolutionStore.upsertFindings(created.id, verifyRetry, [{
+        findingKey: "kconflict-reverified",
+        originId: Number(conflicted.id),
+        title: "Evidence-conflicted bug",
+        location: "src/Target.sol:78",
+        severity: "high",
+        status: "confirmed-executable",
+        phaseAttempt: {
+          subjectType: "finding",
+          subjectId: Number(conflicted.id),
+          inputFingerprint: "sha256:conflict-retry",
+        },
+      }]);
+      resolutionStore.finishRun(verifyRetry, "done");
+      assert.equal(resolutionStore.getFinding(Number(conflicted.id)).refutation_status, null);
+    } finally {
+      resolutionStore.close();
+    }
+    const conflictRecovered = await post(`/api/projects/${created.uuid}/runs`, { verb: "report", findingIds: [conflicted.id] });
+    assert.equal(conflictRecovered.status, 200);
+    assert.ok((await conflictRecovered.json()).jobId);
   });
 });
 
@@ -1451,7 +2141,29 @@ test("api: report launch accepts source-only execution-confirmed findings withou
           severity: "medium",
           status: "suspected",
         },
+        {
+          findingKey: "kreviewrefuted",
+          title: "Source-only independently refuted bug",
+          location: "src/Target.rs:56",
+          severity: "medium",
+          status: "confirmed-differential",
+          refutationStatus: "refuted",
+          refutationReason: "The execution passed, but the claimed invariant does not hold.",
+        },
+        {
+          findingKey: "kduplicate",
+          title: "Source-only duplicate bug",
+          location: "src/Target.rs:78",
+          severity: "medium",
+          status: "confirmed-executable",
+        },
       ]);
+      const rows = store.queryFindings(created.id);
+      const canonical = rows.find((finding) => finding.finding_key === "ksource");
+      const duplicate = rows.find((finding) => finding.finding_key === "kduplicate");
+      assert.ok(canonical);
+      assert.ok(duplicate);
+      store.setFindingTracking(Number(duplicate.id), "duplicate", Number(canonical.id));
     } finally {
       store.close();
     }
@@ -1460,8 +2172,12 @@ test("api: report launch accepts source-only execution-confirmed findings withou
     assert.equal(detail.prepareSummary.realTarget.requiresConfirmation, false);
     const ready = detail.allFindings.find((finding) => finding.finding_key === "ksource");
     const suspected = detail.allFindings.find((finding) => finding.finding_key === "ksuspected");
+    const reviewRefuted = detail.allFindings.find((finding) => finding.finding_key === "kreviewrefuted");
+    const duplicate = detail.allFindings.find((finding) => finding.finding_key === "kduplicate");
     assert.ok(ready);
     assert.ok(suspected);
+    assert.ok(reviewRefuted);
+    assert.ok(duplicate);
 
     const launched = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "report", findingIds: [ready.id] }));
     const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
@@ -1482,6 +2198,14 @@ test("api: report launch accepts source-only execution-confirmed findings withou
     const rejected = await post(`/api/projects/${created.uuid}/runs`, { verb: "report", findingIds: [suspected.id] });
     assert.equal(rejected.status, 400);
     assert.match((await rejected.json()).error, /not locally execution-confirmed/);
+
+    const reviewRejected = await post(`/api/projects/${created.uuid}/runs`, { verb: "report", findingIds: [reviewRefuted.id] });
+    assert.equal(reviewRejected.status, 400);
+    assert.match((await reviewRejected.json()).error, /independent review/);
+
+    const duplicateRejected = await post(`/api/projects/${created.uuid}/runs`, { verb: "report", findingIds: [duplicate.id] });
+    assert.equal(duplicateRejected.status, 400);
+    assert.match((await duplicateRejected.json()).error, /canonical finding/);
   });
 });
 
@@ -1540,7 +2264,15 @@ test("api: startup reconciles error runs that have successful terminal artifacts
   const out = await mkdtemp(path.join(os.tmpdir(), "flounder-api-reconcile-"));
   const runDir = path.join(out, "artifact-success-run");
   await mkdir(runDir, { recursive: true });
-  await writeFile(path.join(runDir, "events.jsonl"), JSON.stringify({ ts: new Date().toISOString(), kind: "audit_done", stoppedReason: "finished", findings: 1 }) + "\n");
+  const priorEvents = Array.from({ length: 700 }, (_, i) => JSON.stringify({
+    ts: new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString(),
+    kind: "audit_action",
+    detail: `historical activity ${i}`,
+  }));
+  await writeFile(
+    path.join(runDir, "events.jsonl"),
+    `${priorEvents.join("\n")}\n${JSON.stringify({ ts: new Date().toISOString(), kind: "audit_done", stoppedReason: "finished", findings: 1 })}\n`,
+  );
 
   const store = MetadataStore.openForOutput(out);
   let runId;
@@ -1767,7 +2499,7 @@ test("api: project detail summarizes the latest prepare manifest and workspace q
       ]);
       const confirmRunId = confirmStore.startRun({ projectId: created.id, kind: "confirm", runDir: path.join(out, "prepared-target-confirm-test"), provider: "openai-codex", model: "gpt-5.5" });
       confirmStore.upsertConfirmDecisions(created.id, confirmRunId, [
-        { bug: "prior prepared source bug", reproduced: "yes", recommendation: "submit-candidate", members: ["kalreadyreproduced"] },
+        { bug: "prior prepared source bug", reproduced: "yes", recommendation: "submit-candidate", evidenceLevel: "real-target-reproduced", members: ["kalreadyreproduced"] },
       ]);
       confirmStore.finishRun(confirmRunId, "done");
     } finally {
@@ -1785,8 +2517,68 @@ test("api: project detail summarizes the latest prepare manifest and workspace q
     assert.deepEqual(confirmSpec.inputRunDirs, [auditRunDir]);
     assert.ok(confirmSpec.confirmKeys.includes("confirmed-bug"));
     assert.ok(confirmSpec.confirmKeys.includes("kalreadyreproduced"), "project confirm carries prior decided findings as consolidation context");
+    assert.ok(confirmSpec.confirmFindings.some((finding) => finding.id === "confirmed-bug" && finding.originId), "project confirm carries DB-backed finding seeds");
     assert.deepEqual(confirmSpec.confirmSettledRows.map((row) => row.bug), ["prior prepared source bug"]);
     assert.ok(confirmSpec.confirmKeys.some((key) => /^origin:\d+:confirmed-bug$/.test(key)), "confirm spec carries origin selector for verify-artifact recovery");
+  });
+});
+
+test("api: confirm launch carries DB-backed seeds when prior run artifact is missing", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const created = await json(await post("/api/projects", {
+      name: "confirm-db-seed-missing-artifact",
+      sourcePaths: ["src"],
+      config: { sandboxConfirmNetwork: "none" },
+    }));
+    const missingRunDir = path.join(out, "missing-audit-findings-run");
+    let readyId;
+    const store = MetadataStore.openForOutput(out);
+    try {
+      const auditRunId = store.startRun({ projectId: created.id, kind: "audit", runDir: missingRunDir });
+      store.upsertFindings(created.id, auditRunId, [{
+        findingKey: "kdbseed",
+        title: "Confirmed finding persisted without artifact",
+        location: "src/Target.sol:9",
+        severity: "high",
+        status: "confirmed-differential",
+        scopeId: "SCOPE-DB",
+        description: "DB-only confirmed finding.",
+        evidence: "Local executable evidence was persisted.",
+        exploitSketch: "Trigger the invariant violation.",
+        fix: "Bind the invariant.",
+        confidence: 0.91,
+      }]);
+      store.finishRun(auditRunId, "killed");
+      readyId = store.listFindings(created.id)[0].id;
+    } finally {
+      store.close();
+    }
+
+    const launched = await json(await post(`/api/projects/${created.uuid}/runs`, { verb: "confirm", findingIds: [readyId] }));
+    const job = (await json(await fetch(base + "/api/jobs/" + launched.jobId))).job;
+    const spec = JSON.parse(job.spec_json);
+
+    assert.equal(spec.verb, "confirm");
+    assert.equal(spec.sandboxConfirmNetwork, "enabled");
+    assert.deepEqual(spec.inputRunDirs, [missingRunDir]);
+    assert.ok(spec.confirmKeys.includes("kdbseed"));
+    assert.ok(spec.confirmKeys.some((key) => key === `origin:${readyId}:kdbseed`));
+    assert.equal(spec.confirmFindings.length, 1);
+    assert.equal(spec.confirmFindings[0].id, "kdbseed");
+    assert.equal(spec.confirmFindings[0].originId, readyId);
+    assert.equal(spec.confirmFindings[0].confirmationStatus, "confirmed-differential");
+    assert.equal(spec.confirmFindings[0].scopeId, "SCOPE-DB");
+
+    const explicit = await json(await post(`/api/projects/${created.uuid}/runs`, {
+      verb: "confirm",
+      findingIds: [readyId],
+      sandboxConfirmNetwork: "none",
+    }));
+    const explicitJob = (await json(await fetch(base + "/api/jobs/" + explicit.jobId))).job;
+    const explicitSpec = JSON.parse(explicitJob.spec_json);
+    assert.equal(explicitSpec.sandboxConfirmNetwork, "none");
   });
 });
 
@@ -2266,6 +3058,135 @@ test("api: clean prepare firewall notes and optional material gaps do not block 
   });
 });
 
+test("api: clean answer-firewall exclusion notes with negated included wording do not block audits", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+    const created = await json(await post("/api/projects", { name: "reserve-style-clean-firewall" }));
+    const runDir = path.join(out, "reserve-style-clean-firewall-prepare");
+    const workspace = path.join(runDir, "prepare", "workspace");
+    await mkdir(path.join(workspace, "sources", "reserve"), { recursive: true });
+    await writeFile(path.join(workspace, "sources", "reserve", "README.md"), "official staged source\n");
+    await writeFile(
+      path.join(workspace, "prepare_manifest.json"),
+      JSON.stringify({
+        status: "partial",
+        posture: "blind",
+        scope_declaration: "Public bounty target source and official materials only.",
+        answer_firewall: [
+          "Blind posture honored: no third-party exploit PoCs or target-specific bug writeups were opened or staged.",
+          "A generic Immunefi writeups-list search result appeared but was not fetched.",
+          "No vulnerability hypotheses, exploit mechanisms, or security conclusions are included.",
+        ],
+        real_target: {
+          requires_confirmation: false,
+          mode: "source-only",
+          reason: "Fixture keeps real-target confirmation out of scope.",
+          ground_truth: [],
+          confirm_guidance: {
+            required: false,
+            allowed_network_actions: "none",
+            recommended_method: "Run local source-level checks against staged source.",
+            not_required_reason: "No deployed target is in scope for this fixture.",
+          },
+        },
+        components: [
+          {
+            identity: "reserve/source",
+            platform: "github",
+            revision: "abc123",
+            source: "https://example.invalid/reserve.git",
+            staged_path: "sources/reserve",
+            in_scope: true,
+            match: "n/a",
+          },
+        ],
+      }),
+    );
+
+    const store = MetadataStore.openForOutput(out);
+    try {
+      const runId = store.startRun({ projectId: created.id, kind: "prepare", runDir, provider: "openai-codex", model: "gpt-5.5" });
+      store.finishRun(runId, "done");
+    } finally {
+      store.close();
+    }
+
+    const detail = await json(await fetch(base + `/api/projects/${created.uuid}`));
+    assert.equal(detail.prepareSummary.quality, "limited");
+    assert.equal(detail.prepareSummary.auditReady, true);
+    assert.equal(detail.prepareSummary.blocked, false);
+    assert.deepEqual(detail.prepareSummary.blockingIssues, []);
+    assert.deepEqual(detail.prepareSummary.issues, []);
+    assert.equal(detail.prepareSummary.answerFirewall, "clean · 3 guardrail notes");
+  });
+});
+
+test("api: semicolon-joined clean answer-firewall notes do not block audits", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+    const created = await json(await post("/api/projects", { name: "reserve-style-clean-firewall-string" }));
+    const runDir = path.join(out, "reserve-style-clean-firewall-string-prepare");
+    const workspace = path.join(runDir, "prepare", "workspace");
+    await mkdir(path.join(workspace, "sources", "reserve"), { recursive: true });
+    await writeFile(path.join(workspace, "sources", "reserve", "README.md"), "official staged source\n");
+    await writeFile(
+      path.join(workspace, "prepare_manifest.json"),
+      JSON.stringify({
+        status: "partial",
+        posture: "blind",
+        scope_declaration: "Public bounty target source and official materials only.",
+        answer_firewall:
+          "Blind posture honored: no third-party exploit PoCs or target-specific bug writeups were opened or staged.; " +
+          "A generic Immunefi writeups-list search result appeared but was not fetched.; " +
+          "No vulnerability hypotheses, exploit mechanisms, or security conclusions are included.",
+        real_target: {
+          requires_confirmation: false,
+          mode: "source-only",
+          reason: "Fixture keeps real-target confirmation out of scope.",
+          ground_truth: [],
+          confirm_guidance: {
+            required: false,
+            allowed_network_actions: "none",
+            recommended_method: "Run local source-level checks against staged source.",
+            not_required_reason: "No deployed target is in scope for this fixture.",
+          },
+        },
+        components: [
+          {
+            identity: "reserve/source",
+            platform: "github",
+            revision: "abc123",
+            source: "https://example.invalid/reserve.git",
+            staged_path: "sources/reserve",
+            in_scope: true,
+            match: "n/a",
+          },
+        ],
+      }),
+    );
+
+    const store = MetadataStore.openForOutput(out);
+    try {
+      const runId = store.startRun({ projectId: created.id, kind: "prepare", runDir, provider: "openai-codex", model: "gpt-5.5" });
+      store.finishRun(runId, "done");
+    } finally {
+      store.close();
+    }
+
+    const detail = await json(await fetch(base + `/api/projects/${created.uuid}`));
+    assert.equal(detail.prepareSummary.quality, "limited");
+    assert.equal(detail.prepareSummary.auditReady, true);
+    assert.equal(detail.prepareSummary.blocked, false);
+    assert.deepEqual(detail.prepareSummary.blockingIssues, []);
+    assert.deepEqual(detail.prepareSummary.issues, []);
+    assert.equal(detail.prepareSummary.answerFirewall, "clean · 3 guardrail notes");
+  });
+});
+
 test("api: blind prepare manifests get a clean answer-firewall fallback", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();
@@ -2718,6 +3639,62 @@ test("api: latest map checkpoint bounds current scope inventory despite stale db
   });
 });
 
+test("api: a later continue checkpoint expands the current inventory beyond the original map", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const created = await json(await post("/api/projects", { name: "continued-scope-view", sourcePaths: ["./src"] }));
+    const projectPath = `/api/projects/${created.uuid}`;
+    const mapRunDir = await mkdtemp(path.join(out, "continued-scope-map-"));
+    const continueRunDir = await mkdtemp(path.join(out, "continued-scope-run-"));
+    await writeFile(path.join(mapRunDir, "audit_scopes.json"), JSON.stringify([
+      { id: "S1", obligation: "Bind the withdrawal recipient.", region: "src/Vault.sol:1-40", status: "audited", score: 10 },
+      { id: "S2", obligation: "Reject replayed permits.", region: "src/Permit.sol:1-30", status: "audited", score: 9 },
+    ]));
+    await writeFile(path.join(continueRunDir, "audit_scopes.json"), JSON.stringify([
+      { id: "S1", obligation: "Bind the withdrawal recipient.", region: "src/Vault.sol:1-40", status: "audited", score: 10 },
+      { id: "S2", obligation: "Reject replayed permits.", region: "src/Permit.sol:1-30", status: "audited", score: 9 },
+      { id: "S3", obligation: "Account for appended settlement coverage.", region: "src/Settle.sol:1-50", status: "audited", score: 8 },
+    ]));
+
+    const store = MetadataStore.openForOutput(out);
+    try {
+      const mapRun = store.startRun({ projectId: created.id, kind: "map", runDir: mapRunDir });
+      store.db.prepare("UPDATE run SET started_at = ? WHERE id = ?").run("2026-01-01T00:00:00.000Z", mapRun);
+      store.finishRun(mapRun, "done");
+      const continueRun = store.startRun({ projectId: created.id, kind: "run", runDir: continueRunDir });
+      store.db.prepare("UPDATE run SET started_at = ? WHERE id = ?").run("2026-01-01T01:00:00.000Z", continueRun);
+      store.finishRun(continueRun, "done");
+      store.replaceScopes(created.id, [
+        { scopeId: "S1", title: "Bind recipient", status: "audited", score: 10 },
+        { scopeId: "S2", title: "Reject replay", status: "audited", score: 9 },
+        { scopeId: "S3", title: "Appended settlement", status: "audited", score: 8 },
+      ]);
+    } finally {
+      store.close();
+    }
+
+    const detail = await json(await fetch(base + projectPath));
+    assert.deepEqual(detail.progress, { total: 3, audited: 3, deferred: 0, pending: 0 });
+    assert.deepEqual(detail.scopes.map((scope) => scope.scope_id), ["S1", "S2", "S3"]);
+
+    const scopes = await json(await fetch(base + `${projectPath}/scopes`));
+    assert.equal(scopes.total, 3);
+    assert.deepEqual(scopes.scopes.map((scope) => scope.scope_id), ["S1", "S2", "S3"]);
+
+    const after = MetadataStore.openForOutput(out);
+    try {
+      const killedRun = after.startRun({ projectId: created.id, kind: "run", runDir: path.join(out, "continued-scope-killed") });
+      after.finishRun(killedRun, "killed");
+    } finally {
+      after.close();
+    }
+    const afterKilled = await json(await fetch(base + projectPath));
+    assert.deepEqual(afterKilled.progress, { total: 3, audited: 3, deferred: 0, pending: 0 });
+    assert.deepEqual(afterKilled.scopes.map((scope) => scope.scope_id), ["S1", "S2", "S3"]);
+  });
+});
+
 test("api: scope prioritize moves a mapped scope to the top of the queue", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();
@@ -2774,6 +3751,35 @@ test("api: stale auditing scopes recover when no job is active", async () => {
 
     const inventory = await loadScopeInventory(inventoryDir);
     assert.deepEqual(inventory.map((scope) => [scope.id, scope.status]), [["stale", "pending"], ["queued", "pending"]]);
+  });
+});
+
+test("api: one corrupt historical scope inventory does not break project listings", async () => {
+  await withServer(async (base, out) => {
+    const json = (response) => response.json();
+    const post = (route, body) => fetch(base + route, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const damaged = await json(await post("/api/projects", { name: "scope-corrupt", sourcePaths: ["./src"] }));
+    const healthy = await json(await post("/api/projects", { name: "scope-healthy", sourcePaths: ["./src"] }));
+    const inventoryDir = projectHistoryDir({ outputDir: out, targetName: damaged.name });
+    await mkdir(inventoryDir, { recursive: true });
+    await writeFile(path.join(inventoryDir, "scopes.json"), "[{\"id\":\"truncated\"");
+
+    const store = MetadataStore.openForOutput(out);
+    try {
+      store.upsertScopes(damaged.id, [{ scopeId: "stale", title: "Stale scope", status: "auditing", score: 10 }]);
+      store.upsertScopes(healthy.id, [{ scopeId: "ready", title: "Ready scope", status: "pending", score: 9 }]);
+    } finally {
+      store.close();
+    }
+
+    const response = await fetch(base + "/api/projects");
+    assert.equal(response.status, 200);
+    const list = await json(response);
+    assert.ok(list.projects.some((project) => project.uuid === damaged.uuid));
+    assert.ok(list.projects.some((project) => project.uuid === healthy.uuid));
+    assert.equal((await fetch(base + `/api/projects/${healthy.uuid}`)).status, 200);
+    assert.equal((await fetch(base + `/api/projects/${damaged.uuid}`)).status, 200);
+    await assert.rejects(loadScopeInventory(inventoryDir), /Could not load scope inventory/);
   });
 });
 
@@ -2849,6 +3855,7 @@ test("api: info-only audit ledgers are hidden from actionable findings", async (
       const runId = store.startRun({ projectId: created.id, kind: "run", runDir });
       store.upsertFindings(created.id, runId, [
         { findingKey: "ledger", title: "Obligation ledger: safe", location: "src/A.sol:1", severity: "info", status: "suspected" },
+        { findingKey: "refuted", title: "Checked claim is false", location: "src/A.sol:2", severity: "info", status: "refuted" },
         { findingKey: "bug", title: "Unbound value", location: "src/B.sol:2", severity: "high", status: "suspected", evidence: "full proof detail kept for the project findings endpoint" },
       ]);
     } finally {
@@ -2857,20 +3864,23 @@ test("api: info-only audit ledgers are hidden from actionable findings", async (
 
     const projectPath = "/api/projects/" + created.uuid;
     const detail = await json(await fetch(base + projectPath));
-    assert.equal(detail.findingsTotal, 1);
-    assert.deepEqual(detail.statusCounts, { suspected: 1 });
+    assert.equal(detail.findingsTotal, 2);
+    assert.deepEqual(detail.statusCounts, { refuted: 1, suspected: 1 });
     assert.equal(detail.auditConfirmedFindings, 0);
     assert.equal(detail.reproducedBugs, 0);
-    assert.deepEqual(detail.allFindings.map((finding) => finding.finding_key), ["bug"]);
+    assert.deepEqual(detail.allFindings.map((finding) => finding.finding_key), ["bug", "refuted"]);
     assert.equal("evidence" in detail.allFindings[0], false, "project overview should use lightweight finding summaries");
 
     const findings = await json(await fetch(base + projectPath + "/findings"));
-    assert.equal(findings.total, 1);
+    assert.equal(findings.total, 2);
     assert.equal(findings.findings[0].finding_key, "bug");
     assert.equal(findings.findings[0].evidence, "full proof detail kept for the project findings endpoint");
+    assert.equal(findings.findings[1].finding_key, "refuted");
+    assert.equal(findings.findings[1].status, "refuted");
 
     const bugs = await json(await fetch(base + "/api/bugs"));
-    assert.equal(bugs.findings.length, 1);
+    assert.equal(bugs.findings.length, 2);
+    assert.deepEqual(bugs.findings.map((finding) => finding.finding_key), ["bug", "refuted"]);
     assert.equal("evidence" in bugs.findings[0], false, "global findings list should use lightweight finding summaries");
   });
 });
@@ -2901,9 +3911,50 @@ test("api: project findings endpoint paginates detailed rows", async () => {
     assert.equal(page.findings.length, 2);
     assert.deepEqual(page.findings.map((finding) => finding.title), ["B", "A"]);
     assert.ok(page.findings.every((finding) => typeof finding.evidence === "string"));
-    assert.equal(page.findings[0].has_report, true);
+    assert.equal(page.findings[0].has_report, false, "suspected findings cannot retain disclosure reports");
     assert.equal("report_path" in page.findings[0], false);
     assert.equal("report_markdown" in page.findings[0], false);
+  });
+});
+
+test("api: finding lifecycle exposes occurrences and blocked phase attempts, then reopens a focused retry", async () => {
+  await withServer(async (base, out) => {
+    const json = (response) => response.json();
+    const created = await json(await fetch(base + "/api/projects", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "finding-lifecycle", sourcePaths: ["./src"] }),
+    }));
+    const store = MetadataStore.openForOutput(out);
+    let findingId;
+    try {
+      const runId = store.startRun({ projectId: created.id, kind: "run", runDir: path.join(out, "lifecycle-run"), materialFingerprint: "sha256:lifecycle" });
+      store.upsertFindings(created.id, runId, [{ findingKey: "klifecycle", title: "Lifecycle claim", location: "src/Lifecycle.sol:7", severity: "high", status: "suspected" }]);
+      findingId = Number(store.listFindings(created.id)[0].id);
+      const verifyRun = store.startRun({ projectId: created.id, kind: "verify", runDir: path.join(out, "lifecycle-verify"), materialFingerprint: "sha256:lifecycle" });
+      store.recordFindingPhaseAttempt(created.id, verifyRun, { subjectType: "finding", subjectId: findingId, phase: "verify", inputFingerprint: "sha256:verify-input", state: "blocked", outcome: "no-verdict", blocker: "compiler unavailable" });
+    } finally {
+      store.close();
+    }
+
+    const lifecycle = await json(await fetch(base + `/api/findings/${findingId}/lifecycle`));
+    assert.equal(lifecycle.occurrences.length, 1);
+    assert.equal(lifecycle.attempts.length, 1);
+    assert.equal(lifecycle.attempts[0].state, "blocked");
+    assert.match(lifecycle.attempts[0].blocker, /compiler unavailable/);
+
+    const retry = await json(await fetch(base + `/api/findings/${findingId}/retry`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ phase: "verify" }),
+    }));
+    assert.equal(retry.ok, true);
+    const after = MetadataStore.openForOutput(out);
+    try {
+      assert.equal(after.phaseEligible(created.id, "finding", findingId, "verify", "sha256:verify-input"), true);
+    } finally {
+      after.close();
+    }
   });
 });
 
@@ -2947,6 +3998,90 @@ test("api: ignored findings are hidden from active filters and can be recovered"
     await patch(`/api/findings/${ignored.id}/tracking`, { status: "open" });
     const restored = await json(await fetch(base + `/api/projects/${created.uuid}/findings?tracking=active`));
     assert.deepEqual(restored.findings.map((finding) => finding.finding_key).sort(), ["ignore", "keep"]);
+  });
+});
+
+test("api: duplicate tracking can link to a canonical finding in the same project", async () => {
+  await withServer(async (base, out) => {
+    const json = (r) => r.json();
+    const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const patch = (p, body) => fetch(base + p, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+    const created = await json(await post("/api/projects", { name: "duplicate-finding-links", sourcePaths: ["./src"] }));
+    const other = await json(await post("/api/projects", { name: "duplicate-finding-other", sourcePaths: ["./src"] }));
+    const store = MetadataStore.openForOutput(out);
+    try {
+      const runId = store.startRun({ projectId: created.id, kind: "audit", runDir: await mkdtemp(path.join(out, "duplicate-finding-links-run-")) });
+      store.upsertFindings(created.id, runId, [
+        { findingKey: "canonical", title: "Canonical helper reentry", location: "src/Router.sol:1", severity: "high", status: "confirmed-executable" },
+        { findingKey: "variant", title: "Variant helper reentry", location: "src/Router.sol:2", severity: "medium", status: "confirmed-executable" },
+      ]);
+      const otherRunId = store.startRun({ projectId: other.id, kind: "audit", runDir: await mkdtemp(path.join(out, "duplicate-finding-other-run-")) });
+      store.upsertFindings(other.id, otherRunId, [
+        { findingKey: "other", title: "Other project finding", location: "src/Other.sol:1", severity: "medium", status: "confirmed-executable" },
+      ]);
+    } finally {
+      store.close();
+    }
+
+    const all = await json(await fetch(base + `/api/projects/${created.uuid}/findings`));
+    const canonical = all.findings.find((finding) => finding.finding_key === "canonical");
+    const variant = all.findings.find((finding) => finding.finding_key === "variant");
+    assert.ok(canonical);
+    assert.ok(variant);
+
+    const missingCanonicalResponse = await patch(`/api/findings/${variant.id}/tracking`, { status: "duplicate" });
+    assert.equal(missingCanonicalResponse.status, 400);
+    assert.match((await missingCanonicalResponse.json()).error, /required/);
+
+    const linkedResponse = await patch(`/api/findings/${variant.id}/tracking`, { status: "duplicate", duplicateOfFindingId: canonical.id });
+    assert.equal(linkedResponse.status, 200);
+    const duplicates = await json(await fetch(base + `/api/projects/${created.uuid}/findings?tracking=duplicate`));
+    assert.equal(duplicates.total, 1);
+    assert.equal(duplicates.findings[0].finding_key, "variant");
+    assert.equal(duplicates.findings[0].duplicate_of_finding_id, canonical.id);
+
+    const verifyDuplicate = await json(await post(`/api/projects/${created.uuid}/runs`, {
+      verb: "audit",
+      verifyFindings: [{ id: variant.id }],
+    }));
+    const verifyDuplicateJob = (await json(await fetch(base + `/api/jobs/${verifyDuplicate.jobId}`))).job;
+    const verifyDuplicateSpec = JSON.parse(verifyDuplicateJob.spec_json);
+    assert.equal(verifyDuplicateSpec.verifyFindings[0].id, variant.id, "the concrete variant remains the model-visible claim");
+    assert.equal(verifyDuplicateSpec.verifyFindings[0].originId, canonical.id, "the verdict settles on the canonical finding");
+
+    const secondRunId = (() => {
+      const db = MetadataStore.openForOutput(out);
+      try {
+        const runId = db.startRun({ projectId: created.id, kind: "audit", runDir: path.join(out, "duplicate-finding-links-second-run") });
+        db.upsertFindings(created.id, runId, [
+          { findingKey: "second-variant", title: "Second variant helper reentry", location: "src/Router.sol:3", severity: "medium", status: "confirmed-executable" },
+        ]);
+        return runId;
+      } finally {
+        db.close();
+      }
+    })();
+    assert.ok(secondRunId > 0);
+    const refreshed = await json(await fetch(base + `/api/projects/${created.uuid}/findings`));
+    const secondVariant = refreshed.findings.find((finding) => finding.finding_key === "second-variant");
+    assert.ok(secondVariant);
+    const chainedResponse = await patch(`/api/findings/${secondVariant.id}/tracking`, { status: "duplicate", duplicateOfFindingId: variant.id });
+    assert.equal(chainedResponse.status, 400);
+    assert.match((await chainedResponse.json()).error, /itself a duplicate/);
+
+    const selfResponse = await patch(`/api/findings/${variant.id}/tracking`, { status: "duplicate", duplicateOfFindingId: variant.id });
+    assert.equal(selfResponse.status, 400);
+
+    const otherAll = await json(await fetch(base + `/api/projects/${other.uuid}/findings`));
+    const otherFinding = otherAll.findings[0];
+    const crossProjectResponse = await patch(`/api/findings/${variant.id}/tracking`, { status: "duplicate", duplicateOfFindingId: otherFinding.id });
+    assert.equal(crossProjectResponse.status, 400);
+
+    await patch(`/api/findings/${variant.id}/tracking`, { status: "triaging" });
+    const reopened = await json(await fetch(base + `/api/projects/${created.uuid}/findings?q=%23${variant.id}`));
+    assert.equal(reopened.findings[0].tracking_status, "triaging");
+    assert.equal(reopened.findings[0].duplicate_of_finding_id, null);
   });
 });
 
@@ -3083,7 +4218,7 @@ test("api: duplicate findings from different scopes collapse to one user-facing 
   });
 });
 
-test("api: verified duplicates hide older suspected candidates at the same scope and location", async () => {
+test("api: similar titles at the same location remain distinct unless canonical identity is exact", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();
     const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -3127,17 +4262,17 @@ test("api: verified duplicates hide older suspected candidates at the same scope
 
     const projectPath = "/api/projects/" + created.uuid;
     const detail = await json(await fetch(base + projectPath));
-    assert.equal(detail.findingsTotal, 2);
-    assert.deepEqual(detail.allFindings.map((finding) => finding.finding_key).sort(), ["confirmed-normalize", "same-line-distinct"].sort());
-    assert.deepEqual(detail.statusCounts, { "confirmed-executable": 1, suspected: 1 });
+    assert.equal(detail.findingsTotal, 3);
+    assert.deepEqual(detail.allFindings.map((finding) => finding.finding_key).sort(), ["suspected-normalize", "confirmed-normalize", "same-line-distinct"].sort());
+    assert.deepEqual(detail.statusCounts, { "confirmed-executable": 1, suspected: 2 });
 
     const findings = await json(await fetch(base + projectPath + "/findings"));
-    assert.equal(findings.total, 2);
-    assert.deepEqual(findings.findings.map((finding) => finding.finding_key).sort(), ["confirmed-normalize", "same-line-distinct"].sort());
+    assert.equal(findings.total, 3);
+    assert.deepEqual(findings.findings.map((finding) => finding.finding_key).sort(), ["suspected-normalize", "confirmed-normalize", "same-line-distinct"].sort());
   });
 });
 
-test("api: strongly related suspected duplicates hide behind confirmed findings", async () => {
+test("api: cross-location semantic similarity never hides a distinct finding", async () => {
   await withServer(async (base, out) => {
     const json = (r) => r.json();
     const post = (p, body) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -3181,17 +4316,17 @@ test("api: strongly related suspected duplicates hide behind confirmed findings"
 
     const projectPath = "/api/projects/" + created.uuid;
     const detail = await json(await fetch(base + projectPath));
-    assert.equal(detail.findingsTotal, 2);
-    assert.deepEqual(detail.allFindings.map((finding) => finding.finding_key).sort(), ["confirmed-bytecode-length", "distinct-bytecode"].sort());
-    assert.deepEqual(detail.statusCounts, { "confirmed-executable": 1, suspected: 1 });
+    assert.equal(detail.findingsTotal, 3);
+    assert.deepEqual(detail.allFindings.map((finding) => finding.finding_key).sort(), ["confirmed-bytecode-length", "suspected-bytecode-length", "distinct-bytecode"].sort());
+    assert.deepEqual(detail.statusCounts, { "confirmed-executable": 1, suspected: 2 });
 
     const findings = await json(await fetch(base + projectPath + "/findings"));
-    assert.equal(findings.total, 2);
-    assert.deepEqual(findings.findings.map((finding) => finding.finding_key).sort(), ["confirmed-bytecode-length", "distinct-bytecode"].sort());
+    assert.equal(findings.total, 3);
+    assert.deepEqual(findings.findings.map((finding) => finding.finding_key).sort(), ["confirmed-bytecode-length", "suspected-bytecode-length", "distinct-bytecode"].sort());
 
     const bugs = await json(await fetch(base + "/api/bugs"));
-    assert.equal(bugs.stats.total, 2);
-    assert.deepEqual(bugs.findings.map((finding) => finding.finding_key).sort(), ["confirmed-bytecode-length", "distinct-bytecode"].sort());
+    assert.equal(bugs.stats.total, 3);
+    assert.deepEqual(bugs.findings.map((finding) => finding.finding_key).sort(), ["confirmed-bytecode-length", "suspected-bytecode-length", "distinct-bytecode"].sort());
   });
 });
 
@@ -3237,7 +4372,12 @@ test("api: run log supports a bounded JSON tail for agents", async () => {
     } finally {
       store.close();
     }
-    await writeFile(path.join(runDir, "events.jsonl"), `${JSON.stringify({
+    const priorEvents = Array.from({ length: 75 }, (_, i) => JSON.stringify({
+      ts: new Date(Date.UTC(2026, 5, 22, 8, 0, i)).toISOString(),
+      kind: "audit_action",
+      detail: `older activity ${i}`,
+    }));
+    await writeFile(path.join(runDir, "events.jsonl"), `${priorEvents.join("\n")}\n${JSON.stringify({
       ts: "2026-06-22T08:12:50.000Z",
       kind: "audit_command_run",
       runId: "cmd23",
@@ -3247,7 +4387,7 @@ test("api: run log supports a bounded JSON tail for agents", async () => {
       output: "docker: Error response from daemon: exec: \"forge\": executable file not found in $PATH.",
     })}\n`);
 
-    const res = await fetch(base + `/api/runs/${runId}/log?tail=50`);
+    const res = await fetch(base + `/api/runs/${runId}/log?tail=1`);
     assert.equal(res.status, 200);
     assert.match(res.headers.get("content-type") ?? "", /application\/json/);
     const body = await res.json();
@@ -3258,7 +4398,7 @@ test("api: run log supports a bounded JSON tail for agents", async () => {
     assert.equal(body.events[0].passed, false);
     assert.equal(body.events[0].exitCode, 127);
     assert.match(body.events[0].output, /forge/);
-    assert.equal(body.limit, 50);
+    assert.equal(body.limit, 1);
   });
 });
 
@@ -3632,6 +4772,15 @@ test("api: daemon lists return provider-auth summaries by default", async () => 
             { provider: "openai-codex", configured: true, required: true, oauthLogin: true, expectedEnvVars: ["SHOULD_NOT_BE_DEFAULT"] },
             { provider: "anthropic", configured: false, required: true, oauthLogin: true, expectedEnvVars: ["ANTHROPIC_API_KEY"] },
           ],
+          sandbox: {
+            ok: true,
+            backend: "oci",
+            image: "flounder-sandbox:latest",
+            allowHostFallback: false,
+            autoBuild: true,
+            message: "Default sandbox image will be built automatically.",
+            expectedEnvVars: ["SHOULD_NOT_BE_DEFAULT"],
+          },
         },
       }),
     });
@@ -3639,6 +4788,14 @@ test("api: daemon lists return provider-auth summaries by default", async () => 
     const summary = await json(await fetch(base + "/api/daemons"));
     assert.equal(summary.daemons[0].capabilities.configuredProviderCount, 1);
     assert.deepEqual(summary.daemons[0].capabilities.providers[0], { provider: "openai-codex", configured: true, required: true, oauthLogin: true });
+    assert.deepEqual(summary.daemons[0].capabilities.sandbox, {
+      ok: true,
+      backend: "oci",
+      image: "flounder-sandbox:latest",
+      allowHostFallback: false,
+      autoBuild: true,
+      message: "Default sandbox image will be built automatically.",
+    });
     assert.equal(JSON.stringify(summary).includes("SHOULD_NOT_BE_DEFAULT"), false);
 
     const raw = await json(await fetch(base + "/api/daemons?include=capabilities"));
@@ -3654,10 +4811,10 @@ test("api: provider profiles — seed + CRUD + per-phase roles; pi discovery", a
     // a fresh store is seeded with starter profiles
     const seeded = (await json(await fetch(base + "/api/providers"))).providers;
     assert.ok(seeded.length >= 1 && seeded.some((p) => p.provider === "openai-codex"), "expected seeded providers");
-    const codexDefault = seeded.find((p) => p.name === "openai-codex · gpt-5.5 · xhigh");
-    assert.ok(codexDefault, "expected codex gpt-5.5 xhigh starter profile");
+    const codexDefault = seeded.find((p) => p.name === "openai-codex · gpt-5.6-sol · xhigh");
+    assert.ok(codexDefault, "expected codex gpt-5.6-sol xhigh starter profile");
     assert.equal(codexDefault.provider, "openai-codex");
-    assert.equal(codexDefault.model, "gpt-5.5");
+    assert.equal(codexDefault.model, "gpt-5.6-sol");
     assert.equal(codexDefault.thinking, "xhigh");
     const opusMax = seeded.find((p) => p.name === "claude-code · opus 4.8 max");
     assert.ok(opusMax, "expected opus 4.8 max starter profile");
@@ -3671,8 +4828,9 @@ test("api: provider profiles — seed + CRUD + per-phase roles; pi discovery", a
     const discoveredModels = (await json(await fetch(base + "/api/pi/models/openai-codex"))).models;
     assert.ok(discoveredModels.length >= 1, "expected pi model discovery");
     assert.ok(discoveredModels.every((m) => Array.isArray(m.thinkingLevels) && m.thinkingLevels.length >= 1));
-    const gpt55 = discoveredModels.find((m) => m.id === "gpt-5.5");
-    if (gpt55) assert.ok(gpt55.thinkingLevels.includes("xhigh"), "gpt-5.5 should expose xhigh through pi metadata");
+    const gpt56sol = discoveredModels.find((m) => m.id === "gpt-5.6-sol");
+    assert.ok(gpt56sol, "the pinned pi runtime must expose the default gpt-5.6-sol model");
+    assert.ok(gpt56sol.thinkingLevels.includes("xhigh"), "gpt-5.6-sol should expose xhigh through pi metadata");
 
     // create with a per-phase override (map cheaper than dig), then read it back
     const created = await json(await post("/api/providers", { name: "prof-x", provider: "openai-codex", model: "gpt-5.5", thinking: "high", roles: { map: { thinking: "low" } } }));

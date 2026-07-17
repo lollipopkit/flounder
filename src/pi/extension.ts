@@ -9,6 +9,7 @@ import { runAudit } from "../agent/audit.js";
 import { runConfirm } from "../agent/confirm.js";
 import { deriveScopeNote } from "../scope-note.js";
 import { analyzeCommandSafety } from "../security/policy.js";
+import { isSandboxBackend } from "../security/sandbox.js";
 
 // Budget policy for pi tools that invoke the sealed run/map/audit verbs, kept in step with
 // the CLI: UNBOUNDED by default. A real map/dig audit's decisive obligation can surface late,
@@ -74,7 +75,7 @@ function applyMaterialConfig(cfg: AuditorConfig, params: ToolParams): void {
 
 function applySandboxConfig(cfg: AuditorConfig, params: ToolParams): void {
   const backend = str(params, "sandboxBackend");
-  if (backend === "auto" || backend === "oci" || backend === "host") cfg.sandboxBackend = backend;
+  if (isSandboxBackend(backend)) cfg.sandboxBackend = backend;
   cfg.sandboxImage = str(params, "sandboxImage") ?? cfg.sandboxImage;
   const allowHost = bool(params, "sandboxAllowHostFallback");
   if (allowHost !== undefined) cfg.sandboxAllowHostFallback = allowHost;
@@ -101,6 +102,7 @@ function applyAuditBudgets(cfg: AuditorConfig, params: ToolParams): void {
   const digConcurrency = num(params, "digConcurrency");
   if (digConcurrency !== undefined) cfg.auditDigConcurrency = Math.max(1, Math.floor(digConcurrency));
   if (bool(params, "remap")) cfg.auditRemap = true;
+  if (bool(params, "appendMap")) cfg.auditAppendMap = true;
 }
 
 function configured(params: ToolParams): AuditorConfig {
@@ -169,7 +171,7 @@ const sharedParams = {
   thinking: Type.Optional(Type.String({ description: "off|minimal|low|medium|high|xhigh." })),
   outputDir: Type.Optional(Type.String({ description: "Artifact output directory." })),
   historyDir: Type.Optional(Type.String({ description: "Project history directory. Defaults to outputDir/history." })),
-  sandboxBackend: Type.Optional(Type.String({ description: "auto|oci|host." })),
+  sandboxBackend: Type.Optional(Type.String({ description: "auto|oci|apple-container|host." })),
   sandboxImage: Type.Optional(Type.String({ description: "OCI image for sandboxed commands." })),
   sandboxAllowHostFallback: Type.Optional(Type.Boolean({ description: "Trusted-local opt-in for host fallback when OCI is unavailable." })),
   sandboxPrepareNetwork: Type.Optional(Type.String({ description: "none|enabled for prepare/build warm-up commands." })),
@@ -193,6 +195,7 @@ const auditBudgetParams = {
   digSamples: Type.Optional(Type.Number({ description: "Independent dig passes per selected scope." })),
   digConcurrency: Type.Optional(Type.Number({ description: "How many scopes run in parallel." })),
   remap: Type.Optional(Type.Boolean({ description: "Re-enumerate scopes from scratch instead of resuming inventory." })),
+  appendMap: Type.Optional(Type.Boolean({ description: "Expand the existing scope inventory by appending novel scopes; preserves existing scope status." })),
 };
 
 export default function fullStackAuditorExtension(pi: ExtensionAPI): void {
@@ -300,6 +303,7 @@ export default function fullStackAuditorExtension(pi: ExtensionAPI): void {
       const mapSteps = num(params, "mapSteps");
       if (mapSteps !== undefined) cfg.auditMapSteps = Math.max(1, Math.floor(mapSteps));
       if (bool(params, "remap")) cfg.auditRemap = true;
+      if (bool(params, "appendMap")) cfg.auditAppendMap = true;
       cfg.auditDeep = true;
       cfg.auditMapOnly = true;
       const result = await runAudit(cfg, { kind: "map" });

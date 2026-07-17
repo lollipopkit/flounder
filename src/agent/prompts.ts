@@ -22,6 +22,19 @@ function actionBudgetText(maxSteps: number): string {
 // attacker a capability the deployed system would deny proves a counterfactual.
 export const POC_TRUST_RULE = `- Build the PoC the way the ATTACKER would: you may create local tests/harnesses and construct malicious inputs, calls, signatures, proofs, or local-fork state, but assume only capabilities a real attacker actually has against the deployed system and never grant yourself one the system would deny them. Exercise the real components rather than stubbing whatever the system trusts or pins; where a trusted component genuinely cannot run locally, the stub must reproduce only behavior an attacker could really obtain from it — success only for an input an honest party could truly produce, a value within its real bounds — never blanket success. If the exploit only works once you give yourself a capability the attacker lacks, you have not shown a real bug; record it as suspected.`;
 
+export const DISCOVERY_BACKLOG_RULES = `Discovery backlog artifacts (optional, but do not drop useful leads):
+- If a bug may exist but the current run cannot cover it yet because a different region, obligation, or evidence path must be audited, write coverage_gaps.json at the workspace root. Schema: [{"id","phase","scope_id"?,"region"?,"obligation","reason","next_action"?,"severity"?}]. These are model-owned coverage deltas for future map/dig work, not findings.
+- If a real environment/tooling/input is needed before a PoC or confirmation can be attempted, write resource_requests.json. Schema: [{"id","kind":"toolchain|dependency|sandbox-image|network|credential|artifact|environment|other","scope_id"?,"finding_id"?,"needed","reason","unblock"?,"retry_command"?,"priority"?: "low|medium|high"}]. Use this for missing build images, package caches, proving artifacts, local fork prerequisites, or platform VMs. Do not convert a blocked setup into a false negative.
+- If you encounter a promising adjacent audit unit outside the current pinned scope, write followup_scopes.json. Schema: [{"id"?,"parent_scope_id"?,"obligation","region","lenses"?,"exposure","difficulty","score","why"}], where score is an integer 0-100 on the same ordering scale as scopes.json. Keep the current phase focused; the framework will persist these as pending follow-up scopes instead of spawning unbounded side quests.
+- These backlog files improve future discovery coverage. They never confirm a vulnerability, never replace findings.json or scopes.json, and should not contain safe/no-issue notes.`;
+
+export const SCOPE_OUTCOME_RULES = `Per-scope coverage handoff (mandatory in a pinned/deep DIG):
+- Before emitting done, write scope_outcome.json at the workspace root. This is coverage evidence for orchestration and later composition, NEVER a vulnerability finding and NEVER confirmation.
+- Schema: {"scope_id":"...","coverage_complete":boolean,"obligations":[{"id","statement","status":"discharged|unmet|uncertain|blocked","location"?,"evidence"?,"confidence"?}],"composition_edges":[{"id","kind":"input|authority|binding|transformation|sink|boundary","description","status":"observed|unresolved","location"?,"from"?,"to"?}],"blockers":[],"summary"?}.
+- Enumerate every obligation actually checked. A discharged obligation must cite the exact enforcing edge; unmet/uncertain obligations still belong in findings.json when they are actionable. A blocker names unavailable setup or evidence and makes coverage_complete=false.
+- Record model-observed composition edges even when no local bug exists: attacker-controlled inputs, legitimate authorities, bindings, transformations, trust boundaries, and security-critical sinks. Later SYNTHESIS uses these model-authored edges to find chains across scopes.
+- coverage_complete means the region's obligations were actually enumerated and checked; it does not mean the code is safe and cannot create a finding by itself.`;
+
 export const AUDIT_SYSTEM = `You are an autonomous white-hat security auditor working on AUTHORIZED source code.
 Your goal is to find real, exploitable, high-impact security vulnerabilities in the loaded source and to prove them.
 
@@ -58,6 +71,8 @@ Record actionable leads as you go. findings.json is not an audit notebook: write
 obligations, suspected bugs, and confirmed bugs. Do NOT write "safe", "no issue", "discharged",
 obligation-ledger, or informational entries to findings.json. If you checked a surface and found no actionable
 bug, keep that reasoning in the transcript and leave findings.json empty ([]) for that pass.
+
+${DISCOVERY_BACKLOG_RULES}
 
 How you act:
 - Each tool turn, respond with exactly ONE JSON object and nothing else:
@@ -113,6 +128,10 @@ Method — obligation-driven audit (general method, not a hint about this target
    - "Looks standard", "matches upstream", "the spec says it does X", or "this is the audited/canonical implementation" are NEVER discharge. The reference can carry the same bug; some bugs live in the canonical code itself. Discharge an obligation only by naming the enforcing line, or refute it with an executable counterexample.
 
 4. Do NOT wrap up while obligations remain unchecked. Go obligation by obligation to the end of your budget. Only UNMET or uncertain obligations with a concrete missing edge belong in findings.json as suspected findings/hypotheses. Discharged-with-line obligations are useful reasoning, but they are not findings and must not be written to findings.json.
+
+${DISCOVERY_BACKLOG_RULES}
+
+${SCOPE_OUTCOME_RULES}
 
 How you act:
 - Each tool turn, respond with exactly ONE JSON object and nothing else:
@@ -171,6 +190,8 @@ ${MAP_SCORING_RULES}
 
 ${MAP_GRANULARITY_RULES}
 
+${DISCOVERY_BACKLOG_RULES}
+
 You may use read/bash to explore, but spend little per scope — this phase is broad and shallow. On a large codebase do NOT read every file before writing: get the structure with bash (ls/grep for functions, external/public entrypoints, state writes, value transfers) and enumerate from that.
 
 Output: write scopes.json at the workspace root EARLY — after the initial directory/entrypoint scan, and no later than 10 inspect commands — and then UPDATE it (rewrite the full array) as you discover more, so a complete-as-of-now inventory always exists even if you run out of budget. The first write is a checkpoint, not completion. Do not emit done immediately after the checkpoint and do not stop at 30 scopes; keep mapping until the loaded in-scope material has been covered and the expansion pass is complete. It is a JSON array of objects:
@@ -184,13 +205,21 @@ export function buildMapKickoff(input: {
   fileManifest: string;
   memoryHint?: string;
   maxSteps: number;
+  mapExistingScopesPath?: string;
+  mapExistingScopesCount?: number;
 }): string {
+  const appendMapBlock = input.mapExistingScopesPath && input.mapExistingScopesCount
+    ? `\nAPPEND-MAP MODE:\n- An existing scope inventory with ${input.mapExistingScopesCount} scope(s) is available at ${input.mapExistingScopesPath}.\n- Before writing scopes.json, read that file and treat it as already-covered map output.\n- Your output scopes.json must contain ONLY newly discovered scopes not already represented there. Do not rewrite, rename, or re-score existing scopes.\n- Avoid duplicates by comparing both region and obligation; split genuinely new obligations even if they live near an existing region.\n- The framework will merge your novel scopes into the persisted inventory and preserve existing audited/deferred/pending status.\n`
+    : "";
   return `Target: ${input.target}
 Phase: MAP — enumerate the COMPLETE scope inventory (coverage, not a shortlist). ${actionBudgetText(input.maxSteps)}; stay broad and shallow, but keep expanding until the loaded in-scope material has been covered.
+${appendMapBlock}
 
 ${MAP_SCORING_RULES}
 
 ${MAP_GRANULARITY_RULES}
+
+${DISCOVERY_BACKLOG_RULES}
 
 Authorized scope note:
 ${input.scopeNote && input.scopeNote.trim().length > 0 ? input.scopeNote.trim() : "(none provided — treat all loaded source as in scope)"}
@@ -240,7 +269,7 @@ ${input.memoryHint && input.memoryHint.trim().length > 0 ? input.memoryHint.trim
 Loaded source files:
 ${input.fileManifest}
 
-Begin the obligation-driven method: ${focus ? "enumerate this region's obligations from design intent, then discharge each by naming the enforcing line or flagging its absence." : "model the system, rank and commit to the critical region, then enumerate and discharge its obligations."} Respond with one JSON tool action or done object.`;
+Begin the obligation-driven method: ${focus ? "enumerate this region's obligations from design intent, then discharge each by naming the enforcing line or flagging its absence." : "model the system, rank and commit to the critical region, then enumerate and discharge its obligations."} Persist scope_outcome.json separately from actionable findings.json before done. Respond with one JSON tool action or done object.`;
 }
 
 export const AUDIT_VERIFY_SYSTEM = `You are an autonomous white-hat security auditor in VERIFY mode on AUTHORIZED source code. You are handed ONE specific suspected finding (a claim) and must determine, BY EXECUTION, whether it is REAL or a FALSE POSITIVE. You are NOT enumerating new issues.
@@ -391,19 +420,23 @@ Spend your effort on REPRODUCTION, not a survey. There is no turn limit by defau
 You determine, for THIS target, what real ground truth is and how to reach it — fork the live chain, stand up a real local node, build the real release, whatever fits. The framework prescribes no per-technology procedure; it requires only that your reproduction be real, executed, and exhibited.
 ${POC_TRUST_RULE}
 
+You also determine, from the target's own public or supplied engagement materials, what submission policy applies. Do not hard-code or assume any bounty platform. Set policy_kind to one of: "bug_bounty", "contest", "private_audit", "incident", "source_review", "unknown", or "custom". For bug_bounty/contest/custom bounty-like policies, adjudicate the concrete gates that affect submit readiness and expected collectible payout: scope/asset eligibility, live funded impact or affected live deployment, known issue / duplicate / prior disclosure status, severity tier, exclusions, and payout cap/min/max. For non-bounty work, record why payout is not applicable and do not estimate one. Never invent a collectible bounty: if scope, live impact, novelty, or tier math is not established, write that gate as unknown/needs-human and leave expected_collectible_usd unset or explicitly unknown.
+
+For a bounty-like policy and any row you mark reproduced:"yes", make a good-faith live exposure / affected-deployment sizing attempt before finalizing the row, then write impact_inventory.json at the workspace root. The framework does not prescribe how to do this: you decide whether the target calls for reading deployment registries, chain state on a local fork, token balances, package release metadata, product docs, explorer pages, or another real-ground-truth source. Keep it bounded to the evidence needed for pass/fail/unknown. The inventory is evidence, not a strategy checklist: record only what you actually established and the blocker when you cannot establish it. Schema: {"generated_at","policy_kind","items":[{"bug","members":["<finding id>"],"status":"funded|unfunded|unknown|not-applicable|blocked","affected_deployments":[{"network","address","kind","is_live":true|false|"unknown","is_funded":true|false|"unknown","funds_at_risk_usd":"number or unknown","block":"block/height/version if applicable","evidence":"source/command/result","method":"how you established it"}],"blockers":["..."],"confidence":"high|medium|low|unknown"}]}. Reference this inventory from adjudication.live_impact_status and payout_estimate.basis. Do not mark recommendation:"submit-candidate" unless required bounty gates pass, including live funded impact/affected live deployment and collectible payout basis; use needs-human when any gate is unsettled.
+
 How you act:
 - Each tool turn, respond with exactly ONE JSON object (a tool action or a done object); no prose, no fences.
 - write/edit create your own scratch/PoC/harness files in the copied workspace. You CANNOT modify the target source under audit.
 - bash runs one command. Use purpose=confirm with success_patterns for a real local test/build runner; you may also fork, fetch, and search.
 
-Output — write confirm_decision.json at the workspace root: a JSON array, one row per DISTINCT bug. The members array must contain ONLY the bracketed finding ids from the work list (for example "kabc123"), never titles or prose:
-[{"bug","members":["<finding id>"],"distinct_fix","reproduced":"yes"|"no"|"could-not-set-up","repro_evidence":"how you reproduced it on the real target, the observed effect, and the command_id of the passing run","repro_command_id":"<the passing purpose=confirm run's command_id, when you built a source-level PoC>","fix_patch":{"path","old","new"},"patched_success_patterns":["<what your PoC prints once the fix BLOCKS the exploit>"],"corroboration":"public support for the mechanism, with sources","novelty":"novel | already-disclosed (sources, as of date)","human_gates":"scope / venue / embargo facts you cannot settle by execution","recommendation":"submit-candidate"|"needs-human"|"drop"}]
+Output — write confirm_decision.json at the workspace root: a JSON array, one row per DISTINCT bug. For bounty-like reproduced rows also write impact_inventory.json at the workspace root. The members array must contain ONLY the bracketed finding ids from the work list (for example "kabc123"), never titles or prose:
+[{"bug","members":["<finding id>"],"distinct_fix","reproduced":"yes"|"no"|"could-not-set-up","repro_evidence":"how you reproduced it on the real target, the observed effect, and the command_id of the passing run","repro_command_id":"<the passing purpose=confirm run's command_id, when you built a source-level PoC>","fix_patch":{"path","old","new"},"patched_success_patterns":["<what your PoC prints once the fix BLOCKS the exploit>"],"corroboration":"public support for the mechanism, with sources","novelty":"novel | already-disclosed (sources, as of date)","human_gates":"remaining scope / venue / embargo / payout facts you cannot settle by execution","engagement_profile":{"policy_kind":"bug_bounty|contest|private_audit|incident|source_review|unknown|custom","platform":"platform or venue if known, arbitrary string, optional","selected_by":"why this policy was selected","confidence":"high|medium|low|unknown","policy_sources":["source urls or corpus paths"],"required_gates":["scope","live_impact","known_issue","payout"]},"adjudication":{"gates":[{"id":"scope|live_impact|known_issue|payout|custom","status":"pass|fail|unknown|needs-human","evidence":"what establishes or blocks this gate"}],"scope_status":"pass|fail|unknown|needs-human","live_impact_status":"pass|fail|unknown|needs-human","known_issue_status":"pass|fail|unknown|needs-human","payout_estimate":{"status":"not-applicable|unknown|estimated","eligible_min_usd":"number when established","eligible_max_usd":"number when established","expected_collectible_usd":"number only when all collectible-payout gates pass; otherwise omit","confidence":"high|medium|low|unknown","basis":"program terms and live impact evidence"}}},"recommendation":"submit-candidate"|"needs-human"|"drop"}]
 A row is only "reproduced":"yes" if it cleared the objective bar above and cites a command_id from a purpose=confirm run that actually passed.
-Write confirm_decision.json INCREMENTALLY — add or update each bug's row as soon as you finish that bug (rewrite the full array each time), not only at the very end — so an interruption keeps the work already done.
+Write confirm_decision.json INCREMENTALLY — add or update each bug's row as soon as you finish that bug (rewrite the full array each time), not only at the very end — so an interruption keeps the work already done. Rewrite impact_inventory.json incrementally when a bounty-like row's live exposure evidence changes.
 If the task lists ALREADY-SETTLED rows, carry them into confirm_decision.json and do NOT re-reproduce their existing member ids — work only the findings not yet settled. If an unsettled finding is the same distinct bug as an already-settled row, add that new finding id to the settled row's members and reuse the prior reproduction evidence; otherwise leave settled rows unchanged. This is how an interrupted or batched confirm resumes without splitting one root cause across runs.
 Supply repro_command_id + fix_patch + patched_success_patterns whenever a row's PoC is a source-level test with a fix: the framework then runs a fix-equivalence matrix over your rows — it applies one row's fix to the pristine source and re-runs another row's PoC — and MERGES any rows a single fix neutralizes, so "distinct bugs" is decided by execution, not by your grouping alone. Rows without these fields are left exactly as you wrote them (the framework cannot machine-verify their separation).
 
-Do NOT write report_*.md files in CONFIRM mode. Confirm's output is the decision sheet only: confirm_decision.json plus the framework-generated confirm_report.md summary. Formal, submission-ready Markdown reports are a separate REPORT phase that runs after confirmed/reproduced decisions exist; that phase will use your decision rows, evidence, and artifacts to write one report per bug.
+Do NOT write report_*.md files in CONFIRM mode. Confirm's output is the decision sheet only: confirm_decision.json, optional impact_inventory.json, plus the framework-generated confirm_report.md summary. Formal, submission-ready Markdown reports are a separate REPORT phase that runs after confirmed/reproduced decisions exist; that phase will use your decision rows, evidence, and artifacts to write one report per bug.
 
 White-hat boundaries (non-negotiable):
 - You MAY read from and fork live networks/data to reproduce LOCALLY. You MUST NOT broadcast/submit/relay/publish any transaction, move funds, or write to any live network or third-party system. Fork and read; replay only against a LOCAL fork; never push to a live system.
@@ -438,7 +471,7 @@ ${input.memoryHint && input.memoryHint.trim().length > 0 ? input.memoryHint.trim
 Loaded source files:
 ${input.fileManifest}
 
-Consolidate the findings into distinct bugs, reproduce each distinct bug against real ground truth, check novelty/corroboration online (leads only), then write confirm_decision.json before emitting done. Do not write report_*.md in this phase; formal reports are generated by the later Report phase. Respond with one JSON tool action or done object.`;
+Consolidate the findings into distinct bugs, reproduce each distinct bug against real ground truth, classify the engagement policy, adjudicate scope/live-impact/known-issue/payout gates when the policy is bounty-like, write impact_inventory.json for bounty-like reproduced rows, check novelty/corroboration online (leads only), then write confirm_decision.json before emitting done. Do not write report_*.md in this phase; formal reports are generated by the later Report phase. Respond with one JSON tool action or done object.`;
 }
 
 export function buildAuditKickoff(input: {

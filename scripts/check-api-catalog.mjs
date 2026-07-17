@@ -24,7 +24,8 @@ const stalePatterns = [
   },
 ];
 
-const [catalog, cliHelp, uiHelp, daemonHelp, daemonStartHelp] = await Promise.all([
+const [catalog, ordinaryCatalog, cliHelp, uiHelp, daemonHelp, daemonStartHelp] = await Promise.all([
+  Promise.resolve(apiCatalog(true)),
   Promise.resolve(apiCatalog()),
   cli(["--help"]),
   cli(["ui", "--help"]),
@@ -32,11 +33,18 @@ const [catalog, cliHelp, uiHelp, daemonHelp, daemonStartHelp] = await Promise.al
   cli(["daemon", "start", "--help"]),
 ]);
 
+assert.equal(ordinaryCatalog.maintainerMode, false, "ordinary API catalog must report maintainer mode disabled");
+assert.equal(ordinaryCatalog.resources.includes("harness-experiment"), false, "ordinary API catalog must hide maintainer resources");
+assert.equal(ordinaryCatalog.endpoints.some((entry) => entry.path.startsWith("/api/harness-experiments")), false, "ordinary API catalog must hide maintainer endpoints");
+assert.equal(catalog.maintainerMode, true, "maintainer API catalog must report maintainer mode enabled");
+
 const catalogText = flatten(catalog);
 const helpText = [cliHelp, uiHelp, daemonHelp, daemonStartHelp].join("\n");
 const publicText = [catalogText, helpText].join("\n");
 
 assert.match(uiHelp, /flounder ui \[--port <n>\].*--concurrency <n>/s, "ui help must be side-effect-free and document local daemon concurrency");
+assert.match(uiHelp, /--maintainer[\s\S]*maintainer-only Harness API\/CLI\/UI surfaces/, "ui help must document the explicit maintainer capability boundary");
+assert.doesNotMatch(cliHelp, /\bflounder experiment\b/, "ordinary top-level help must not advertise maintainer-only source-improvement commands");
 assert.match(daemonStartHelp, new RegExp(escapeRegExp(daemonStartUsage)), "daemon start help must document the current start command");
 assert.match(cliHelp, /flounder daemon start --server <url> --token <token>/, "top-level CLI help must expose daemon start");
 
@@ -57,6 +65,22 @@ assert.match(scopePatch.summary, /top of the next auto-dig batch/i, "scope patch
 assert.equal(typeof scopePatch.body?.prioritize, "string", "scope patch catalog must document prioritize:true");
 assert.match(scopePatch.body.prioritize, /top/i, "scope prioritize body description must say it moves a scope to the top");
 assert.match(scopePatch.body.status, /deferred.*pending/s, "scope patch catalog must document defer/resume statuses");
+
+const runGroupCreate = endpoint("POST", "/api/run-groups");
+assert.match(runGroupCreate.summary, /schema-validated/i, "run-group manifests must advertise validation");
+assert.match(runGroupCreate.summary, /never bypass/i, "run-group manifests must preserve the sandbox/confirmation boundary");
+const runGroupStart = endpoint("POST", "/api/run-groups/:uuid/start");
+assert.match(runGroupStart.summary, /parallelism/i, "run-group start must document bounded scheduling");
+const workItemRetry = endpoint("POST", "/api/work-items/:id/retry");
+assert.match(workItemRetry.summary, /preserving.*prior attempt evidence/i, "work-item retry must preserve immutable attempt evidence");
+assert.match(workItemRetry.summary, /cannot be rewritten as retries/i, "benchmark misses must not be hidden by retry semantics");
+
+const experimentCreate = endpoint("POST", "/api/harness-experiments");
+assert.match(experimentCreate.summary, /verifier-grounded/i, "harness weakness mining must remain grounded in persisted verifier evidence");
+assert.match(experimentCreate.summary, /cannot be proposed as edits/i, "harness proposals must advertise the protected boundary");
+const experimentEvaluate = endpoint("POST", "/api/harness-experiments/:uuid/evaluate");
+assert.match(experimentEvaluate.summary, /deterministic promotion gate/i, "harness evaluation must use a product-owned deterministic gate");
+assert.match(experimentEvaluate.summary, /never changes code, merges, or deploys/i, "promotion API must not imply autonomous release authority");
 
 for (const { name, pattern } of stalePatterns) {
   assert.doesNotMatch(publicText, pattern, `catalog/CLI help still exposes ${name}`);

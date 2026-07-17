@@ -44,12 +44,15 @@ The installed skill should trigger from requests about Flounder audits, public-s
 
 ## Why Flounder
 
-- **Autonomous audit loop.** `flounder run <clue>` can execute prepare -> map -> dig -> confirm -> report as a tracked workflow. Prepare can turn a transaction, address, project, repository, or link into staged source and materials; map inventories the audit surface; dig writes and runs proof tests; confirm reproduces findings on the real target; report packages reproduced bugs into Markdown reports. The operator does not have to build a custom scenario pipeline for each target.
+- **Autonomous audit loop.** `flounder run <clue>` can execute prepare -> map -> dig -> synthesize -> verify -> confirm -> report as a tracked workflow. Prepare can turn a transaction, address, project, repository, or link into staged source and materials; map inventories the audit surface; dig writes and runs proof tests; synthesize composes cross-scope candidates; verify confirms or refutes candidates by local execution; confirm reproduces findings on the real target; report packages reproduced bugs into Markdown reports. The operator does not have to build a custom scenario pipeline for each target.
 - **Framework-agnostic reasoning.** Flounder does not encode a Solidity/EVM, ZK/proof-system, Rust, Go, JavaScript, protocol, or crypto-specific audit strategy. Source, corpus, and optional profiles are inputs; the audit strategy comes from the model. As coding models improve, the audit capability can improve without rewriting the framework around every new stack.
 - **Execution-grounded findings.** A finding is not real because the model says it is plausible. It must cite a passing local command that exercises the vulnerable path. Stronger findings also pass differential confirmation, independent refutation, and faithful-PoC appeal checks.
-- **Blind discovery plus open-world reproduction.** Discovery runs network-sealed, so findings are derived from the target material rather than copied from disclosures. `flounder confirm` then opens the network only for white-hat reproduction, novelty checks, and submit/no-submit decision sheets.
+- **Versioned coverage and composition.** Scope inventories and model memory are bound to the prepared-material fingerprint. Independent Map inventories are unioned without dropping singleton scopes; every Dig writes a separate obligation/composition outcome, incomplete outcomes stay visible, and cross-scope synthesis runs even when individual scopes produced no finding.
+- **Blind discovery plus capability-scoped reproduction.** Discovery runs network-sealed, so findings are derived from the target material rather than copied from disclosures. During `flounder confirm`, only explicit read/fork/fetch commands receive egress for white-hat reproduction and novelty checks; arbitrary model code remains network-sealed.
 - **Sandboxed execution boundary.** Model-generated code, PoCs, dependency installs, and local tests run in a copied workspace, not directly in the host checkout. The default OCI backend refuses silent host execution, bind-mounts only the copied workspace and package cache, drops Linux capabilities, uses `no-new-privileges`, read-only root filesystems and tmpfs temp dirs, applies process/memory/CPU limits when configured, and disables network for sealed audit commands. This reduces the blast radius of malicious dependencies, unsafe PoCs, and model mistakes before they can pollute the host machine.
 - **Multiple audit scenarios.** Use the same product for blind capability audits, incident investigation from suspicious on-chain evidence, open-world bug-bounty audits, targeted follow-up on suspected findings, and disclosure preparation. Whether Flounder prepares the target itself or you provide source paths is an input path, not the scenario.
+- **Durable evaluation groups.** `flounder group` runs validated positive, negative, control, replay, and multi-target work items through the same daemon queue and audit kernel. Group concurrency, attempts, blocked setup, evidence outcomes, and reports survive control-plane restarts. Manifest-provided commands are never executed directly, host execution is rejected, and lifecycle state stays separate from security/scoring outcomes.
+- **Governed maintainer experiments.** When the control plane is explicitly started with `flounder ui --maintainer`, `flounder experiment` helps a Flounder maintainer agent mine verifier-grounded Evaluation failures, constrain source proposals to an allowlist, and compare paired baseline/candidate runs. It is not triggered by ordinary Projects and is absent from the default user surface. Promotion requires distinct cases and bug families, passing hidden holdouts and controls, and no paired regressions; merge and deployment remain human gates.
 - **Strong fit for Solidity and ZK.** Solidity/EVM targets work well because local forks and Foundry/Hardhat tests can prove real on-chain effects. ZK/proof-system targets work well because local prover and constraint harnesses can turn subtle missing constraints into executable counterexamples. These are high-signal examples, not hard-coded limits.
 - **Designed for agent tooling.** Flounder exposes the audit workflow through a CLI, React dashboard, self-describing REST API, pi extension, provider profiles, and daemon execution plane. Codex-style and Claude Code-style providers can be routed through the same sandbox and audit contract.
 - **Local control of code and credentials.** The UI server is a control plane. Audits run on a daemon, optionally on another machine, so target code and provider credentials stay on the executor host.
@@ -61,15 +64,35 @@ The installed skill should trigger from requests about Flounder audits, public-s
 | Blind capability audit | A public-source or authorized project, repo, package, source tree, or project link, with no bug hint | Let Flounder prepare the target when possible, or provide source/build paths when you already have them. Do not include incident reports, known bug names, exploit theories, or answer-bearing corpus. Judge the result by coverage and execution-backed findings, not by a claim that the target is safe. |
 | Incident investigation | A suspicious transaction, address, exploit link, or factual incident clue | Use Prepare to collect chain facts, deployed source, official project material, and reproduction requirements. The clue is evidence, not proof; the output should explain the root cause and whether it reproduced on attacker-real local ground truth. |
 | Open-world public-source audit | A public-source target, repository, package, deployment, project, or bounty scope | Let Prepare actively collect official docs, deployments, provenance, package metadata, and bounty scope when available. The audit remains model-directed, but the allowed context is broader than a blind capability test. |
+| Normal bug bounty | A public bounty scope, source or deployment, and a private disclosure path | Keep real-target confirmation in the loop when a live target exists. Reports should come from reproduced or locally confirmed findings that still pass scope, duplicate, known-issue, impact, and payout-readiness gates. |
+| Bug bounty contest | A time-limited contest with source, rules, and a venue-specific report format | Use short settled batches so findings reach verify/refute and report quickly. Source-only local confirmation can be reportable when the contest rules do not require live-target reproduction, but suspected-only findings are still not submissions. Preserve prior coverage and submitted findings with append-map expansion instead of remapping from scratch. |
 | Targeted follow-up | A suspected finding, scope id, file/region, or prior run | Use `audit --verify`, `audit --scope`, `confirm`, or selected project actions to settle a narrower question by execution. |
 | Disclosure preparation | Confirmed or reproduced findings | Consolidate duplicates, run real-target confirmation when required, regenerate selected reports, and package only non-ignored, evidence-backed bugs. |
+
+## Engagement Modes
+
+Projects can record how the audit will be judged without changing the thin audit
+kernel. The default `standard` posture is for general authorized review.
+`bug-bounty` records normal bounty context: Prepare may collect public program
+scope and deployments, Confirm remains expected for live-target reproduction,
+and reporting should wait for scope, novelty, known-issue, impact, and payout
+gates. `bug-bounty-contest` records a time-limited contest posture: the project
+can run short batches, skip real-target confirmation when the rules are
+source-only, settle reports before opening the next batch, and append novel
+scopes when the inventory is exhausted.
+
+These modes are workflow and evidence gates, not audit strategy. The model still
+chooses what to inspect and test; Flounder preserves coverage, duplicate state,
+resource blockers, and report readiness so the operator can move quickly without
+flattening suspected, confirmed, reproduced, duplicate, and submitted items into
+one bucket.
 
 ## Preparation Paths
 
 Preparation is about how Flounder receives the target, not what kind of audit it is.
 
-- **Framework-prepared target, recommended by default**: start from a clue such as a project link, repo, package, bounty page, transaction, or address. `flounder run <clue>` runs prepare -> map/dig -> confirm -> report, and the dashboard uses the same path when the project has a task/clue.
-- **Source-provided target**: use `--source`, `--build-root`, and optional `--corpus` when the code is already staged locally or the user explicitly wants no external preparation. This enters the sealed map/dig audit directly.
+- **Framework-prepared target, recommended by default**: start from a clue such as a project link, repo, package, bounty page, transaction, or address. `flounder run <clue>` runs prepare -> map/dig -> synthesize -> verify -> confirm -> report, and the dashboard uses the same path when the project has a task/clue.
+- **Source-provided target**: use `--source`, `--build-root`, and optional `--corpus` when the code is already staged locally or the user explicitly wants no external preparation. This enters the sealed map/dig/synthesize/verify audit directly.
 - **Hybrid project**: provide local source/build paths and a task/clue. This is useful for open-world bounty work where Flounder should audit the local checkout but still collect official public context, scope, deployments, and provenance.
 
 ## What Flounder Automates
@@ -85,8 +108,11 @@ Flounder is built for the parts of security work that usually require a human to
 | Exploit construction | Writes local PoCs, tests, fixtures, or harnesses inside an isolated workspace. |
 | Sandboxed execution | Runs model-generated tests and PoCs away from the host source tree, credentials, and user environment. |
 | Execution proof | Runs the proof locally and only upgrades findings when command evidence exists. |
+| Discovery health | Writes run-health and backlog artifacts so a zero-finding run can be distinguished from a shallow run, a missing-resource blocker, or coverage that still needs a later dig. Toolchain warm-up failures are captured as resource requests even when the model did not write one itself, and backlog rows are classified for the project Next Actions queue. |
+| Evaluation and replay | Runs positive, negative, control, regression, and multi-target work items with durable concurrency and evidence accounting; regenerates group reports without rerunning model work. |
+| Maintainer Harness | Explicit `--maintainer` capability that teaches a repository agent to turn Evaluation failures into bounded source candidates and a reviewable PR; hidden and disabled for ordinary users. |
 | Real-target confirmation | Reproduces confirmed findings against real-world ground truth, such as a local fork of a deployed target. |
-| Reporting | Tracks status, artifacts, confirm decisions, formal reports, and submission state across projects. |
+| Reporting | Tracks one canonical record per exact finding, every occurrence and phase attempt, confirm decisions, formal reports, and submission state across projects. |
 
 ## Quickstart
 
@@ -130,7 +156,7 @@ the same provider is already logged in through pi at `~/.pi/agent/auth.json`,
 Flounder imports that provider entry into its daemon-local auth file on
 `login`/`check`.
 
-Then create a project in the dashboard, describe the audit task in the task/clue box, choose its execution daemon and default provider profile, and start a run. The project directory defaults to the project UUID under the daemon workspace, so it stays stable even if the display name changes. A fresh install seeds starter profiles for `openai-codex · gpt-5.5 · xhigh` and `claude-code · opus 4.8 max`; each selected daemon still needs local auth for the providers it will run. The CLI can drive the same control plane:
+Then create a project in the dashboard, describe the audit task in the task/clue box, choose its execution daemon and default provider profile, and start a run. The project directory defaults to the project UUID under the daemon workspace, so it stays stable even if the display name changes. A fresh install seeds starter profiles for `openai-codex · gpt-5.6-sol · xhigh` and `claude-code · opus 4.8 max`; each selected daemon still needs local auth for the providers it will run. Existing projects keep their explicitly selected profile until an operator changes it. The CLI can drive the same control plane:
 
 ```bash
 # Recommended default: let Flounder prepare the target, then audit, confirm, and report.
@@ -266,7 +292,9 @@ curl -X PATCH http://127.0.0.1:4500/api/findings/123/tracking \
 
 ## Sandbox Runtime
 
-Real audits execute model-generated commands through the sandbox. The safe default is Docker-backed OCI: install and start Docker or a Docker-compatible runtime, then build the default image with `npm run sandbox:build`. `--sandbox-backend auto` uses `flounder-sandbox:latest` when available and otherwise fails closed instead of silently running tests on the host.
+Real audits execute model-generated commands through the sandbox. The safe default is `--sandbox-backend auto`: on Apple silicon macOS it first uses Apple's `container` runtime when the selected image and sealed network are ready; otherwise it uses Docker-backed OCI when the image is available. If no sandbox engine is ready, it fails closed instead of silently running tests on the host.
+
+For the Docker-backed path, install and start Docker or a Docker-compatible runtime, then build the default image with `npm run sandbox:build`. For the Apple path, install and start Apple's `container` runtime, build or pull the selected sandbox image into that runtime, and let `auto` select it on Apple silicon macOS. `--sandbox-backend apple-container` requires that path explicitly. Sealed Apple commands use an internal host-only, no-DNS `flounder-sealed` network.
 
 The default image is a baseline, not a promise to cover every target stack. It includes common build and audit toolchains so the first run has a safe execution boundary, but specialized targets should use a daemon- or operator-provided image with the exact compiler, prover, chain tooling, or package manager they require:
 
@@ -276,7 +304,7 @@ flounder run --source ./src --build-root . --sandbox-image your-audit-image:late
 
 Image construction is part of the trusted execution base. The audit model may report missing toolchains or propose an image recipe, but it should not receive unrestricted `docker build` / `docker pull` capability inside the audit loop. A safe automation path is to generate a reviewable target-specific image plan, build it in a controlled daemon/operator step, then pin and reuse that image by name or digest.
 
-For trusted local smoke tests only, use `--sandbox-backend host --allow-host-execution` or set `FLOUNDER_ALLOW_HOST_EXECUTION=1`. Host mode still uses the copied workspace plus isolated `HOME` and package-cache paths, but it does not provide kernel-level filesystem or network isolation and should not be used for untrusted targets, malicious dependencies, or real model-generated exploit code.
+For trusted local smoke tests only, use `--sandbox-backend host --allow-host-execution` or set `FLOUNDER_ALLOW_HOST_EXECUTION=1`. Host mode still uses the copied workspace plus isolated `HOME` and package-cache paths, but it cannot enforce command-level network sealing or provide kernel-level filesystem isolation and should not be used for untrusted targets, malicious dependencies, or real model-generated exploit code.
 
 ## Use It Yourself
 
@@ -293,17 +321,19 @@ The tracked workflow is:
 
 1. **Prepare**: acquire or stage source, corpus, dependency closure, and deployment-match evidence when the run starts from a clue.
 2. **Map**: enumerate and score the audit surface without producing findings.
-3. **Dig**: deep-audit selected scopes, construct PoCs, and execution-confirm findings locally.
-4. **Confirm**: reproduce confirmed findings on real-world ground truth and decide whether they are submission candidates.
-5. **Report**: generate formal Markdown reports for reproduced or source-provided locally confirmed bugs.
+3. **Dig**: deep-audit selected scopes and attempt to prove each new finding locally while its source context is still active.
+4. **Synthesize**: compose per-scope findings into distinct cross-scope bug candidates.
+5. **Verify candidates**: settle only the suspected or synthesized candidates that Dig did not already prove or refute. Each claim runs in an isolated workspace with bounded concurrency; an unchanged blocked attempt waits for changed materials or an explicit retry instead of draining again. Standalone `verify` also accepts imported prior claims.
+6. **Confirm**: reproduce confirmed findings on real-world ground truth and decide whether they are submission candidates.
+7. **Report**: generate formal Markdown reports for reproduced or source-provided locally confirmed bugs.
 
 You can run that end to end or drive each phase directly:
 
 | Command | Use |
 | --- | --- |
 | `flounder prepare <clue>` | open-world acquisition from a transaction, address, project, package, repository, or link into staged source, corpus, dependency closure, and deployment-match evidence |
-| `flounder run <clue>` | one-command prepare -> sealed map/dig -> confirm -> report from a transaction, address, repo, package, project, bounty, or link |
-| `flounder run --source <paths...> --target <name>` | source-provided sealed audit: map -> dig on source already staged locally |
+| `flounder run <clue>` | one-command prepare -> sealed map/dig/synthesize/verify -> confirm -> report from a transaction, address, repo, package, project, bounty, or link |
+| `flounder run --source <paths...> --target <name>` | source-provided sealed audit: map -> dig -> synthesize -> verify on source already staged locally |
 | `flounder map --target <name> --source <paths...>` | enumerate and persist the scope inventory only; no findings |
 | `flounder audit <region> --source <paths...>` | deep-audit one named file/function/region without a new map |
 | `flounder audit --scope <id,...> --source <paths...>` | deep-audit selected inventory scopes after `flounder map` |
@@ -333,6 +363,8 @@ A finding's status is the framework's verdict from execution:
 | --- | --- |
 | `confirmed-differential` | The exploit ran and the model's minimal fix blocked it while the test still ran. |
 | `confirmed-executable` | A cited local confirmation test triggered the bug. |
+| `confirmed-source` | Source-backed evidence is present, but local executable verification is still required. |
+| `needs-evidence` | Local review completed, but the claim needs external evidence to settle. |
 | `suspected` | Credible but not execution-proven, or downgraded by refutation. |
 | `refuted` | A skeptic or real-target reproduction broke the claim. |
 
@@ -340,7 +372,7 @@ A finding's status is the framework's verdict from execution:
 
 A run produces private artifacts under the output directory. By default, Flounder keeps local state under `~/.flounder`:
 
-- `~/.flounder/flounder.db`: local tracking database for projects, runs, findings, daemon tokens, and jobs.
+- `~/.flounder/flounder.db`: local tracking database for projects, runs, scopes, canonical findings and occurrences, phase attempts, evaluations, discovery backlog, daemon tokens, and jobs.
 - `~/.flounder/<target>-<timestamp>/`: run artifacts, copied workspaces, logs, transcripts, findings, and reports.
 - `~/.flounder/history/<target>/`: durable memory, scope inventory, build cache, and project history.
 - `~/.flounder/workspace/`: default daemon workspace for project directories.
@@ -353,21 +385,24 @@ A run artifact directory contains:
 - scope inventory and coverage (`audit_scopes.json`, `summary.json`)
 - findings and hypotheses (`audit_findings.json`, `audit_hypotheses.json`)
 - command evidence (`audit_command_runs.json`)
+- discovery health and backlog (`run_health.json`, `coverage_gaps.json`, `resource_requests.json`, `followup_scopes.json`)
 - live/replay trace (`events.jsonl`, `audit_transcript.json`, `calls/*.json`)
 - private report drafts (`audit_report.md`, `report_<id>.md`)
-- confirm decision sheets (`confirm_decision.json`, `confirm_report.md`, `confirm_equivalence.json`)
+- confirm decision sheets (`confirm_decision.json`, `confirm_report.md`, `confirm_equivalence.json`, and bounty-like `impact_inventory.json` when live exposure evidence is attempted)
 
-The dashboard stores metadata and artifact paths in SQLite so an agent can inspect progress without scraping run directories.
+The dashboard stores metadata, run health, discovery backlog rows, and artifact paths in SQLite so an agent can inspect progress without scraping run directories.
 
 ## Dashboard
 
-`flounder ui` is a local control plane and dashboard for projects, daemons, provider profiles, runs, scopes, findings, reports, and live activity. A project is pinned to an execution daemon and a default provider profile, with optional per-phase provider overrides for prepare, map, dig, and confirm. The selected daemon must be authenticated for every provider profile the project can use. New projects start from a prominent task/clue input, can run immediately after creation, and default their daemon workspace directory to the project UUID.
+`flounder ui` is a local control plane and dashboard for projects, evaluations, daemons, provider profiles, runs, scopes, findings, reports, and live activity. A project is pinned to an execution daemon and a default provider profile, with optional per-phase provider overrides for prepare, map, dig, and confirm. The selected daemon must be authenticated for every provider profile the project can use. New projects start from a prominent task/clue input, can run immediately after creation, and default their daemon workspace directory to the project UUID.
 
-The project view shows the prepare -> map -> dig -> confirm -> report workflow, current phase, scope coverage, live model activity, findings as they land, per-finding confirm actions, real-target reproduction status, and reports. The primary action is **Run** before the first pipeline run and **Continue** after one exists; finer-grained Prepare, Map, Dig, Verify, Confirm, and Report actions live under More actions. The project list can pin projects, archive them to Settings, unarchive them later, and drag active projects into a manual order.
+The project view shows the prepare -> map -> dig -> synthesize -> verify -> confirm -> report workflow, current phase, scope coverage, run health, a **Next Actions** queue, live provider reasoning summaries, findings as they land, per-finding confirm actions, real-target reproduction status, and reports. Concurrent Dig work is separated into one Activity lane per scope, with pipeline events kept in their own lane. Dig attempts local proof during discovery; **Verify candidates** is the explicit follow-up for unresolved or synthesized claims, not a second full audit. Continue resumes an interrupted Dig batch first, but when only verify/confirm/report work remains it starts directly at that evidence tail instead of creating an empty Dig run. Next Actions is an agent-owned work queue: coverage work can Continue, Expand map, or prioritize scopes; setup work asks the agent to resolve toolchain, sandbox, dependency, source, or auth blockers when possible; routing work asks the agent to inspect ambiguous rows and choose the next safe workflow action. The operator is asked only for explicit credentials, authorization, or unavailable external resources. The primary action is **Run** before the first pipeline run and **Continue** after one exists; finer-grained Prepare, Map, Dig, Verify candidates, Confirm, and Report actions live under More actions. The project list can pin projects, archive them to Settings, unarchive them later, and drag active projects into a manual order.
 
-A cross-project Findings view tracks every finding through submission states. It supports project, audit-status, and tracking filters; the default Active view hides findings marked `ignored`, and the Ignored view lets an operator recover machine-reported false positives later by changing them back to `open`.
+A cross-project Findings view tracks every project finding through submission states. Each row shows only the current phase and its blocker or next action; opening the workflow/report detail reveals the full local-verification, real-target, and formal-report attempt history plus focused retry controls. Evaluation evidence is excluded by default and can be inspected with the explicit source filter; those rows link back to their Evaluation and do not expose disclosure tracking controls.
 
-Every UI operation is also a REST call. `GET /api` returns the API catalog, and `GET /api/runs/:id/log` streams the executing daemon's live model output, tool calls, and milestones.
+The Evaluations view creates and operates durable audit, benchmark, regression, and verification run groups. Ordinary users see only this evidence workspace. When a Flounder source maintainer explicitly starts the control plane with `--maintainer`, an additional **Harness · Maintainer** mode becomes available for governed baseline/candidate experiments. Each item uses a hidden tracking project, and every attempt receives a fresh scope/memory/transcript namespace while sharing only the target dependency cache. Project jobs are claimed ahead of queued Evaluation jobs on a shared daemon; already-running work is never preempted. Lifecycle completion is never presented as an evidence pass by itself, and a promotion recommendation never merges or deploys code.
+
+Every UI operation is also a REST call. `GET /api` returns the API catalog, `GET /api/projects/:uuid/backlog` lists discovery backlog rows with `actionability`, `action_owner`, and `recommended_action` metadata, `GET /api/findings/:id/lifecycle` returns occurrences and phase attempts, `POST /api/findings/:id/retry` reopens one blocked phase, `PATCH /api/backlog/:id` updates operator state, and `GET /api/runs/:id/log` streams the executing daemon's provider reasoning summaries, output, tool calls, and milestones with per-stream identifiers.
 
 ## White-Hat Boundary
 
@@ -377,9 +412,13 @@ Flounder supports white-hat audits of publicly available source, your own code, 
 
 - [Usage](docs/USAGE.md): commands, sandbox setup, dashboard, API, materials, providers, daemon setup, and outputs.
 - [Architecture](docs/ARCHITECTURE.md): thin-agent design, sandbox boundary, confirmation boundary, control/execution split, and tracking model.
+- [Product validation](docs/VALIDATION.md): current release-readiness evidence, limits, and remaining validation work.
+- [Capability expansion plan](docs/PRODUCT_CAPABILITY_PLAN.md): accepted design direction for future batch, evidence, and target-preparation capabilities.
+- [Versioned coverage loop](docs/VERSIONED_COVERAGE_LOOP.md): material-versioned Map/Dig state, adaptive sampling, Evaluation isolation, and maintainer Harness safety invariants.
 - [Agent skill](skills/flounder/SKILL.md): Codex / Claude Code operating manual.
 - [Domain profiles](configs/README.md): optional answer-free context packs. They are not product modes and are off by default.
-- [Optional Solidity/EVM notes](docs/SOLIDITY.md) and [ZK constraint profile](configs/zk-constraint-audit.default.json): high-signal context examples, not Flounder's core limit.
+- [Optional Solidity/EVM notes](docs/SOLIDITY.md), [Cairo/Starknet notes](docs/STARKNET.md), [TON/FunC notes](docs/TON.md), and [ZK constraint profile](configs/zk-constraint-audit.default.json): high-signal context examples and verification-environment setup, not Flounder's core limit.
+- [Reports](reports/README.md): public-safe incident investigations and vulnerability reports produced with Flounder.
 
 ## Contributing
 

@@ -7,7 +7,7 @@
 import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { runAudit } from "../agent/audit.js";
 import { runConfirm } from "../agent/confirm.js";
 import { runReport } from "../agent/report.js";
@@ -17,11 +17,13 @@ import { deriveScopeNote } from "../scope-note.js";
 import { specToConfig, type LaunchSpec, type ReportFindingSpec } from "./run-manager.js";
 import { toScopeRow, toFindingRow, configSnapshot, type RunTracker, type ConfirmDecisionInput, type FindingReportInput } from "../db/record.js";
 import { defaultConfig, defaultOutputDir, defaultWorkspaceDir, sandboxExecutionOptions, type AuditorConfig } from "../config.js";
-import type { Coverage, RunKind, RunStatus } from "../db/store.js";
+import type { Coverage, DiscoveryBacklogInput, FindingPhaseAttemptInput, RunKind, RunStatus } from "../db/store.js";
 import type { AgentFinding, AuditScope } from "../agent/tools.js";
+import type { RunHealth } from "../agent/discovery-artifacts.js";
 import { assertProviderAuthenticated, knownRuntimeProviders, providerAuthStatus } from "../provider-auth.js";
 import { buildDefaultSandboxImage, checkSandboxReadiness, DEFAULT_SANDBOX_IMAGE, isDefaultSandboxImage, type SandboxImageBuildResult, type SandboxReadiness } from "../security/sandbox.js";
 import { RunLogger } from "../trace/logger.js";
+import { positiveIntegerId } from "../util/ids.js";
 
 export interface DaemonOptions {
   server: string;
@@ -32,7 +34,7 @@ export interface DaemonOptions {
   workspace?: string; // root under which project dirs live; materials resolve here (default ~/.flounder/workspace)
 }
 
-type Activity = { kind: string; delta?: string; tool?: string; step?: number };
+type Activity = { kind: string; delta?: string; tool?: string; step?: number; streamId?: string };
 
 let defaultSandboxBuild: Promise<SandboxImageBuildResult> | undefined;
 
@@ -53,6 +55,12 @@ export async function runDaemon(opts: DaemonOptions): Promise<void> {
   const reg = await fetch(base + "/api/daemon/register", { method: "POST", headers, body: JSON.stringify({ name: opts.name ?? "daemon", capabilities: await daemonCapabilities(), workspace }) }).catch(() => null);
   if (!reg || !reg.ok) throw new Error(`daemon: could not register with ${base} (status ${reg ? reg.status : "no response"}) — check --server and --token`);
   console.log(`[flounder daemon] connected to ${base}  (out=${out}, workspace=${workspace}, concurrency=${maxConcurrent})`);
+  // Historical terminal artifacts live on the executor, not the control plane.
+  // Replay them best-effort after registration; failures never block new work and
+  // remain eligible for the next daemon restart.
+  void replayTerminalVerifyArtifacts(base, headers, out).then((count) => {
+    if (count > 0) console.log(`[flounder daemon] reconciled ${count} terminal verify artifact${count === 1 ? "" : "s"}`);
+  }).catch(() => {});
   setInterval(heartbeat, 10_000);
   heartbeat();
 
@@ -72,10 +80,12 @@ export async function runDaemon(opts: DaemonOptions): Promise<void> {
     heartbeat();
     const spec: LaunchSpec = { ...job.spec, out };
     let tracker: RemoteTracker | undefined;
+    const trackers: RemoteTracker[] = [];
     let phaseStarts = 0;
     const sink = activitySink(() => tracker);
     const makeTracker = (cfg: AuditorConfig, runDir: string, kind: RunKind): RunTracker => {
-      tracker = new RemoteTracker(base, headers, { jobId: job.id, project: cfg.targetName, kind, runDir, provider: cfg.provider, model: cfg.auditModel, thinking: cfg.thinkingLevel, budgets: cfg.auditVerify ? { ...configSnapshot(cfg), verify: true, ...(cfg.auditVerifyFromStart ? { verifyFromStart: true } : {}) } : configSnapshot(cfg), additional: phaseStarts > 0 });
+      tracker = new RemoteTracker(base, headers, { jobId: job.id, project: job.project, kind, runDir, provider: cfg.provider, model: cfg.auditModel, thinking: cfg.thinkingLevel, budgets: cfg.auditVerify ? { ...configSnapshot(cfg), verify: true, ...(cfg.auditVerifyFromStart ? { verifyFromStart: true } : {}) } : configSnapshot(cfg), additional: phaseStarts > 0 });
+      trackers.push(tracker);
       phaseStarts += 1;
       return tracker;
     };
@@ -91,14 +101,14 @@ export async function runDaemon(opts: DaemonOptions): Promise<void> {
       }
       if (!spec.mockLlm) await assertProviderAuthenticated(cfg.provider);
       if (spec.verb === "run" && spec.pipeline) {
-        await runPipelineJob(base, headers, spec, { out, workspace, signal: abort.signal, makeTracker, flushTracker, onActivity: sink.push, mockLlm: spec.mockLlm === true, runScopeTargets, jobId: job.id });
+        await runPipelineJob(base, headers, spec, { out, workspace, signal: abort.signal, makeTracker, flushTracker, onActivity: sink.push, mockLlm: spec.mockLlm === true, runScopeTargets, jobId: job.id, trackingProject: job.project });
       } else if (spec.verb === "report") {
         if (!spec.reportFindings?.length) throw new Error("report requires reproduced finding inputs");
         await runReport(cfg, { findings: spec.reportFindings, signal: abort.signal, makeTracker, onActivity: sink.push, ...(spec.maxSteps !== undefined ? { maxSteps: spec.maxSteps } : {}) });
       } else if (spec.verb === "confirm") {
         if (!spec.inputRunDir) throw new Error("confirm requires inputRunDir");
         await requireSandboxReady(cfg, "confirm", { makeTracker, flushTracker, onActivity: sink.push });
-        await runConfirm(cfg, { inputRunDir: spec.inputRunDir, signal: abort.signal, makeTracker, onActivity: sink.push, ...(spec.inputRunDirs ? { inputRunDirs: spec.inputRunDirs } : {}), ...(spec.confirmKeys ? { confirmKeys: spec.confirmKeys } : {}), ...(spec.confirmSettledRows ? { settledDecisions: spec.confirmSettledRows } : {}), ...(spec.maxSteps !== undefined ? { maxSteps: spec.maxSteps } : {}), ...(spec.fresh ? { fresh: true } : {}) });
+        await runConfirm(cfg, { inputRunDir: spec.inputRunDir, signal: abort.signal, makeTracker, onActivity: sink.push, ...(spec.inputRunDirs ? { inputRunDirs: spec.inputRunDirs } : {}), ...(spec.confirmKeys ? { confirmKeys: spec.confirmKeys } : {}), ...(spec.confirmFindings ? { inlineFindings: spec.confirmFindings } : {}), ...(spec.confirmSettledRows ? { settledDecisions: spec.confirmSettledRows } : {}), ...(spec.maxSteps !== undefined ? { maxSteps: spec.maxSteps } : {}), ...(spec.fresh ? { fresh: true } : {}) });
       } else if (spec.verb === "prepare") {
         if (!spec.clue) throw new Error("prepare requires a clue (tx / address / project / link)");
         await runPrepare(cfg, {
@@ -123,7 +133,7 @@ export async function runDaemon(opts: DaemonOptions): Promise<void> {
         await requireSandboxReady(cfg, spec.verb, { makeTracker, flushTracker, onActivity: sink.push });
         try {
           await runAudit(cfg, {
-            kind: spec.verb,
+            kind: cfg.auditVerify ? "verify" : spec.verb,
             signal: abort.signal,
             makeTracker,
             onActivity: sink.push,
@@ -135,7 +145,11 @@ export async function runDaemon(opts: DaemonOptions): Promise<void> {
         }
       }
       await flushTracker();
-      await post(base, headers, `/api/daemon/jobs/${job.id}/status`, { status: abort.signal.aborted ? "canceled" : "done" });
+      const terminal = daemonJobTerminalState(trackers.map((item) => item.terminalState()), abort.signal.aborted);
+      await post(base, headers, `/api/daemon/jobs/${job.id}/status`, {
+        status: terminal,
+        ...(terminal === "error" ? { error: trackers.find((item) => item.terminalState() === "error")?.errorSummary() ?? "one or more run phases finished with status error" } : {}),
+      });
     } catch (error) {
       await flushTracker();
       await post(base, headers, `/api/daemon/jobs/${job.id}/status`, { status: abort.signal.aborted ? "canceled" : "error", error: error instanceof Error ? error.message.slice(0, 500) : String(error) });
@@ -199,9 +213,13 @@ async function runPipelineJob(
     mockLlm: boolean;
     runScopeTargets: Map<number, number>;
     jobId: number;
+    trackingProject: string;
   },
 ): Promise<void> {
-  let staged = spec.buildRoot ?? spec.sourcePaths[0];
+  const resolvedMaterials = resolvePipelineMaterials(spec, ctx.out, ctx.workspace);
+  let stagedSourcePaths = resolvedMaterials.sourcePaths;
+  let stagedBuildRoot = resolvedMaterials.buildRoot;
+  const stagedCorpusPaths = resolvedMaterials.corpusPaths;
   let derivedScopeNote: string | undefined;
   if (spec.clue) {
     const prepareCfg = specToConfig({ ...spec, verb: "prepare", sourcePaths: [], buildRoot: undefined, corpusPaths: [] }, ctx.out, ctx.workspace);
@@ -216,39 +234,44 @@ async function runPipelineJob(
       ...(spec.maxSteps !== undefined ? { maxSteps: spec.maxSteps } : {}),
     });
     await ctx.flushTracker();
-    staged = prepare.workspaceDir;
+    stagedSourcePaths = [prepare.workspaceDir];
+    stagedBuildRoot = prepare.workspaceDir;
     derivedScopeNote = deriveScopeNote(prepare.manifest);
   }
-  if (!staged) throw new Error("pipeline run needs a prepared workspace or a clue for Prepare");
+  if (stagedSourcePaths.length === 0 || !stagedBuildRoot) throw new Error("pipeline run needs a prepared workspace or a clue for Prepare");
   const scopeNote = [spec.scopeNote, derivedScopeNote].filter((entry): entry is string => Boolean(entry && entry.trim())).join("\n\n") || undefined;
   const auditSpec: LaunchSpec = {
     ...spec,
     verb: "run",
     dir: undefined,
-    sourcePaths: [staged],
-    buildRoot: staged,
+    sourcePaths: stagedSourcePaths,
+    buildRoot: stagedBuildRoot,
+    corpusPaths: stagedCorpusPaths,
     ...(scopeNote ? { scopeNote } : {}),
   };
-  const auditCfg = specToConfig(auditSpec, ctx.out, ctx.workspace);
-  await requireSandboxReady(auditCfg, "run", ctx);
-  await runAudit(auditCfg, {
-    kind: "run",
-    signal: ctx.signal,
-    makeTracker: ctx.makeTracker,
-    onActivity: ctx.onActivity,
-    control: { getRunScopesTarget: () => ctx.runScopeTargets.get(ctx.jobId) },
-    ...(ctx.mockLlm ? { llm: new MockAuditLlmClient() } : {}),
-  });
-  await ctx.flushTracker();
+  if (spec.pipelineStart !== "settle") {
+    const auditCfg = specToConfig(auditSpec, ctx.out, ctx.workspace);
+    await requireSandboxReady(auditCfg, "run", ctx);
+    await runAudit(auditCfg, {
+      kind: "run",
+      signal: ctx.signal,
+      makeTracker: ctx.makeTracker,
+      onActivity: ctx.onActivity,
+      control: { getRunScopesTarget: () => ctx.runScopeTargets.get(ctx.jobId) },
+      ...(ctx.mockLlm ? { llm: new MockAuditLlmClient() } : {}),
+    });
+    await ctx.flushTracker();
+  }
 
-  const verify = await pipelineWorklist(base, headers, spec.target, "verify", spec.verifyFromStart === true);
+  const verify = await pipelineWorklist(base, headers, ctx.jobId, ctx.trackingProject, "verify", spec.verifyFromStart === true);
   if (verify.verifyFindings.length > 0) {
     const verifySpec: LaunchSpec = {
       ...spec,
       verb: "audit",
       dir: undefined,
-      sourcePaths: [staged],
-      buildRoot: staged,
+      sourcePaths: stagedSourcePaths,
+      buildRoot: stagedBuildRoot,
+      corpusPaths: stagedCorpusPaths,
       verifyFindings: verify.verifyFindings,
     };
     const verifyCfg = specToConfig(verifySpec, ctx.out, ctx.workspace);
@@ -259,7 +282,7 @@ async function runPipelineJob(
       verifyCfg.auditVerify = vf;
       await requireSandboxReady(verifyCfg, "audit", ctx);
       await runAudit(verifyCfg, {
-        kind: "audit",
+        kind: "verify",
         signal: ctx.signal,
         makeTracker: ctx.makeTracker,
         onActivity: ctx.onActivity,
@@ -271,43 +294,49 @@ async function runPipelineJob(
     await ctx.flushTracker();
   }
 
-  const confirm = await pipelineWorklist(base, headers, spec.target, "confirm");
-  if (confirm.inputRunDir && confirm.inputRunDirs.length > 0 && confirm.confirmKeys.length > 0) {
-    const confirmSpec: LaunchSpec = {
-      ...spec,
-      verb: "confirm",
-      dir: undefined,
-      sourcePaths: [staged],
-      buildRoot: staged,
-      inputRunDir: confirm.inputRunDir,
-      inputRunDirs: confirm.inputRunDirs,
-      confirmKeys: confirm.confirmKeys,
-      ...(confirm.confirmSettledRows ? { confirmSettledRows: confirm.confirmSettledRows } : {}),
-    };
-    const confirmCfg = specToConfig(confirmSpec, ctx.out, ctx.workspace);
-    await requireSandboxReady(confirmCfg, "confirm", ctx);
-    await runConfirm(confirmCfg, {
-      inputRunDir: confirmSpec.inputRunDir!,
-      signal: ctx.signal,
-      makeTracker: ctx.makeTracker,
-      onActivity: ctx.onActivity,
-      ...(confirmSpec.inputRunDirs ? { inputRunDirs: confirmSpec.inputRunDirs } : {}),
-      ...(confirmSpec.confirmKeys ? { confirmKeys: confirmSpec.confirmKeys } : {}),
-      ...(confirmSpec.confirmSettledRows ? { settledDecisions: confirmSpec.confirmSettledRows } : {}),
-      ...(spec.maxSteps !== undefined ? { maxSteps: spec.maxSteps } : {}),
-      ...(spec.fresh ? { fresh: true } : {}),
-    });
-    await ctx.flushTracker();
-  }
+  await drainPipelineConfirmWork(
+    () => pipelineWorklist(base, headers, ctx.jobId, ctx.trackingProject, "confirm"),
+    async (confirm) => {
+      const confirmSpec: LaunchSpec = {
+        ...spec,
+        verb: "confirm",
+        dir: undefined,
+        sourcePaths: stagedSourcePaths,
+        buildRoot: stagedBuildRoot,
+        corpusPaths: stagedCorpusPaths,
+        inputRunDir: confirm.inputRunDir!,
+        inputRunDirs: confirm.inputRunDirs,
+        confirmKeys: confirm.confirmKeys,
+        ...(confirm.confirmFindings ? { confirmFindings: confirm.confirmFindings } : {}),
+        ...(confirm.confirmSettledRows ? { confirmSettledRows: confirm.confirmSettledRows } : {}),
+      };
+      const confirmCfg = specToConfig(confirmSpec, ctx.out, ctx.workspace);
+      await requireSandboxReady(confirmCfg, "confirm", ctx);
+      await runConfirm(confirmCfg, {
+        inputRunDir: confirmSpec.inputRunDir!,
+        signal: ctx.signal,
+        makeTracker: ctx.makeTracker,
+        onActivity: ctx.onActivity,
+        ...(confirmSpec.inputRunDirs ? { inputRunDirs: confirmSpec.inputRunDirs } : {}),
+        ...(confirmSpec.confirmKeys ? { confirmKeys: confirmSpec.confirmKeys } : {}),
+        ...(confirmSpec.confirmFindings ? { inlineFindings: confirmSpec.confirmFindings } : {}),
+        ...(confirmSpec.confirmSettledRows ? { settledDecisions: confirmSpec.confirmSettledRows } : {}),
+        ...(spec.maxSteps !== undefined ? { maxSteps: spec.maxSteps } : {}),
+        ...(spec.fresh ? { fresh: true } : {}),
+      });
+      await ctx.flushTracker();
+    },
+  );
 
-  const report = await pipelineWorklist(base, headers, spec.target, "report");
+  const report = await pipelineWorklist(base, headers, ctx.jobId, ctx.trackingProject, "report");
   if (report.reportFindings.length > 0) {
     const reportSpec: LaunchSpec = {
       ...spec,
       verb: "report",
       dir: undefined,
-      sourcePaths: [staged],
-      buildRoot: staged,
+      sourcePaths: stagedSourcePaths,
+      buildRoot: stagedBuildRoot,
+      corpusPaths: stagedCorpusPaths,
       reportFindings: report.reportFindings,
     };
     const reportCfg = specToConfig(reportSpec, ctx.out, ctx.workspace);
@@ -321,24 +350,72 @@ async function runPipelineJob(
   }
 }
 
-async function pipelineWorklist(base: string, headers: Record<string, string>, project: string, phase: "verify" | "confirm" | "report", verifyFromStart = false): Promise<{
+/** Resolve project-relative materials before the pipeline drops `dir` for its
+ * phase-local specs. Without this boundary, a stored buildRoot of "." became
+ * the daemon process cwd and could stage an unrelated repository. Preserve the
+ * authorized source roots separately from the (possibly broader) build root. */
+export function resolvePipelineMaterials(spec: LaunchSpec, out: string, workspace: string): {
+  sourcePaths: string[];
+  buildRoot?: string;
+  corpusPaths: string[];
+} {
+  const cfg = specToConfig(spec, out, workspace);
+  const sourcePaths = [...cfg.sourcePaths];
+  const buildRoot = cfg.buildRoot ?? sourcePaths[0];
+  return {
+    sourcePaths,
+    ...(buildRoot ? { buildRoot } : {}),
+    corpusPaths: [...cfg.corpusPaths],
+  };
+}
+
+type PipelineWorklist = {
   verifyFindings: unknown[];
   inputRunDir?: string;
   inputRunDirs: string[];
   confirmKeys: string[];
+  confirmFindings?: Array<Record<string, unknown>>;
   confirmSettledRows?: LaunchSpec["confirmSettledRows"];
   reportFindings: ReportFindingSpec[];
-}> {
+};
+
+export async function drainPipelineConfirmWork(
+  loadWork: () => Promise<PipelineWorklist>,
+  runWork: (work: PipelineWorklist) => Promise<void>,
+): Promise<number> {
+  const seen = new Set<string>();
+  let runs = 0;
+  for (;;) {
+    const work = await loadWork();
+    if (!hasPipelineConfirmWork(work)) return runs;
+    const fingerprint = pipelineConfirmWorkFingerprint(work);
+    if (seen.has(fingerprint)) return runs;
+    seen.add(fingerprint);
+    await runWork(work);
+    runs += 1;
+  }
+}
+
+function hasPipelineConfirmWork(work: PipelineWorklist): boolean {
+  return Boolean(work.inputRunDir && work.inputRunDirs.length > 0 && work.confirmKeys.length > 0);
+}
+
+function pipelineConfirmWorkFingerprint(work: PipelineWorklist): string {
+  return [...new Set(work.confirmKeys.map((key) => key.trim()).filter(Boolean))].sort().join("\n");
+}
+
+async function pipelineWorklist(base: string, headers: Record<string, string>, jobId: number, project: string, phase: "verify" | "confirm" | "report", verifyFromStart = false): Promise<PipelineWorklist> {
   const res = await fetch(base + "/api/daemon/pipeline-worklist", {
     method: "POST",
     headers,
-    body: JSON.stringify({ project, phase, ...(phase === "verify" && verifyFromStart ? { verifyFromStart: true } : {}) }),
+    body: JSON.stringify({ jobId, project, phase, ...(phase === "verify" && verifyFromStart ? { verifyFromStart: true } : {}) }),
   });
   if (!res.ok) throw new Error(`pipeline ${phase} worklist failed (${res.status})`);
   const body = (await res.json().catch(() => ({}))) as {
     inputRunDir?: unknown;
     inputRunDirs?: unknown;
     confirmKeys?: unknown;
+    confirmFindings?: unknown;
     confirmSettledRows?: unknown;
     reportFindings?: unknown;
     verifyFindings?: unknown;
@@ -351,6 +428,7 @@ async function pipelineWorklist(base: string, headers: Record<string, string>, p
     ...(inputRunDir ? { inputRunDir } : {}),
     inputRunDirs: strings(body.inputRunDirs),
     confirmKeys: strings(body.confirmKeys),
+    ...(Array.isArray(body.confirmFindings) ? { confirmFindings: body.confirmFindings.filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object" && !Array.isArray(entry)) } : {}),
     ...(settledRows && settledRows.length > 0 ? { confirmSettledRows: settledRows } : {}),
     reportFindings: Array.isArray(body.reportFindings) ? body.reportFindings as ReportFindingSpec[] : [],
   };
@@ -392,6 +470,7 @@ async function requireSandboxReady(
 function shouldAutoBuildDefaultSandbox(readiness: SandboxReadiness): boolean {
   return !readiness.ok
     && readiness.backend !== "host"
+    && readiness.backend !== "apple-container"
     && !readiness.allowHostFallback
     && isDefaultSandboxImage(readiness.image);
 }
@@ -488,6 +567,8 @@ class RemoteTracker implements RunTracker {
   private chain: Promise<void>;
   private runId: number | undefined;
   private readonly targetName: string;
+  private finalStatus: RunStatus | undefined;
+  private latestHealth: RunHealth | undefined;
 
   constructor(
     private readonly base: string,
@@ -520,14 +601,27 @@ class RemoteTracker implements RunTracker {
     this.enqueue(() => (this.runId ? this.req("PATCH", `/api/daemon/runs/${this.runId}`, { runScopes: { done, target } }) : Promise.resolve()));
   }
 
+  materialFingerprint(fingerprint: string): void {
+    this.enqueue(() => (this.runId ? this.req("PATCH", `/api/daemon/runs/${this.runId}`, { materialFingerprint: fingerprint }) : Promise.resolve()));
+  }
+
   findings(findings: AgentFinding[], runDir: string, reason?: string): void {
-    const reportable = findings.filter((finding) => finding.severity !== "info" && finding.confirmationStatus !== "discharged");
-    if (reportable.length === 0) return;
-    this.enqueue(() => (this.runId ? this.req("PATCH", `/api/daemon/runs/${this.runId}`, { findings: reportable.map((f) => toFindingRow(f, runDir, this.targetName)), reason }) : Promise.resolve()));
+    const rows = remoteFindingRows(findings, runDir, this.targetName);
+    if (rows.length === 0) return;
+    this.enqueue(() => (this.runId ? this.req("PATCH", `/api/daemon/runs/${this.runId}`, { findings: rows, reason }) : Promise.resolve()));
   }
 
   stage(name: string, info: Record<string, unknown>): void {
     this.enqueue(() => (this.runId ? this.req("PATCH", `/api/daemon/runs/${this.runId}`, { stage: { name, info } }) : Promise.resolve()));
+  }
+
+  health(health: RunHealth): void {
+    this.latestHealth = health;
+    this.enqueue(() => (this.runId ? this.req("PATCH", `/api/daemon/runs/${this.runId}`, { health }) : Promise.resolve()));
+  }
+
+  backlog(rows: DiscoveryBacklogInput[]): void {
+    this.enqueue(() => (this.runId ? this.req("PATCH", `/api/daemon/runs/${this.runId}`, { backlog: rows }) : Promise.resolve()));
   }
 
   confirmDecisions(rows: ConfirmDecisionInput[], decisionPath?: string): void {
@@ -540,8 +634,23 @@ class RemoteTracker implements RunTracker {
     this.enqueue(() => (this.runId ? this.req("PATCH", `/api/daemon/runs/${this.runId}`, { findingReports: reports }) : Promise.resolve()));
   }
 
+  phaseAttempt(input: FindingPhaseAttemptInput): void {
+    this.enqueue(() => (this.runId ? this.req("PATCH", `/api/daemon/runs/${this.runId}`, { phaseAttempt: input }) : Promise.resolve()));
+  }
+
   finish(status: RunStatus, coverage?: Coverage, findingsTotal?: number): void {
+    this.finalStatus = status;
     this.enqueue(() => (this.runId ? this.req("PATCH", `/api/daemon/runs/${this.runId}`, { finish: { status, coverage, findingsTotal } }) : Promise.resolve()));
+  }
+
+  terminalState(): RunStatus | undefined {
+    return this.finalStatus;
+  }
+
+  errorSummary(): string | undefined {
+    if (this.finalStatus !== "error") return undefined;
+    const reason = this.latestHealth?.reasons.find((entry) => entry.trim());
+    return reason?.slice(0, 500) || "run phase finished with status error";
   }
 
   activity(events: Activity[]): void {
@@ -551,6 +660,155 @@ class RemoteTracker implements RunTracker {
   flush(): Promise<void> {
     return this.chain;
   }
+}
+
+export function daemonJobTerminalState(
+  runStatuses: Array<RunStatus | undefined>,
+  aborted = false,
+): "done" | "error" | "canceled" {
+  if (aborted || runStatuses.includes("killed")) return "canceled";
+  if (runStatuses.includes("error")) return "error";
+  return "done";
+}
+
+export function remoteFindingRows(findings: AgentFinding[], runDir: string, targetName: string): ReturnType<typeof toFindingRow>[] {
+  return findings
+    .map((finding) => toFindingRow(finding, runDir, targetName))
+    .filter((row) => row.status !== "discharged"
+      && (row.severity !== "info" || (row.status === "refuted" && row.originId !== undefined)));
+}
+
+const VERIFY_ARTIFACT_NAMES = ["audit_hypotheses.json", "audit_findings.json"] as const;
+const MAX_VERIFY_ARTIFACT_FILE_BYTES = 4 * 1024 * 1024;
+const MAX_VERIFY_ARTIFACT_REPLAY_ROWS = 1_000;
+const MAX_VERIFY_ARTIFACT_REPLAY_PAGES = 20;
+
+/** Read only the two verdict artifacts, only below this daemon's configured output
+ * root, and return negative verdicts stripped to the bounded protocol fields. */
+export async function loadVerifyArtifactReplay(outRoot: string, runDir: string): Promise<Array<Record<string, unknown>>> {
+  const root = await realpath(path.resolve(outRoot));
+  const run = await realpath(path.resolve(runDir));
+  if (!pathIsWithin(root, run)) throw new Error("verify artifact run directory escapes the daemon output root");
+
+  const all: Array<Record<string, unknown>> = [];
+  for (const name of VERIFY_ARTIFACT_NAMES) {
+    const candidate = path.join(run, name);
+    let resolved: string;
+    try {
+      resolved = await realpath(candidate);
+    } catch (error) {
+      if (isMissingFile(error)) continue;
+      throw error;
+    }
+    if (!pathIsWithin(run, resolved)) throw new Error("verify artifact file escapes its run directory");
+    const fileStat = await stat(resolved);
+    if (!fileStat.isFile() || fileStat.size > MAX_VERIFY_ARTIFACT_FILE_BYTES) throw new Error("verify artifact file is not a bounded regular file");
+    const parsed = JSON.parse(await readFile(resolved, "utf8")) as unknown;
+    all.push(...findingArtifactRows(parsed));
+    if (all.length > MAX_VERIFY_ARTIFACT_REPLAY_ROWS) throw new Error("too many verify artifact rows");
+  }
+
+  const seen = new Set<number>();
+  const negative: Array<Record<string, unknown>> = [];
+  for (const artifact of all) {
+    const originId = positiveIntegerId(artifact.originId ?? artifact.origin_id);
+    if (originId === undefined) continue;
+    // Multiple verdicts for one origin in one run are ambiguous even if only one is
+    // negative. Do not let transport ordering choose a winner.
+    if (seen.has(originId)) throw new Error("conflicting verify artifact rows for one origin");
+    seen.add(originId);
+    const title = typeof artifact.title === "string" ? artifact.title : "";
+    const status = typeof (artifact.confirmationStatus ?? artifact.status) === "string"
+      ? String(artifact.confirmationStatus ?? artifact.status)
+      : "";
+    if (!/^\s*REFUTED\s*:/i.test(title) && status !== "suspected") continue;
+    negative.push(sanitizeVerifyArtifactRow(artifact, originId));
+  }
+  return negative;
+}
+
+/** Best-effort paged replay. A failed/missing/corrupt run remains unversioned on
+ * the server and will be retried the next time this daemon registers. */
+export async function replayTerminalVerifyArtifacts(
+  base: string,
+  headers: Record<string, string>,
+  outRoot: string,
+): Promise<number> {
+  let beforeId: number | undefined;
+  let reconciled = 0;
+  for (let page = 0; page < MAX_VERIFY_ARTIFACT_REPLAY_PAGES; page += 1) {
+    const response = await fetch(base + "/api/daemon/reconciliation/worklist", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ ...(beforeId ? { beforeId } : {}), limit: 50 }),
+    }).catch(() => null);
+    if (!response?.ok) return reconciled;
+    const body = (await response.json().catch(() => null)) as { version?: unknown; runs?: unknown; nextBeforeId?: unknown } | null;
+    if (!body || !Number.isInteger(body.version) || !Array.isArray(body.runs)) return reconciled;
+    const version = Number(body.version);
+    for (const entry of body.runs) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+      const row = entry as Record<string, unknown>;
+      const runId = positiveIntegerId(row.runId);
+      if (runId === undefined || typeof row.runDir !== "string" || !row.runDir) continue;
+      let artifacts: Array<Record<string, unknown>>;
+      try {
+        artifacts = await loadVerifyArtifactReplay(outRoot, row.runDir);
+      } catch {
+        continue;
+      }
+      const replay = await fetch(base + `/api/daemon/reconciliation/runs/${runId}`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ version, artifacts }),
+      }).catch(() => null);
+      if (replay?.ok) reconciled += 1;
+    }
+    if (body.runs.length === 0) return reconciled;
+    const next = positiveIntegerId(body.nextBeforeId);
+    if (next === undefined || next === beforeId) return reconciled;
+    beforeId = next;
+  }
+  return reconciled;
+}
+
+function findingArtifactRows(value: unknown): Array<Record<string, unknown>> {
+  if (Array.isArray(value)) return value.filter(isObjectRecord);
+  if (!isObjectRecord(value)) throw new Error("verify artifact must be an array or wrapper object");
+  for (const key of ["findings", "hypotheses", "items"]) {
+    const rows = value[key];
+    if (Array.isArray(rows)) return rows.filter(isObjectRecord);
+  }
+  throw new Error("verify artifact wrapper has no finding rows");
+}
+
+function sanitizeVerifyArtifactRow(artifact: Record<string, unknown>, originId: number): Record<string, unknown> {
+  const allowedText = ["title", "location", "severity", "scopeId", "scope_id", "description", "evidence", "exploitSketch", "exploit_sketch", "fix", "confirmationStatus", "status", "refutationStatus", "refutation_status", "refutationReason", "refutation_reason"] as const;
+  const row: Record<string, unknown> = { originId };
+  for (const key of allowedText) {
+    const value = artifact[key];
+    if (value === undefined) continue;
+    if (typeof value !== "string" || value.length > 1_000_000) throw new Error("invalid verify artifact field");
+    row[key] = value;
+  }
+  if (artifact.confidence !== undefined) {
+    if (typeof artifact.confidence !== "number" || !Number.isFinite(artifact.confidence)) throw new Error("invalid verify artifact confidence");
+    row.confidence = artifact.confidence;
+  }
+  return row;
+}
+
+function pathIsWithin(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith(".." + path.sep) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isMissingFile(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === "ENOENT");
 }
 
 // Batches token-level activity (~200ms) so the live stream stays token-granular without a

@@ -2,10 +2,11 @@
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { defaultConfig, defaultOutputDir, defaultWorkspaceDir, normalizeProjectContext, normalizeRoleModels, type AuditorConfig } from "./config.js";
 import { CLI_CONFIG_KEYS, configFilePath, getCliConfigValue, isCliConfigKey, loadCliConfig, setCliConfigValue, unsetCliConfigValue, type CliConfigKey } from "./config-file.js";
-import { launchProjectRunViaApi, launchViaApi, ran, resolveServer, fetchArtifact } from "./cli-client.js";
+import { launchProjectRunViaApi, launchViaApi, ran, resolveServer, fetchArtifact, requestControlPlane } from "./cli-client.js";
 import { buildProjectContinueBody } from "./cli-project.js";
 import { deriveScopeNote } from "./scope-note.js";
 import type { LaunchSpec } from "./server/run-manager.js";
@@ -13,7 +14,9 @@ import { importRunToProjectHistory, projectHistoryManifestPath } from "./trace/h
 import { MetadataStore } from "./db/store.js";
 import { startUiServer } from "./server/app.js";
 import { runDaemon } from "./server/daemon.js";
+import { isSandboxBackend } from "./security/sandbox.js";
 import { knownRuntimeProviders, loginProvider, printProviderCheck, providerAuthStatus } from "./provider-auth.js";
+import { absolutizeRunGroupManifest, normalizeRunGroupManifest } from "./evaluation/contracts.js";
 
 async function main(argv: string[]): Promise<void> {
   const [cmd, ...rest] = argv;
@@ -28,12 +31,22 @@ async function main(argv: string[]): Promise<void> {
   }
 
   if (cmd === "server") {
-    runServerCommand(rest);
+    await runServerCommand(rest);
     return;
   }
 
   if (cmd === "config") {
     runConfigCommand(rest);
+    return;
+  }
+
+  if (cmd === "group") {
+    await runGroupCommand(rest);
+    return;
+  }
+
+  if (cmd === "experiment") {
+    await runHarnessExperimentCommand(rest);
     return;
   }
 
@@ -50,7 +63,7 @@ async function main(argv: string[]): Promise<void> {
     const host = readFlag(rest, "--host") ?? "127.0.0.1";
     const out = resolveOut(rest);
     const workspace = readFlag(rest, "--workspace") ?? defaultWorkspaceDir(); // where the co-located daemon finds project dirs
-    const server = startUiServer({ out, port, host });
+    const server = startUiServer({ out, port, host, maintainerMode: rest.includes("--maintainer") });
     if (rest.includes("--no-daemon")) {
       console.log("[flounder ui] --no-daemon: no executor started. Connect one with `flounder daemon start --server <url> --token <token>`.");
     } else {
@@ -243,7 +256,7 @@ async function parseConfig(args: string[]): Promise<{ cfg: AuditorConfig }> {
   cfg.maxTokens = readIntFlag(args, "--max-tokens") ?? cfg.maxTokens;
   cfg.reproductionCommandTimeoutMs = readIntFlag(args, "--repro-timeout-ms") ?? cfg.reproductionCommandTimeoutMs;
   const sandboxBackend = readFlag(args, "--sandbox-backend");
-  if (sandboxBackend === "auto" || sandboxBackend === "oci" || sandboxBackend === "host") cfg.sandboxBackend = sandboxBackend;
+  if (isSandboxBackend(sandboxBackend)) cfg.sandboxBackend = sandboxBackend;
   cfg.sandboxImage = readFlag(args, "--sandbox-image") ?? cfg.sandboxImage;
   if (args.includes("--allow-host-execution")) cfg.sandboxAllowHostFallback = true;
   const prepareNetwork = readFlag(args, "--prepare-network");
@@ -266,10 +279,18 @@ async function parseConfig(args: string[]): Promise<{ cfg: AuditorConfig }> {
   // knobs (materials, models, budgets, deep-phase parameters).
   cfg.auditMaxScopes = readIntFlag(args, "--max-scopes") ?? cfg.auditMaxScopes;
   cfg.auditMapSteps = readIntFlag(args, "--map-steps") ?? cfg.auditMapSteps;
+  cfg.auditMapSamples = readIntFlag(args, "--map-samples") ?? cfg.auditMapSamples;
   cfg.auditDigSteps = readIntFlag(args, "--dig-steps") ?? cfg.auditDigSteps;
   cfg.auditDigSamples = readIntFlag(args, "--dig-samples") ?? cfg.auditDigSamples;
+  cfg.auditDigMaxSamples = readIntFlag(args, "--dig-max-samples") ?? cfg.auditDigMaxSamples;
+  if (cfg.auditDigMaxSamples < cfg.auditDigSamples) cfg.auditDigMaxSamples = cfg.auditDigSamples;
+  if (args.includes("--no-adaptive-dig")) cfg.auditAdaptiveDig = false;
+  if (args.includes("--eager-prepare")) cfg.auditEagerPrepare = true;
   cfg.auditDigConcurrency = readIntFlag(args, "--dig-concurrency") ?? cfg.auditDigConcurrency;
+  cfg.auditVerifyConcurrency = readIntFlag(args, "--verify-concurrency") ?? cfg.auditVerifyConcurrency;
   if (args.includes("--remap")) cfg.auditRemap = true;
+  if (args.includes("--append-map") || args.includes("--expand-map")) cfg.auditAppendMap = true;
+  cfg.auditAppendMapSeedPaths = readMultiFlag(args, "--append-map-seed");
   if (args.includes("--dry-run")) cfg.dryRun = true;
   const thinking = readFlag(args, "--thinking");
   if (thinking === "off" || thinking === "minimal" || thinking === "low" || thinking === "medium" || thinking === "high" || thinking === "xhigh") {
@@ -297,7 +318,7 @@ function applyConfigOverrides(cfg: AuditorConfig, raw: Record<string, unknown>):
     cfg.reproductionCommandTimeoutMs = Math.max(1000, Math.floor(rawReproductionCommandTimeoutMs));
   }
   const rawSandboxBackend = raw.sandboxBackend ?? raw.sandbox_backend;
-  if (rawSandboxBackend === "auto" || rawSandboxBackend === "oci" || rawSandboxBackend === "host") cfg.sandboxBackend = rawSandboxBackend;
+  if (isSandboxBackend(rawSandboxBackend)) cfg.sandboxBackend = rawSandboxBackend;
   const rawSandboxImage = raw.sandboxImage ?? raw.sandbox_image;
   if (typeof rawSandboxImage === "string" && rawSandboxImage.trim()) cfg.sandboxImage = rawSandboxImage.trim();
   const rawAllowHost = raw.sandboxAllowHostFallback ?? raw.sandbox_allow_host_fallback ?? raw.allowHostExecution ?? raw.allow_host_execution;
@@ -333,12 +354,22 @@ function applyConfigOverrides(cfg: AuditorConfig, raw: Record<string, unknown>):
   if (typeof rawMaxScopes === "number" && Number.isFinite(rawMaxScopes)) cfg.auditMaxScopes = Math.max(1, Math.floor(rawMaxScopes));
   const rawMapSteps = raw.auditMapSteps ?? raw.audit_map_steps;
   if (typeof rawMapSteps === "number" && Number.isFinite(rawMapSteps)) cfg.auditMapSteps = Math.max(1, Math.floor(rawMapSteps));
+  const rawMapSamples = raw.auditMapSamples ?? raw.audit_map_samples;
+  if (typeof rawMapSamples === "number" && Number.isFinite(rawMapSamples)) cfg.auditMapSamples = Math.max(1, Math.floor(rawMapSamples));
   const rawDigSteps = raw.auditDigSteps ?? raw.audit_dig_steps;
   if (typeof rawDigSteps === "number" && Number.isFinite(rawDigSteps)) cfg.auditDigSteps = Math.max(1, Math.floor(rawDigSteps));
   const rawDigSamples = raw.auditDigSamples ?? raw.audit_dig_samples;
   if (typeof rawDigSamples === "number" && Number.isFinite(rawDigSamples)) cfg.auditDigSamples = Math.max(1, Math.floor(rawDigSamples));
+  const rawDigMaxSamples = raw.auditDigMaxSamples ?? raw.audit_dig_max_samples;
+  if (typeof rawDigMaxSamples === "number" && Number.isFinite(rawDigMaxSamples)) cfg.auditDigMaxSamples = Math.max(cfg.auditDigSamples, Math.floor(rawDigMaxSamples));
+  const rawAdaptiveDig = raw.auditAdaptiveDig ?? raw.audit_adaptive_dig;
+  if (typeof rawAdaptiveDig === "boolean") cfg.auditAdaptiveDig = rawAdaptiveDig;
+  const rawEagerPrepare = raw.auditEagerPrepare ?? raw.audit_eager_prepare;
+  if (typeof rawEagerPrepare === "boolean") cfg.auditEagerPrepare = rawEagerPrepare;
   const rawDigConcurrency = raw.auditDigConcurrency ?? raw.audit_dig_concurrency;
   if (typeof rawDigConcurrency === "number" && Number.isFinite(rawDigConcurrency)) cfg.auditDigConcurrency = Math.max(1, Math.floor(rawDigConcurrency));
+  const rawVerifyConcurrency = raw.auditVerifyConcurrency ?? raw.audit_verify_concurrency;
+  if (typeof rawVerifyConcurrency === "number" && Number.isFinite(rawVerifyConcurrency)) cfg.auditVerifyConcurrency = Math.max(1, Math.floor(rawVerifyConcurrency));
   if (raw.thinkingLevel === "off" || raw.thinkingLevel === "minimal" || raw.thinkingLevel === "low" || raw.thinkingLevel === "medium" || raw.thinkingLevel === "high" || raw.thinkingLevel === "xhigh") {
     cfg.thinkingLevel = raw.thinkingLevel;
   }
@@ -481,11 +512,30 @@ process environment.
 `);
 }
 
-function runMintTokenCommand(args: string[]): void {
+async function runMintTokenCommand(args: string[]): Promise<void> {
   const out = resolveOut(args);
   const positional = args.find((token) => !token.startsWith("--"));
   const name = readFlag(args, "--name") ?? positional ?? "daemon";
-  const server = readFlag(args, "--server") ?? "http://<this-server-host>:4500";
+  const serverFlag = readFlag(args, "--server");
+  if (serverFlag) {
+    const server = resolveServer(serverFlag);
+    const response = await fetch(`${server}/api/daemons`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    if (!response.ok) throw new Error(`failed to mint daemon token via ${server}: ${response.status} ${await response.text()}`);
+    const body = (await response.json()) as { id?: unknown; token?: unknown; name?: unknown };
+    if (typeof body.id !== "number" || typeof body.token !== "string") {
+      throw new Error(`failed to mint daemon token via ${server}: malformed response`);
+    }
+    const label = typeof body.name === "string" && body.name ? body.name : name;
+    console.log(`[daemon ${body.id}] ${label}`);
+    console.log(`token: ${body.token}`);
+    console.log(`run on the executor machine:\n  flounder daemon start --server ${server} --token ${body.token}`);
+    return;
+  }
+  const server = "http://<this-server-host>:4500";
   const db = MetadataStore.openForOutput(out);
   try {
     const { id, token } = db.createDaemonToken(name);
@@ -497,10 +547,10 @@ function runMintTokenCommand(args: string[]): void {
   }
 }
 
-function runDaemonTokenCommand(args: string[]): void {
+async function runDaemonTokenCommand(args: string[]): Promise<void> {
   const [subcommand = "mint", ...rest] = args;
   if (subcommand === "mint" || subcommand === "create") {
-    runMintTokenCommand(rest);
+    await runMintTokenCommand(rest);
     return;
   }
   throw new Error("Unknown server daemon-token command. Use: flounder server daemon-token mint [name]");
@@ -537,6 +587,11 @@ function buildAuditSpec(cmd: "run" | "map" | "audit", rest: string[], cfg: Audit
     provider: cfg.provider,
     model: cfg.auditModel,
     thinking: cfg.thinkingLevel,
+    mapSamples: cfg.auditMapSamples,
+    digSamples: cfg.auditDigSamples,
+    digMaxSamples: cfg.auditDigMaxSamples,
+    adaptiveDig: cfg.auditAdaptiveDig,
+    eagerPrepare: cfg.auditEagerPrepare,
     out: cfg.outputDir,
     ...sandboxSpec(cfg),
   };
@@ -544,6 +599,9 @@ function buildAuditSpec(cmd: "run" | "map" | "audit", rest: string[], cfg: Audit
   if (cfg.auditScopeNote && cfg.auditScopeNote.trim()) spec.scopeNote = cfg.auditScopeNote.trim(); // --scope-note, or the pipeline's prepare-derived focus
   if (cmd === "run" && rest.includes("--quick")) spec.quick = true;
   if (rest.includes("--remap")) spec.remap = true;
+  if (rest.includes("--append-map") || rest.includes("--expand-map")) spec.appendMap = true;
+  const appendMapSeedPaths = readMultiFlag(rest, "--append-map-seed");
+  if (appendMapSeedPaths.length > 0) spec.appendMapSeedPaths = appendMapSeedPaths;
   if (cmd === "run" && rest.includes("--verify-from-start")) spec.verifyFromStart = true;
   if (rest.includes("--mock-llm")) spec.mockLlm = true; // offline mock model, executed by the daemon
   if (cmd === "audit") {
@@ -560,8 +618,8 @@ function buildAuditSpec(cmd: "run" | "map" | "audit", rest: string[], cfg: Audit
   cap("--map-steps", (n) => (spec.mapSteps = n));
   cap("--dig-steps", (n) => (spec.digSteps = n));
   cap("--max-scopes", (n) => (spec.maxScopes = n));
-  cap("--dig-samples", (n) => (spec.digSamples = n));
   cap("--dig-concurrency", (n) => (spec.digConcurrency = n));
+  cap("--verify-concurrency", (n) => (spec.verifyConcurrency = n));
   return spec;
 }
 
@@ -589,8 +647,9 @@ function safeJsonParse(text: string): unknown {
 
 // `flounder run <clue>` — the one-command pipeline. Orchestrates the distinct phases as SEPARATE
 // tracked runs (so each stays resumable + UI-visible and the dig stays network-sealed), feeding
-// each phase's output to the next: prepare (acquire, open-world) → run (map→dig, sealed) on the
-// staged source → confirm (reproduce, open-world) if the dig found anything. The user runs one
+// each phase's output to the next: prepare (acquire, open-world) → run
+// (map→dig→synthesize→verify, sealed) on the staged source → confirm (reproduce, open-world)
+// if the audit found anything. The user runs one
 // command and reads the final trail. --no-confirm stops after the dig; --posture/--no-match-deployed/
 // --endpoint tune prepare; --max-scopes/--dig-* tune the dig (via buildAuditSpec).
 async function runPipeline(rest: string[], cfg: AuditorConfig, clue: string): Promise<void> {
@@ -602,7 +661,7 @@ async function runPipeline(rest: string[], cfg: AuditorConfig, clue: string): Pr
   const endpoint = readFlag(rest, "--endpoint") ?? readFlag(rest, "--rpc");
   const noConfirm = rest.includes("--no-confirm");
   if (!noConfirm) {
-    console.log(`=== flounder run pipeline · target "${target}" · prepare → map → dig → confirm → report ===`);
+    console.log(`=== flounder run pipeline · target "${target}" · prepare → map → dig → synthesize → verify → confirm → report ===`);
     const spec: LaunchSpec = { verb: "run", target, sourcePaths: [], provider: cfg.provider, model: cfg.auditModel, thinking: cfg.thinkingLevel, clue, posture, matchDeployed, pipeline: true, out: cfg.outputDir, ...sandboxSpec(cfg) };
     if (endpoint !== undefined) spec.endpoint = endpoint;
     const result = await launchViaApi(server, spec);
@@ -710,11 +769,11 @@ function firstPositional(args: string[]): string | undefined {
     "--verify", "--findings", "--source", "--corpus", "--build-root", "--target",
     "--config", "--provider", "--audit-model", "--model", "--thinking", "--out",
     "--history-dir", "--server", "--clue", "--posture", "--endpoint", "--rpc",
-    "--max-steps", "--map-steps", "--dig-steps", "--max-scopes", "--dig-samples",
-    "--dig-concurrency", "--scope", "--scope-note", "--max-tokens", "--repro-timeout-ms",
+    "--max-steps", "--map-steps", "--map-samples", "--dig-steps", "--max-scopes", "--dig-samples", "--dig-max-samples",
+    "--dig-concurrency", "--verify-concurrency", "--scope", "--scope-note", "--max-tokens", "--repro-timeout-ms",
     "--sandbox-backend", "--sandbox-image", "--prepare-network", "--confirm-network",
     "--sandbox-memory-mb", "--sandbox-cpus", "--prepare-timeout-ms", "--scope-coverage-mode",
-    "--coverage",
+    "--coverage", "--append-map-seed",
   ]);
   for (let i = 0; i < args.length; i += 1) {
     const token = args[i];
@@ -748,6 +807,216 @@ function canonicalVerifyArgs(args: string[], verifyFile: string, removePositiona
   return ["--verify", verifyFile, ...out];
 }
 
+async function runGroupCommand(args: string[]): Promise<void> {
+  const [subcommand, ref, ...rest] = args;
+  if (!subcommand || subcommand === "help" || subcommand === "--help" || subcommand === "-h") {
+    printGroupHelp();
+    return;
+  }
+  const allArgs = ref ? [ref, ...rest] : rest;
+  const server = resolveServer(readFlag(allArgs, "--server"));
+  if (subcommand === "create") {
+    const manifestPath = readFlag(allArgs, "--manifest");
+    const nameOverride = readFlag(allArgs, "--name");
+    const parallelismOverride = readIntFlag(allArgs, "--parallel");
+    let body: Record<string, unknown>;
+    if (manifestPath) {
+      const absoluteManifest = path.resolve(manifestPath);
+      const manifest = absolutizeRunGroupManifest(
+        normalizeRunGroupManifest(JSON.parse(await readFile(absoluteManifest, "utf8"))),
+        path.dirname(absoluteManifest),
+      );
+      body = {
+        ...manifest,
+        ...(nameOverride ? { name: nameOverride } : {}),
+        ...(parallelismOverride !== undefined ? { parallelism: parallelismOverride } : {}),
+      };
+    } else {
+      const name = nameOverride ?? (ref && !ref.startsWith("--") ? ref : undefined);
+      if (!name) throw new Error("flounder group create needs --name <name> or --manifest <file>");
+      body = { name, ...(parallelismOverride !== undefined ? { parallelism: parallelismOverride } : {}) };
+    }
+    const created = await requestControlPlane(server, "POST", "/api/run-groups", body);
+    console.log(`created run group ${String(created.name)} (${String(created.uuid)}) with ${Array.isArray(created.items) ? created.items.length : 0} item(s)`);
+    return;
+  }
+  if (subcommand === "retry") {
+    const workItemId = ref && !ref.startsWith("--") ? Number(ref) : Number(readFlag(rest, "--item"));
+    if (!Number.isInteger(workItemId) || workItemId < 1) throw new Error("flounder group retry needs a positive work-item id");
+    const result = await requestControlPlane(server, "POST", `/api/work-items/${workItemId}/retry`, {});
+    printRunGroupStatus(result);
+    return;
+  }
+  const groupRef = ref && !ref.startsWith("--") ? ref : readFlag(rest, "--group");
+  if (!groupRef) throw new Error(`flounder group ${subcommand} needs a group UUID or name`);
+  const uuid = await resolveRunGroupUuid(server, groupRef);
+  if (subcommand === "start") {
+    const parallelism = readIntFlag(rest, "--parallel");
+    const result = await requestControlPlane(server, "POST", `/api/run-groups/${encodeURIComponent(uuid)}/start`, parallelism === undefined ? {} : { parallelism });
+    printRunGroupStatus(result);
+    return;
+  }
+  if (subcommand === "pause" || subcommand === "cancel") {
+    const result = await requestControlPlane(server, "POST", `/api/run-groups/${encodeURIComponent(uuid)}/${subcommand}`, {});
+    printRunGroupStatus(result);
+    return;
+  }
+  if (subcommand === "status") {
+    printRunGroupStatus(await requestControlPlane(server, "GET", `/api/run-groups/${encodeURIComponent(uuid)}`));
+    return;
+  }
+  if (subcommand === "report") {
+    const report = await requestControlPlane(server, "GET", `/api/run-groups/${encodeURIComponent(uuid)}/report`);
+    console.log(typeof report.markdown === "string" ? report.markdown : JSON.stringify(report, null, 2));
+    return;
+  }
+  throw new Error(`Unknown group command "${subcommand}". Use: flounder group create|start|status|pause|cancel|retry|report`);
+}
+
+async function resolveRunGroupUuid(server: string, ref: string): Promise<string> {
+  const response = await requestControlPlane(server, "GET", "/api/run-groups?limit=500");
+  const groups = Array.isArray(response.runGroups) ? response.runGroups as Array<Record<string, unknown>> : [];
+  const matches = groups.filter((group) => group.uuid === ref || group.name === ref);
+  if (matches.length === 1 && typeof matches[0]!.uuid === "string") return matches[0]!.uuid;
+  if (matches.length > 1) throw new Error(`run-group name "${ref}" is ambiguous; use the UUID`);
+  return ref;
+}
+
+function printRunGroupStatus(group: Record<string, unknown>): void {
+  const items = Array.isArray(group.items) ? group.items as Array<Record<string, unknown>> : [];
+  console.log(`${String(group.name ?? group.uuid)} [${String(group.state ?? "unknown")}] ${items.length} item(s)${typeof group.scheduled === "number" ? ` · ${group.scheduled} newly scheduled` : ""}`);
+  for (const item of items) {
+    console.log(`  ${String(item.item_key)}  ${String(item.kind)}  [${String(item.state)}]  ${String(item.outcome ?? "-")}`);
+  }
+}
+
+function printGroupHelp(): void {
+  console.log(`flounder group — durable batch/evaluation run groups.
+
+Usage:
+  flounder group create --manifest <file> [--name <name>] [--parallel <n>]
+  flounder group create --name <name>
+  flounder group start <uuid|name> [--parallel <n>]
+  flounder group status <uuid|name>
+  flounder group pause <uuid|name>
+  flounder group cancel <uuid|name>
+  flounder group retry <work-item-id>
+  flounder group report <uuid|name>
+
+Manifests contain validated work items, target bundles, material policies, and evidence
+contracts. They cannot enable host execution or bypass the normal sandbox/confirmation gate.`);
+}
+
+async function runHarnessExperimentCommand(args: string[]): Promise<void> {
+  const [subcommand, ref, ...rest] = args;
+  if (!subcommand || subcommand === "help" || subcommand === "--help" || subcommand === "-h") {
+    printHarnessExperimentHelp();
+    return;
+  }
+  const allArgs = ref ? [ref, ...rest] : rest;
+  const server = resolveServer(readFlag(allArgs, "--server"));
+  if (subcommand === "list") {
+    const response = await requestControlPlane(server, "GET", "/api/harness-experiments?limit=500");
+    const experiments = Array.isArray(response.experiments) ? response.experiments as Array<Record<string, unknown>> : [];
+    if (experiments.length === 0) console.log("No harness experiments.");
+    for (const experiment of experiments) printHarnessExperimentStatus(experiment);
+    return;
+  }
+  if (subcommand === "create") {
+    const name = readFlag(allArgs, "--name");
+    const baselineRef = readFlag(allArgs, "--baseline");
+    const candidateRef = readFlag(allArgs, "--candidate");
+    const editableFiles = readMultiFlag(allArgs, "--editable-file");
+    if (!name || !baselineRef || editableFiles.length === 0) throw new Error("flounder experiment create needs --name, --baseline, and one or more paths after --editable-file");
+    const baselineRunGroupUuid = await resolveRunGroupUuid(server, baselineRef);
+    const candidateRunGroupUuid = candidateRef ? await resolveRunGroupUuid(server, candidateRef) : undefined;
+    const created = await requestControlPlane(server, "POST", "/api/harness-experiments", {
+      name,
+      baselineRunGroupUuid,
+      ...(candidateRunGroupUuid ? { candidateRunGroupUuid } : {}),
+      editableFiles,
+      promotionPolicy: {
+        ...(readIntFlag(allArgs, "--minimum-samples") !== undefined ? { minimumSamplesPerClass: readIntFlag(allArgs, "--minimum-samples") } : {}),
+        ...(readIntFlag(allArgs, "--minimum-improvements") !== undefined ? { minimumImprovedCases: readIntFlag(allArgs, "--minimum-improvements") } : {}),
+        ...(readFloatFlag(allArgs, "--max-duration-ratio") !== undefined ? { maxDurationRatio: readFloatFlag(allArgs, "--max-duration-ratio") } : {}),
+        ...(readFloatFlag(allArgs, "--max-attempt-ratio") !== undefined ? { maxAttemptRatio: readFloatFlag(allArgs, "--max-attempt-ratio") } : {}),
+      },
+    });
+    printHarnessExperimentStatus(created);
+    return;
+  }
+  const experimentRef = ref && !ref.startsWith("--") ? ref : readFlag(rest, "--experiment");
+  if (!experimentRef) throw new Error(`flounder experiment ${subcommand} needs an experiment UUID or name`);
+  const uuid = await resolveHarnessExperimentUuid(server, experimentRef);
+  if (subcommand === "status") {
+    printHarnessExperimentStatus(await requestControlPlane(server, "GET", `/api/harness-experiments/${encodeURIComponent(uuid)}`));
+    return;
+  }
+  if (subcommand === "attach") {
+    const candidateRef = readFlag(rest, "--candidate");
+    if (!candidateRef) throw new Error("flounder experiment attach needs --candidate <run-group>");
+    const candidateRunGroupUuid = await resolveRunGroupUuid(server, candidateRef);
+    printHarnessExperimentStatus(await requestControlPlane(server, "POST", `/api/harness-experiments/${encodeURIComponent(uuid)}/candidate`, { candidateRunGroupUuid }));
+    return;
+  }
+  if (subcommand === "evaluate") {
+    printHarnessExperimentStatus(await requestControlPlane(server, "POST", `/api/harness-experiments/${encodeURIComponent(uuid)}/evaluate`, {}));
+    return;
+  }
+  if (subcommand === "brief") {
+    const response = await requestControlPlane(server, "GET", `/api/harness-experiments/${encodeURIComponent(uuid)}/brief`);
+    console.log(typeof response.markdown === "string" ? response.markdown : JSON.stringify(response, null, 2));
+    return;
+  }
+  if (subcommand === "proposal") {
+    const proposalPath = readFlag(rest, "--file");
+    if (!proposalPath) throw new Error("flounder experiment proposal needs --file <proposal.json>");
+    const proposal = JSON.parse(await readFile(path.resolve(proposalPath), "utf8")) as unknown;
+    printHarnessExperimentStatus(await requestControlPlane(server, "PATCH", `/api/harness-experiments/${encodeURIComponent(uuid)}/proposal`, { proposal }));
+    return;
+  }
+  throw new Error(`Unknown experiment command "${subcommand}". Use: create|list|status|attach|proposal|evaluate|brief`);
+}
+
+async function resolveHarnessExperimentUuid(server: string, ref: string): Promise<string> {
+  const response = await requestControlPlane(server, "GET", "/api/harness-experiments?limit=500");
+  const experiments = Array.isArray(response.experiments) ? response.experiments as Array<Record<string, unknown>> : [];
+  const matches = experiments.filter((experiment) => experiment.uuid === ref || experiment.name === ref);
+  if (matches.length === 1 && typeof matches[0]!.uuid === "string") return matches[0]!.uuid;
+  if (matches.length > 1) throw new Error(`harness experiment name "${ref}" is ambiguous; use the UUID`);
+  return ref;
+}
+
+function printHarnessExperimentStatus(experiment: Record<string, unknown>): void {
+  const patterns = Array.isArray(experiment.failurePatterns) ? experiment.failurePatterns : [];
+  const scorecard = typeof experiment.scorecard === "object" && experiment.scorecard !== null && !Array.isArray(experiment.scorecard)
+    ? experiment.scorecard as Record<string, unknown>
+    : undefined;
+  console.log(`${String(experiment.name ?? experiment.uuid)} [${String(experiment.state ?? "unknown")}] ${String(experiment.decision ?? "no decision")} · ${patterns.length} weakness pattern(s)`);
+  if (scorecard) {
+    const improved = Array.isArray(scorecard.improvedItemKeys) ? scorecard.improvedItemKeys.length : 0;
+    const regressed = Array.isArray(scorecard.regressedItemKeys) ? scorecard.regressedItemKeys.length : 0;
+    console.log(`  paired result: ${improved} improved · ${regressed} regressed`);
+  }
+}
+
+function printHarnessExperimentHelp(): void {
+  console.log(`flounder experiment — maintainer-only governed harness self-improvement.
+
+Usage:
+  flounder experiment create --name <name> --baseline <group> [--candidate <group>] --editable-file <path...>
+  flounder experiment list
+  flounder experiment status <uuid|name>
+  flounder experiment attach <uuid|name> --candidate <group>
+  flounder experiment proposal <uuid|name> --file <proposal.json>
+  flounder experiment evaluate <uuid|name>
+  flounder experiment brief <uuid|name>
+
+The control plane must be running with \`flounder ui --maintainer\`. The baseline must be a finished Evaluation. Failure mining uses persisted verifier evidence;
+candidate proposals are limited to approved harness files. Evaluation, material, sandbox,
+confirmation, promotion, merge, and deployment policy remain outside the editable loop.`);
+}
+
 async function runHistoryCommand(args: string[]): Promise<void> {
   const [subcommand, ...rest] = args;
   if (subcommand !== "import-run") {
@@ -765,7 +1034,7 @@ async function runHistoryCommand(args: string[]): Promise<void> {
 // Read/write views over the control-plane server state. These are product resources, not
 // database commands: project inventory, global run history, global findings, daemon registry,
 // and daemon connection tokens.
-function runServerCommand(args: string[]): void {
+async function runServerCommand(args: string[]): Promise<void> {
   const [resource, ...rest] = args;
   if (!resource || resource === "help" || resource === "--help" || resource === "-h") {
     printServerHelp();
@@ -790,7 +1059,7 @@ function runServerCommand(args: string[]): void {
     return;
   }
   if (resource === "daemon-token") {
-    runDaemonTokenCommand(rest);
+    await runDaemonTokenCommand(rest);
     return;
   }
   throw new Error(`Unknown server resource "${resource}". Use: flounder server project|run|finding|daemon|daemon-token`);
@@ -985,14 +1254,15 @@ function printHelp(): void {
 
 Usage:
   flounder prepare <clue> [--posture blind|informed] [--no-match-deployed] [--endpoint <url>]   open-world: clue (tx/address/project/repo/link) -> complete, deployment-matched scope; runs BEFORE map
-  flounder run     <clue>                                                         ONE-COMMAND PIPELINE from a tx/address/link: prepare -> map -> dig -> confirm -> report (--no-confirm to stop after the dig)
+  flounder run     <clue>                                                         ONE-COMMAND PIPELINE from a tx/address/link: prepare -> map -> dig -> synthesize -> verify -> confirm -> report (--no-confirm stops after the sealed audit)
   flounder run     --source <paths...> --target <name> [--corpus <paths...>]      sealed audit only: map -> dig on given source (--quick = one breadth pass)
   flounder map     --target <name> --source <paths...> [--corpus <paths...>]      enumerate the scope inventory only (writes audit_scopes.json)
   flounder audit   [<region> | --scope <id,...> | --verify <file>] --source ...   deep-audit a region, inventory scopes, or given claims
   flounder verify  <file> --source <paths...>                                     alias for audit --verify: confirm/refute suspected findings locally
   flounder confirm <run-dir> --source <paths...>                                  open-world: reproduce a run's findings on the real target
   flounder report  --project <uuid|name> [--finding <id>...] [--all]              generate missing reports or regenerate selected/all formal reports
-  flounder continue --project <uuid|name>                                         continue the stored project pipeline (same as the UI Continue button)
+  flounder continue --project <uuid|name>                                         finish the stored project pipeline round (same as the UI Continue button)
+  flounder group create|start|status|pause|cancel|retry|report                    durable evaluation, replay, and multi-target work groups
   flounder history import-run --target <name> --run <dir>
   flounder server project list                                                   list tracked projects
   flounder server run list [--project <name>]                                    list run history globally or for one project
@@ -1001,7 +1271,7 @@ Usage:
   flounder server daemon-token mint [name] [--server <url>]                      create a daemon connection token
   flounder config  [list | get <key> | set <key> <value> | unset <key> | path] [--global|--local]   persisted CLI defaults (server, provider, model, thinking, out, posture)
   flounder daemon provider [list | check [provider] | login [provider]]          manage provider auth on this daemon machine
-  flounder ui      [--port <n>] [--host <h>] [--out <dir>] [--workspace <dir>] [--concurrency <n>] [--no-daemon]   control-plane web dashboard + a co-located executor daemon (localhost)
+  flounder ui      [--port <n>] [--host <h>] [--out <dir>] [--workspace <dir>] [--concurrency <n>] [--no-daemon] [--maintainer]   control-plane web dashboard + a co-located executor daemon (localhost)
   flounder daemon start --server <url> --token <token> [--out <dir>] [--workspace <dir>] [--concurrency <n>]   execution plane: claim + run queued jobs (may be a different machine)
 
 CLI layout:
@@ -1062,9 +1332,9 @@ Shared options:
   --max-steps <n>         cap agent turns for a breadth pass / pinned audit (default: UNBOUNDED — the model stops when done)
   --no-prepare            skip the toolchain warm-up (deps fetch/build)
   --prepare-timeout-ms <n>  per-command timeout for the warm-up, default 600000
-  --sandbox-backend <b>   auto|oci|host; default auto uses the OCI sandbox and refuses implicit host fallback
+  --sandbox-backend <b>   auto|oci|apple-container|host; default auto prefers Apple container on Apple silicon when ready, otherwise Docker-backed OCI
   --sandbox-image <img>   OCI image for sandboxed commands (default flounder-sandbox:latest; build with npm run sandbox:build)
-  --allow-host-execution  trusted-local opt-in only: let auto fall back to host execution when no OCI sandbox is available
+  --allow-host-execution  trusted-local opt-in only: let auto fall back to host execution when no sandbox backend is available
   --prepare-network <m>   none|enabled; dependency warm-up/build commands default to enabled
   --confirm-network <m>   none|enabled; open-world prepare/confirm bash commands default to enabled
   --sandbox-memory-mb <n> memory limit for OCI sandbox commands
@@ -1077,11 +1347,17 @@ run / map / audit deep-phase options:
   --quick                 run only: a single breadth pass instead of map -> audit
   --verify-from-start     run pipeline only: re-run Verify from the beginning instead of only pending candidates
   --map-steps <n>         cap the map phase (default: UNBOUNDED)
+  --map-samples <n>       independent MAP inventories unioned without dropping singleton scopes, default 1
   --dig-steps <n>         cap each scope's dig (default: UNBOUNDED; the dig stops when its obligations are discharged)
   --dig-samples <n>       independent dig passes per scope, findings unioned (raises recall), default 1
+  --dig-max-samples <n>   adaptive per-scope ceiling; extra passes run only for incomplete/uncertain/disagreeing outcomes
+  --no-adaptive-dig       disable outcome-driven sampling above --dig-samples
+  --eager-prepare         warm the isolated toolchain after MAP and surface blockers before DIG
   --dig-concurrency <n>   scopes deep-audited in parallel (isolated workspaces), default 1
+  --verify-concurrency <n> findings verified in parallel (isolated workspaces), default 2
   --max-scopes <n>        one-run cap for un-audited scopes; UI Standard defaults to auditing until 30 project scopes are done
   --remap                 re-enumerate scopes from scratch (default resumes the persisted inventory)
+  --append-map            expand the persisted inventory by asking MAP for novel scopes, preserving existing scope status
 
 flounder audit selectors (choose one; default digs the existing inventory):
   <region>                deep-audit one pinned region, e.g. src/Foo.sol:120-180 (no map needed)
@@ -1101,6 +1377,8 @@ flounder continue:
   --project <uuid|name>   tracked UI/API project. Names are resolved client-side when unique.
   --verify-from-start     re-run Verify from the beginning instead of only pending candidates.
   --remap                 re-enumerate scopes from scratch before digging.
+  --append-map            expand the persisted inventory before digging; preserves existing scope status.
+  --continue-coverage     explicitly open another mapped scope batch after the current round is settled.
   --coverage <mode>       focused|standard|half|full|custom one-off coverage mode.
   --max-scopes <n>        one-off scope cap, or custom target when --coverage custom.
 `);
@@ -1110,7 +1388,7 @@ function printUiHelp(): void {
   console.log(`flounder ui — start the control-plane dashboard.
 
 Usage:
-  flounder ui [--port <n>] [--host <h>] [--out <dir>] [--workspace <dir>] [--concurrency <n>] [--no-daemon]
+  flounder ui [--port <n>] [--host <h>] [--out <dir>] [--workspace <dir>] [--concurrency <n>] [--no-daemon] [--maintainer]
 
 Options:
   --port              Dashboard/API port, default 4500
@@ -1119,9 +1397,11 @@ Options:
   --workspace         Co-located daemon workspace, default ~/.flounder/workspace
   --concurrency       Co-located daemon jobs in parallel, default 2
   --no-daemon         Start only the control plane; connect executors with flounder daemon start
+  --maintainer        Enable maintainer-only Harness API/CLI/UI surfaces for improving Flounder source
 
 flounder ui starts the REST API, SQLite tracking store, dashboard, and by default a local
-execution daemon. Target code and provider credentials stay on the daemon machine.`);
+execution daemon. Target code and provider credentials stay on the daemon machine. Harness
+source-improvement surfaces stay disabled unless --maintainer is explicit.`);
 }
 
 function printContinueHelp(): void {
@@ -1133,14 +1413,19 @@ Usage:
 
 This is the CLI equivalent of the UI Continue button. It queues project work with
 verb:"run", so the control plane decides the next phase from stored project state:
-prepare if needed, map/dig pending scopes, verify pending claims, confirm pending
-real-target findings, and generate missing reports.
+prepare if needed, finish the current map/dig batch, verify pending claims,
+confirm pending real-target findings, and generate missing reports.
+
+After a round has produced its reports, plain continue stops. Pass
+--continue-coverage, --coverage, or --max-scopes only when you intentionally want
+to open another mapped scope batch.
 
 Options:
   --project <uuid|name>     tracked UI/API project; names are allowed when unique
   --verify-from-start       re-run Verify from the beginning instead of only pending candidates
   --remap                   re-enumerate scopes from scratch before digging
   --quick                   single breadth pass instead of map -> dig
+  --continue-coverage       explicitly open another mapped scope batch after this round is settled
   --coverage <mode>         focused|standard|half|full|custom one-off coverage mode
   --max-scopes <n>          one-off scope cap, or custom target when --coverage custom
   --map-steps <n>           one-off map turn cap
@@ -1148,6 +1433,7 @@ Options:
   --max-steps <n>           one-off global turn cap
   --dig-samples <n>         one-off samples per scope
   --dig-concurrency <n>     one-off parallel scopes
+  --verify-concurrency <n>  one-off parallel Verify findings
   --mock-llm                use the deterministic mock model on the daemon
   --server <url>            control plane URL`);
 }

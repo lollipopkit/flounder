@@ -1,7 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import type { ProjectContext } from "./types.js";
-import type { SandboxBackend, SandboxExecutionOptions, SandboxNetworkMode } from "./security/sandbox.js";
+import { isSandboxBackend, type SandboxBackend, type SandboxExecutionOptions, type SandboxNetworkMode } from "./security/sandbox.js";
 
 export interface AuditorConfig {
   targetName: string;
@@ -14,6 +14,9 @@ export interface AuditorConfig {
   buildRoot?: string;
   outputDir: string;
   historyDir?: string;
+  // Optional cache root separated from durable reasoning/coverage state. Evaluation
+  // attempts use isolated historyDir values but may safely share dependency caches.
+  buildCacheDir?: string;
   provider: string;
   auditModel: string;
   maxTokens: number;
@@ -48,20 +51,43 @@ export interface AuditorConfig {
   // Map → dig flow (used when --deep runs without a pinned focus): map enumerates
   // an obligation/scope inventory, dig deep-audits the top scopes one at a time.
   auditMapSteps: number;
+  // Independent MAP sessions whose inventories are unioned. Agreement is an
+  // ordering/uncertainty signal only; singleton scopes are never discarded.
+  auditMapSamples: number;
   auditDigSteps: number;
   auditMaxScopes: number;
   // How many independent dig passes to run per scope; findings are unioned. Raises
   // recall on scopes where a single pass finds a subtle obligation only sometimes
   // (cumulative recall 1 - (1-p)^K) — a variance lever, not a bug-specific tweak.
   auditDigSamples: number;
+  // Optional bounded adaptive ceiling. Extra samples run only when the
+  // model-authored scope outcome is incomplete, uncertain, or disagrees.
+  auditDigMaxSamples: number;
+  auditAdaptiveDig: boolean;
+  // Warm the isolated build/toolchain after MAP and before DIG. Failure creates
+  // resource requests but never turns into a safe/no-bug verdict.
+  auditEagerPrepare: boolean;
   // How many scopes the dig phase audits in parallel. Each concurrent dig runs in
   // its own isolated workspace + session (and its own differential confirmation),
   // so they cannot corrupt each other's test files, build output, or findings.
   // 1 = sequential (default).
   auditDigConcurrency: number;
+  // How many independent VERIFY claims may execute at once. Every claim still
+  // receives an isolated workspace/session; this only bounds the worker pool.
+  auditVerifyConcurrency: number;
   // Re-enumerate the scope inventory from scratch instead of resuming the
   // persisted one (which would otherwise continue with the next un-audited scopes).
   auditRemap: boolean;
+  // Expand the persisted scope inventory by running MAP with the existing
+  // inventory visible, then append only novel scopes. Existing statuses are kept.
+  auditAppendMap: boolean;
+  // Extra scope inventory artifact(s) to show MAP in append mode as already-covered
+  // reference material. These are seed-only and are not persisted into the current
+  // inventory unless MAP independently emits novel scopes.
+  auditAppendMapSeedPaths: string[];
+  // Project-level Next Actions from the discovery backlog. These are durable
+  // control-plane work items from prior runs, not an audit strategy or taxonomy.
+  auditNextActions: AuditNextAction[];
   // After the per-scope dig, run one cross-scope SYNTHESIS pass (sink-driven composition) to find
   // bugs that only exist in the COMPOSITION of components. Default on for map→dig; set false to skip.
   auditSynthesize?: boolean;
@@ -87,6 +113,12 @@ export interface AuditorConfig {
   // True when the verify worklist intentionally re-checks already locally confirmed
   // findings, not just suspected/source-confirmed candidates.
   auditVerifyFromStart: boolean;
+  // Stable digest of the exact source/build/corpus material used by this phase.
+  // The control plane uses it to avoid stale reuse and idempotent blocked retries.
+  materialFingerprint?: string;
+  // Prior canonical findings are visible only to the post-dig synthesis phase,
+  // never to blind map/dig discovery.
+  auditSynthesisContext?: Array<Record<string, unknown>>;
   // CONFIRM mode (`flounder confirm`): the open-world counterpart to the network-sealed
   // `flounder run`. When set, the bash tool swaps to the network-enabled policy (fork/read
   // live networks, fetch, search — never BROADCAST). This is the only capability
@@ -102,6 +134,17 @@ export interface AuditorConfig {
   dryRun: boolean;
 }
 
+export interface AuditNextAction {
+  id?: number;
+  kind: string;
+  actionability?: string;
+  recommendedAction?: string;
+  title?: string;
+  summary?: string;
+  scopeId?: string;
+  reason?: string;
+}
+
 // The phases that may run on different models. `map` = scope enumeration,
 // `dig` = per-scope deep audit, `refute` = independent refutation, `default` =
 // everything else / fallback.
@@ -115,6 +158,7 @@ export interface RoleModel {
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+export const DEFAULT_AUDIT_MODEL = "gpt-5.6-sol";
 
 export function flounderHomeDir(): string {
   return path.join(os.homedir(), ".flounder");
@@ -171,7 +215,7 @@ export function defaultConfig(): AuditorConfig {
     corpusPaths: [],
     outputDir: defaultOutputDir(),
     provider: "openai-codex",
-    auditModel: "gpt-5.5",
+    auditModel: DEFAULT_AUDIT_MODEL,
     maxTokens: 8000,
     thinkingLevel: "xhigh",
     projectContext: {},
@@ -190,11 +234,19 @@ export function defaultConfig(): AuditorConfig {
     auditAppeal: true,
     auditDeep: false,
     auditMapSteps: Number.POSITIVE_INFINITY,
+    auditMapSamples: 1,
     auditDigSteps: Number.POSITIVE_INFINITY,
     auditMaxScopes: Number.POSITIVE_INFINITY,
     auditDigSamples: 1,
+    auditDigMaxSamples: 1,
+    auditAdaptiveDig: true,
+    auditEagerPrepare: false,
     auditDigConcurrency: 1,
+    auditVerifyConcurrency: 2,
     auditRemap: false,
+    auditAppendMap: false,
+    auditAppendMapSeedPaths: [],
+    auditNextActions: [],
     auditMapOnly: false,
     auditRequireInventory: false,
     auditVerifyFromStart: false,
@@ -222,7 +274,7 @@ export function sandboxNetworkForPurpose(cfg: AuditorConfig, purpose: "inspect" 
 }
 
 function readSandboxBackend(value: unknown): SandboxBackend | undefined {
-  return value === "auto" || value === "oci" || value === "host" ? value : undefined;
+  return isSandboxBackend(value) ? value : undefined;
 }
 
 function readSandboxNetwork(value: unknown): SandboxNetworkMode | undefined {

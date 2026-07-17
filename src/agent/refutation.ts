@@ -29,6 +29,17 @@ export interface RefutationVerdict {
   reason: string;
 }
 
+export interface RefutationError {
+  findingId: string;
+  error: string;
+}
+
+export interface RefutationResult {
+  attempted: number;
+  verdicts: RefutationVerdict[];
+  errors: RefutationError[];
+}
+
 export async function runRefutation(input: {
   findings: AgentFinding[];
   source: Doc[];
@@ -43,9 +54,11 @@ export async function runRefutation(input: {
   // Reports which finding is being refuted, so the caller can surface progress in the live UI
   // (the refutation runs after the dig's scope batch, where the activity stream otherwise goes quiet).
   onProgress?: (findingId: string) => void;
-}): Promise<RefutationVerdict[]> {
-  const out: RefutationVerdict[] = [];
-  for (const finding of input.findings.slice(0, Math.max(0, input.max))) {
+}): Promise<RefutationResult> {
+  const attemptedFindings = input.findings.slice(0, Math.max(0, input.max));
+  const verdicts: RefutationVerdict[] = [];
+  const errors: RefutationError[] = [];
+  for (const finding of attemptedFindings) {
     input.onProgress?.(finding.id);
     const user = buildRefutationPrompt(finding, sourceForLocation(input.source, finding.location), input.pocFiles ?? []);
     try {
@@ -63,14 +76,16 @@ export async function runRefutation(input: {
         const unrealistic = parsed.unrealistic === true && parsed.refuted === true;
         const verdict: RefutationVerdict = { findingId: finding.id, refuted: parsed.refuted, unrealistic, reason: typeof parsed.reason === "string" ? parsed.reason.slice(0, 800) : "" };
         finding.refutation = { refuted: verdict.refuted, reason: verdict.reason, unrealistic };
-        out.push(verdict);
+        verdicts.push(verdict);
         await input.logger.event("audit_refutation", { findingId: finding.id, refuted: verdict.refuted, unrealistic });
       }
     } catch (error) {
-      await input.logger.event("audit_refutation_error", { findingId: finding.id, error: error instanceof Error ? error.message.slice(0, 300) : String(error) });
+      const message = error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300);
+      errors.push({ findingId: finding.id, error: message });
+      await input.logger.event("audit_refutation_error", { findingId: finding.id, error: message });
     }
   }
-  return out;
+  return { attempted: attemptedFindings.length, verdicts, errors };
 }
 
 // Discharge challenge — the FALSE-NEGATIVE counterpart of runRefutation. The dig marks many
@@ -90,14 +105,15 @@ A discharge is UNSOUND when the cited enforcement clears only a NARROWER propert
 
 From the actual code and first principles, try to BREAK the discharge: trace whether the obligation's real security property holds end-to-end — all the way to the value/authority SINK it protects, across every reachable path and CALLER, not just the one the auditor examined. Who can reach the protected effect, and is each input that decides it (recipient, amount, the caller, the proof/signature that authorizes it) bound to a legitimate authority?
 
-Respond with ONLY a JSON object (no prose, no fences): {"unsound": true|false, "gap": "<if unsound: the exact missed path/case, with file:line and the resulting attacker impact; else empty>", "reason": "<concise and specific>"}.
-- unsound=true: the discharge does NOT actually clear the obligation — name the missed path/case and the attacker impact (a candidate bug to re-open).
+Respond with ONLY a JSON object (no prose, no fences): {"unsound": true|false, "title": "<if unsound: concise mechanism-specific root-cause title; else empty>", "gap": "<if unsound: the exact missed path/case, with file:line and the resulting attacker impact; else empty>", "reason": "<concise and specific>"}.
+- unsound=true: the discharge does NOT actually clear the obligation — give the candidate a concise mechanism-specific title, then name the missed path/case and attacker impact. The title must identify this exact root cause rather than repeat the broad obligation.
 - unsound=false: after genuine effort the obligation holds end-to-end — say why.
 Be skeptical but honest: default to challenging hard, but if the property genuinely holds, say unsound=false.`;
 
 export interface DischargeVerdict {
   findingId: string;
   unsound: boolean;
+  title: string;
   gap: string;
   reason: string;
 }
@@ -125,11 +141,12 @@ export async function runDischargeChallenge(input: {
         thinkingLevel: input.cfg.thinkingLevel,
         agentic: true,
       });
-      const parsed = extractJsonObject<{ unsound?: unknown; gap?: unknown; reason?: unknown }>(raw);
+      const parsed = extractJsonObject<{ unsound?: unknown; title?: unknown; gap?: unknown; reason?: unknown }>(raw);
       if (parsed && typeof parsed.unsound === "boolean") {
         const verdict: DischargeVerdict = {
           findingId: finding.id,
           unsound: parsed.unsound,
+          title: typeof parsed.title === "string" ? parsed.title.slice(0, 240) : "",
           gap: typeof parsed.gap === "string" ? parsed.gap.slice(0, 800) : "",
           reason: typeof parsed.reason === "string" ? parsed.reason.slice(0, 800) : "",
         };

@@ -149,7 +149,14 @@ export async function runPrepare(
     blockingIssues: blockingIssues.length,
   });
 
-  const preparedSource = await loadSource([workspace.absolute]);
+  // publicRoot must match what downstream audit runs use: `applyPreparedWorkspaceIfNeeded`
+  // (src/server/app.ts) sets both sourcePaths and buildRoot to this same workspace dir, so
+  // audit.ts's loadSource(cfg.sourcePaths, { publicRoot: cfg.buildRoot }) resolves doc.path as
+  // plain relative paths. Without publicRoot here, walk() treats workspace.absolute as external
+  // to process.cwd() and prefixes every doc.path with an external label — so the exact same
+  // files hash to a different materialFingerprint here vs. in the audit phase, and every
+  // pipeline-derived audit run permanently fails the UI's "current material" check.
+  const preparedSource = await loadSource([workspace.absolute], { publicRoot: workspace.absolute });
   const preparedCorpus = stagedCfg.corpusPaths.length > 0 ? await loadCorpus(stagedCfg.corpusPaths) : [];
   stagedCfg.materialFingerprint = materialFingerprint([
     { label: "source", docs: preparedSource },

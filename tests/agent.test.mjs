@@ -1730,6 +1730,12 @@ test("transient-throttle classification: server rate limits retry, real quota ex
   assert.equal(isTransientError("HTTP 429 Too Many Requests"), true);
   assert.equal(isTransientError("Service overloaded, please retry"), true);
   assert.equal(isTransientError("socket hang up"), true);
+  // Reverse-proxy 5xx codes outside the enumerated list (e.g. Cloudflare's
+  // "origin down/unreachable" 521) must retry too — any \d{3} in the 500s.
+  assert.equal(isTransientError("521 status code (no body)"), true);
+  assert.equal(isTransientError("terminated"), true);
+  assert.equal(isTransientError("Stream ended without finish_reason"), true);
+  assert.equal(isTransientError("stream error: stream ID 1; INTERNAL_ERROR; received from peer"), true);
   // A genuine daily usage-limit exhaustion is NOT transient — retrying is futile.
   assert.equal(isTransientError("You have hit your usage limit for today"), false);
   assert.equal(isTransientError("monthly quota exceeded"), false);

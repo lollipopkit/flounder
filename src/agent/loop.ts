@@ -234,14 +234,19 @@ const MAX_TRANSIENT_RETRIES = 5;
 // retryable and should not count toward the stall guard. A genuine usage-limit
 // exhaustion is NOT transient (the daily quota is gone) — it falls through to the
 // stall path, where retrying would also fail.
+//
+// The 5xx match is intentionally broad (any \d{3} in the 500s), not an enumerated
+// list — reverse proxies emit provider-specific codes the pi-ai SDK's own retry
+// classifier doesn't know about (e.g. Cloudflare's 521/522/523/525/530 "origin
+// down/unreachable" codes), and a downed origin is exactly the case retrying helps.
 export function isTransientError(message: string): boolean {
   const m = message.toLowerCase();
   if (m.includes("not your usage limit")) return true; // explicit transient server throttle
   if (m.includes("usage limit") || m.includes("quota")) return false; // real exhaustion
-  return /\b429\b|\b502\b|\b503\b|\b504\b|rate.?limit|temporarily|overloaded|timed? ?out|timeout|econnreset|etimedout|socket hang up/.test(m);
+  return /\b5\d{2}\b|\b429\b|rate.?limit|temporarily|overloaded|timed? ?out|timeout|econnreset|etimedout|socket hang up|terminated|ended without|internal_error/.test(m);
 }
 
-function sleep(ms: number): Promise<void> {
+export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 

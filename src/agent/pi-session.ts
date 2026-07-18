@@ -11,6 +11,10 @@ import { describeAction, readScratchScopes, scratchHasFindings, scratchHasFindin
 import { SCOPE_OUTCOME_FILE, scratchHasScopeOutcome } from "./scope-outcomes.js";
 import { flounderAgentDir } from "../provider-auth.js";
 import { configureOpenAICompatibleEnv, getOpenAICompatibleModel, OPENAI_COMPAT_PROVIDER } from "../llm/openai-compatible.js";
+import { isTransientError, sleep } from "./loop.js";
+
+const SESSION_TRANSIENT_MAX_RETRIES = 5;
+const SESSION_TRANSIENT_RETRY_BASE_MS = 4000;
 
 // Continuous-session driver (point 5). Instead of re-driving a stateless
 // complete() once per step — which re-sends the whole transcript every turn and
@@ -469,46 +473,54 @@ export async function runAuditSession(input: {
   };
 
   try {
-    try {
-      await session.prompt(buildSessionPrompt({
-        cfg: input.cfg,
-        fileManifest: input.fileManifest,
-        ...(input.scopeNote ? { scopeNote: input.scopeNote } : {}),
-        ...(input.memoryHint ? { memoryHint: input.memoryHint } : {}),
-        ...(input.deep ? { deep: true } : {}),
-        ...(input.deepFocus ? { deepFocus: input.deepFocus } : {}),
-        ...(input.map ? { map: true } : {}),
-        ...(input.mapExistingScopesPath ? { mapExistingScopesPath: input.mapExistingScopesPath } : {}),
-        ...(input.mapExistingScopesCount !== undefined ? { mapExistingScopesCount: input.mapExistingScopesCount } : {}),
-        ...(input.verify ? { verify: input.verify } : {}),
-        ...(input.synthesize ? { synthesize: input.synthesize } : {}),
-        ...(input.confirm ? { confirm: input.confirm } : {}),
-        ...(input.report ? { report: input.report } : {}),
-        ...(input.prepare ? { prepare: input.prepare } : {}),
-      }));
-    } catch (error) {
-      if (!budgetAborted) {
-        const message = error instanceof Error ? error.message : String(error);
-        await input.logger.event("audit_session_error", { error: message.slice(0, 500) });
-        // Authentication is an environment setup step, not a finding. Surface it
-        // loudly and actionably instead of silently producing zero findings.
-        if (looksLikeAuthError(message)) {
-          throw new Error(
-            `audit session could not authenticate provider "${input.cfg.provider}". Run \`flounder daemon provider login ${input.cfg.provider}\` on the daemon machine, or start the daemon with that provider's credentials in the environment. For an offline check, run with --mock-llm. Underlying: ${message.slice(0, 300)}`,
-          );
-        }
-        return await settleSessionError(message);
+    for (let attempt = 0; ; attempt += 1) {
+      sessionError = "";
+      let thrown: string | undefined;
+      try {
+        await session.prompt(buildSessionPrompt({
+          cfg: input.cfg,
+          fileManifest: input.fileManifest,
+          ...(input.scopeNote ? { scopeNote: input.scopeNote } : {}),
+          ...(input.memoryHint ? { memoryHint: input.memoryHint } : {}),
+          ...(input.deep ? { deep: true } : {}),
+          ...(input.deepFocus ? { deepFocus: input.deepFocus } : {}),
+          ...(input.map ? { map: true } : {}),
+          ...(input.mapExistingScopesPath ? { mapExistingScopesPath: input.mapExistingScopesPath } : {}),
+          ...(input.mapExistingScopesCount !== undefined ? { mapExistingScopesCount: input.mapExistingScopesCount } : {}),
+          ...(input.verify ? { verify: input.verify } : {}),
+          ...(input.synthesize ? { synthesize: input.synthesize } : {}),
+          ...(input.confirm ? { confirm: input.confirm } : {}),
+          ...(input.report ? { report: input.report } : {}),
+          ...(input.prepare ? { prepare: input.prepare } : {}),
+        }));
+      } catch (error) {
+        if (budgetAborted) break; // fall through to the forced finalize below
+        thrown = error instanceof Error ? error.message : String(error);
       }
-      // budgetAborted: fall through to the forced finalize below
-    }
-    if (sessionError && !budgetAborted) {
-      await input.logger.event("audit_session_error", { error: sessionError.slice(0, 500) });
-      if (looksLikeAuthError(sessionError)) {
+      const message = thrown ?? sessionError;
+      if (!message || budgetAborted) break;
+      await input.logger.event("audit_session_error", { error: message.slice(0, 500) });
+      // Authentication is an environment setup step, not a finding. Surface it
+      // loudly and actionably instead of silently producing zero findings.
+      if (looksLikeAuthError(message)) {
         throw new Error(
-          `audit session could not authenticate provider "${input.cfg.provider}". Run \`flounder daemon provider login ${input.cfg.provider}\` on the daemon machine, or start the daemon with that provider's credentials in the environment. For an offline check, run with --mock-llm. Underlying: ${sessionError.slice(0, 300)}`,
+          `audit session could not authenticate provider "${input.cfg.provider}". Run \`flounder daemon provider login ${input.cfg.provider}\` on the daemon machine, or start the daemon with that provider's credentials in the environment. For an offline check, run with --mock-llm. Underlying: ${message.slice(0, 300)}`,
         );
       }
-      return await settleSessionError(sessionError);
+      // A transport/provider blip (proxy or origin down, rate limit, dropped
+      // stream) is worth a few retries before writing off the whole session —
+      // one retry recovers what would otherwise cost an entire scope's dig
+      // (and, once the run ends up "error", the next pipeline round's synthesis
+      // overhead too). Only the FIRST turn can land here cleanly: once content
+      // has streamed, a retry re-sends the kickoff as a new message on top of
+      // whatever history exists, so this is a start-over, not a true resume.
+      if (isTransientError(message) && attempt < SESSION_TRANSIENT_MAX_RETRIES) {
+        const waitMs = Math.min(60_000, SESSION_TRANSIENT_RETRY_BASE_MS * 2 ** attempt);
+        await input.logger.event("audit_transient_retry", { attempt: attempt + 1, waitMs, error: message.slice(0, 200) });
+        await sleep(waitMs);
+        continue;
+      }
+      return await settleSessionError(message);
     }
     await finalizeIfEmpty();
     return { steps, stoppedReason: verifyMissingVerdict ? "error" : budgetAborted ? "step-budget" : "finished" };
